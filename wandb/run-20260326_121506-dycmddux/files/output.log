@@ -1,0 +1,436 @@
+2026-03-26 12:15:08,820 [INFO] scgg.training.trainer: Wandb initialized: project=scgg, run=swift-bush-3
+2026-03-26 12:15:08,820 [INFO] scgg.training.trainer: Starting training for 300 epochs
+2026-03-26 12:15:08,821 [INFO] scgg.training.trainer:   Sections: 1
+2026-03-26 12:15:08,821 [INFO] scgg.training.trainer:   Batch size: 8192 cells
+2026-03-26 12:15:08,821 [INFO] scgg.training.trainer:   Device: cpu
+2026-03-26 12:15:08,822 [INFO] scgg.training.trainer:   Parameters: 1,306,002
+2026-03-26 12:15:20,405 [INFO] scgg.training.trainer: Epoch 1/300 | Loss: 1.3347 | FM: 1.0001 | LR: 1.00e-04 | Time: 11.6s
+2026-03-26 12:15:30,257 [INFO] scgg.training.trainer: Epoch 2/300 | Loss: 1.3142 | FM: 0.9943 | LR: 2.00e-04 | Time: 9.8s
+2026-03-26 12:15:38,973 [INFO] scgg.training.trainer: Epoch 3/300 | Loss: 1.2466 | FM: 0.9517 | LR: 3.00e-04 | Time: 8.7s
+2026-03-26 12:15:47,099 [INFO] scgg.training.trainer: Epoch 4/300 | Loss: 1.2020 | FM: 0.8914 | LR: 4.00e-04 | Time: 8.1s
+2026-03-26 12:15:55,251 [INFO] scgg.training.trainer: Epoch 5/300 | Loss: 0.9951 | FM: 0.7091 | LR: 5.00e-04 | Time: 8.2s
+2026-03-26 12:15:55,374 [INFO] scgg.training.trainer:   Val Loss: 0.5985 | Val FM: 0.5985
+2026-03-26 12:15:55,550 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch5.pt
+2026-03-26 12:15:55,704 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:16:05,735 [INFO] scgg.training.trainer: Epoch 6/300 | Loss: 0.8569 | FM: 0.5808 | LR: 6.00e-04 | Time: 8.1s
+2026-03-26 12:16:11,100 [INFO] scgg.training.trainer: Epoch 7/300 | Loss: 0.7463 | FM: 0.5498 | LR: 7.00e-04 | Time: 5.4s
+2026-03-26 12:16:19,136 [INFO] scgg.training.trainer: Epoch 8/300 | Loss: 0.8010 | FM: 0.5681 | LR: 8.00e-04 | Time: 8.0s
+2026-03-26 12:16:26,022 [INFO] scgg.training.trainer: Epoch 9/300 | Loss: 0.8613 | FM: 0.6510 | LR: 9.00e-04 | Time: 6.9s
+2026-03-26 12:16:34,064 [INFO] scgg.training.trainer: Epoch 10/300 | Loss: 0.7875 | FM: 0.5393 | LR: 1.00e-03 | Time: 8.0s
+2026-03-26 12:16:34,188 [INFO] scgg.training.trainer:   Val Loss: 0.9395 | Val FM: 0.9395
+2026-03-26 12:16:34,313 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch10.pt
+2026-03-26 12:16:42,315 [INFO] scgg.training.trainer: Epoch 11/300 | Loss: 0.8012 | FM: 0.5731 | LR: 1.00e-03 | Time: 8.0s
+2026-03-26 12:16:50,285 [INFO] scgg.training.trainer: Epoch 12/300 | Loss: 0.6451 | FM: 0.4228 | LR: 1.00e-03 | Time: 8.0s
+2026-03-26 12:16:58,281 [INFO] scgg.training.trainer: Epoch 13/300 | Loss: 0.5472 | FM: 0.3396 | LR: 1.00e-03 | Time: 8.0s
+2026-03-26 12:17:06,121 [INFO] scgg.training.trainer: Epoch 14/300 | Loss: 0.6017 | FM: 0.3998 | LR: 1.00e-03 | Time: 7.8s
+2026-03-26 12:17:12,990 [INFO] scgg.training.trainer: Epoch 15/300 | Loss: 0.5409 | FM: 0.3563 | LR: 9.99e-04 | Time: 6.9s
+2026-03-26 12:17:13,110 [INFO] scgg.training.trainer:   Val Loss: 0.2401 | Val FM: 0.2401
+2026-03-26 12:17:13,238 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch15.pt
+2026-03-26 12:17:13,380 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:17:21,932 [INFO] scgg.training.trainer: Epoch 16/300 | Loss: 0.9570 | FM: 0.7489 | LR: 9.99e-04 | Time: 8.1s
+2026-03-26 12:17:29,880 [INFO] scgg.training.trainer: Epoch 17/300 | Loss: 0.6081 | FM: 0.4079 | LR: 9.99e-04 | Time: 7.9s
+2026-03-26 12:17:36,758 [INFO] scgg.training.trainer: Epoch 18/300 | Loss: 0.7759 | FM: 0.5988 | LR: 9.98e-04 | Time: 6.9s
+2026-03-26 12:17:42,172 [INFO] scgg.training.trainer: Epoch 19/300 | Loss: 0.5834 | FM: 0.4287 | LR: 9.98e-04 | Time: 5.4s
+2026-03-26 12:17:50,181 [INFO] scgg.training.trainer:   Step 100 | Loss: 0.4355 | FM: 0.2548 | LR: 9.97e-04
+2026-03-26 12:17:50,192 [INFO] scgg.training.trainer: Epoch 20/300 | Loss: 0.5211 | FM: 0.3364 | LR: 9.97e-04 | Time: 8.0s
+2026-03-26 12:17:50,314 [INFO] scgg.training.trainer:   Val Loss: 0.6173 | Val FM: 0.6173
+2026-03-26 12:17:50,496 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch20.pt
+2026-03-26 12:17:57,497 [INFO] scgg.training.trainer: Epoch 21/300 | Loss: 0.6117 | FM: 0.4438 | LR: 9.96e-04 | Time: 7.0s
+2026-03-26 12:18:05,506 [INFO] scgg.training.trainer: Epoch 22/300 | Loss: 0.5818 | FM: 0.3776 | LR: 9.96e-04 | Time: 8.0s
+2026-03-26 12:18:13,502 [INFO] scgg.training.trainer: Epoch 23/300 | Loss: 0.4873 | FM: 0.3009 | LR: 9.95e-04 | Time: 8.0s
+2026-03-26 12:18:20,487 [INFO] scgg.training.trainer: Epoch 24/300 | Loss: 0.4392 | FM: 0.2809 | LR: 9.94e-04 | Time: 7.0s
+2026-03-26 12:18:28,528 [INFO] scgg.training.trainer: Epoch 25/300 | Loss: 0.5640 | FM: 0.3767 | LR: 9.93e-04 | Time: 8.0s
+2026-03-26 12:18:28,651 [INFO] scgg.training.trainer:   Val Loss: 0.9294 | Val FM: 0.9294
+2026-03-26 12:18:35,555 [INFO] scgg.training.trainer: Epoch 26/300 | Loss: 0.7085 | FM: 0.5497 | LR: 9.93e-04 | Time: 6.9s
+2026-03-26 12:18:42,395 [INFO] scgg.training.trainer: Epoch 27/300 | Loss: 0.4808 | FM: 0.3236 | LR: 9.92e-04 | Time: 6.8s
+2026-03-26 12:18:50,282 [INFO] scgg.training.trainer: Epoch 28/300 | Loss: 0.5769 | FM: 0.4068 | LR: 9.91e-04 | Time: 7.9s
+2026-03-26 12:18:58,151 [INFO] scgg.training.trainer: Epoch 29/300 | Loss: 0.4110 | FM: 0.2443 | LR: 9.89e-04 | Time: 7.9s
+2026-03-26 12:19:06,027 [INFO] scgg.training.trainer: Epoch 30/300 | Loss: 0.3785 | FM: 0.2185 | LR: 9.88e-04 | Time: 7.9s
+2026-03-26 12:19:06,148 [INFO] scgg.training.trainer:   Val Loss: 0.5998 | Val FM: 0.5998
+2026-03-26 12:19:06,293 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch30.pt
+2026-03-26 12:19:14,381 [INFO] scgg.training.trainer: Epoch 31/300 | Loss: 0.5743 | FM: 0.4001 | LR: 9.87e-04 | Time: 8.1s
+2026-03-26 12:19:19,856 [INFO] scgg.training.trainer: Epoch 32/300 | Loss: 0.9723 | FM: 0.8416 | LR: 9.86e-04 | Time: 5.5s
+2026-03-26 12:19:25,273 [INFO] scgg.training.trainer: Epoch 33/300 | Loss: 0.4276 | FM: 0.2951 | LR: 9.85e-04 | Time: 5.4s
+2026-03-26 12:19:33,318 [INFO] scgg.training.trainer: Epoch 34/300 | Loss: 0.5798 | FM: 0.4021 | LR: 9.83e-04 | Time: 8.0s
+2026-03-26 12:19:38,720 [INFO] scgg.training.trainer: Epoch 35/300 | Loss: 0.3623 | FM: 0.2363 | LR: 9.82e-04 | Time: 5.4s
+2026-03-26 12:19:38,853 [INFO] scgg.training.trainer:   Val Loss: 0.6043 | Val FM: 0.6043
+2026-03-26 12:19:46,865 [INFO] scgg.training.trainer: Epoch 36/300 | Loss: 0.5239 | FM: 0.3498 | LR: 9.80e-04 | Time: 8.0s
+2026-03-26 12:19:53,738 [INFO] scgg.training.trainer: Epoch 37/300 | Loss: 0.3589 | FM: 0.2211 | LR: 9.79e-04 | Time: 6.9s
+2026-03-26 12:20:01,863 [INFO] scgg.training.trainer: Epoch 38/300 | Loss: 0.5060 | FM: 0.3473 | LR: 9.77e-04 | Time: 8.1s
+2026-03-26 12:20:09,832 [INFO] scgg.training.trainer: Epoch 39/300 | Loss: 0.4382 | FM: 0.2882 | LR: 9.76e-04 | Time: 8.0s
+2026-03-26 12:20:17,952 [INFO] scgg.training.trainer:   Step 200 | Loss: 0.3388 | FM: 0.1886 | LR: 9.74e-04
+2026-03-26 12:20:17,965 [INFO] scgg.training.trainer: Epoch 40/300 | Loss: 0.3573 | FM: 0.2057 | LR: 9.74e-04 | Time: 8.1s
+2026-03-26 12:20:18,089 [INFO] scgg.training.trainer:   Val Loss: 0.4821 | Val FM: 0.4821
+2026-03-26 12:20:18,274 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch40.pt
+2026-03-26 12:20:26,305 [INFO] scgg.training.trainer: Epoch 41/300 | Loss: 0.3722 | FM: 0.2326 | LR: 9.72e-04 | Time: 8.0s
+2026-03-26 12:20:34,126 [INFO] scgg.training.trainer: Epoch 42/300 | Loss: 0.3175 | FM: 0.1822 | LR: 9.70e-04 | Time: 7.8s
+2026-03-26 12:20:39,416 [INFO] scgg.training.trainer: Epoch 43/300 | Loss: 0.3060 | FM: 0.2017 | LR: 9.68e-04 | Time: 5.3s
+2026-03-26 12:20:47,358 [INFO] scgg.training.trainer: Epoch 44/300 | Loss: 0.3330 | FM: 0.1834 | LR: 9.66e-04 | Time: 7.9s
+2026-03-26 12:20:54,214 [INFO] scgg.training.trainer: Epoch 45/300 | Loss: 0.5573 | FM: 0.4386 | LR: 9.64e-04 | Time: 6.9s
+2026-03-26 12:20:54,338 [INFO] scgg.training.trainer:   Val Loss: 0.2330 | Val FM: 0.2330
+2026-03-26 12:20:54,539 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch45.pt
+2026-03-26 12:20:54,686 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:21:00,554 [INFO] scgg.training.trainer: Epoch 46/300 | Loss: 0.4184 | FM: 0.3130 | LR: 9.62e-04 | Time: 5.4s
+2026-03-26 12:21:08,442 [INFO] scgg.training.trainer: Epoch 47/300 | Loss: 0.3061 | FM: 0.1788 | LR: 9.60e-04 | Time: 7.9s
+2026-03-26 12:21:13,875 [INFO] scgg.training.trainer: Epoch 48/300 | Loss: 0.3226 | FM: 0.2226 | LR: 9.58e-04 | Time: 5.4s
+2026-03-26 12:21:21,837 [INFO] scgg.training.trainer: Epoch 49/300 | Loss: 0.6555 | FM: 0.5038 | LR: 9.56e-04 | Time: 8.0s
+2026-03-26 12:21:29,798 [INFO] scgg.training.trainer: Epoch 50/300 | Loss: 0.3535 | FM: 0.2140 | LR: 9.54e-04 | Time: 8.0s
+2026-03-26 12:21:29,926 [INFO] scgg.training.trainer:   Val Loss: 0.2649 | Val FM: 0.2649
+2026-03-26 12:21:30,112 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch50.pt
+2026-03-26 12:21:38,153 [INFO] scgg.training.trainer: Epoch 51/300 | Loss: 0.5987 | FM: 0.4611 | LR: 9.51e-04 | Time: 8.0s
+2026-03-26 12:21:43,602 [INFO] scgg.training.trainer: Epoch 52/300 | Loss: 0.4263 | FM: 0.3253 | LR: 9.49e-04 | Time: 5.4s
+2026-03-26 12:21:49,094 [INFO] scgg.training.trainer: Epoch 53/300 | Loss: 0.3007 | FM: 0.2042 | LR: 9.47e-04 | Time: 5.5s
+2026-03-26 12:21:57,165 [INFO] scgg.training.trainer: Epoch 54/300 | Loss: 0.3360 | FM: 0.2081 | LR: 9.44e-04 | Time: 8.1s
+2026-03-26 12:22:05,135 [INFO] scgg.training.trainer: Epoch 55/300 | Loss: 0.5267 | FM: 0.3850 | LR: 9.42e-04 | Time: 8.0s
+2026-03-26 12:22:05,255 [INFO] scgg.training.trainer:   Val Loss: 0.3525 | Val FM: 0.3525
+2026-03-26 12:22:13,403 [INFO] scgg.training.trainer: Epoch 56/300 | Loss: 0.3703 | FM: 0.2323 | LR: 9.39e-04 | Time: 8.1s
+2026-03-26 12:22:18,850 [INFO] scgg.training.trainer: Epoch 57/300 | Loss: 0.2559 | FM: 0.1658 | LR: 9.37e-04 | Time: 5.4s
+2026-03-26 12:22:24,265 [INFO] scgg.training.trainer: Epoch 58/300 | Loss: 0.2298 | FM: 0.1426 | LR: 9.34e-04 | Time: 5.4s
+2026-03-26 12:22:32,313 [INFO] scgg.training.trainer: Epoch 59/300 | Loss: 0.3154 | FM: 0.1968 | LR: 9.31e-04 | Time: 8.0s
+2026-03-26 12:22:37,693 [INFO] scgg.training.trainer:   Step 300 | Loss: 0.2654 | FM: 0.1806 | LR: 9.28e-04
+2026-03-26 12:22:37,702 [INFO] scgg.training.trainer: Epoch 60/300 | Loss: 0.3269 | FM: 0.2370 | LR: 9.28e-04 | Time: 5.4s
+2026-03-26 12:22:37,825 [INFO] scgg.training.trainer:   Val Loss: 0.1973 | Val FM: 0.1973
+2026-03-26 12:22:37,970 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch60.pt
+2026-03-26 12:22:38,131 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:22:38,705 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch60.pt
+2026-03-26 12:22:44,255 [INFO] scgg.training.trainer: Epoch 61/300 | Loss: 0.2591 | FM: 0.1712 | LR: 9.26e-04 | Time: 5.5s
+2026-03-26 12:22:49,616 [INFO] scgg.training.trainer: Epoch 62/300 | Loss: 0.2028 | FM: 0.1171 | LR: 9.23e-04 | Time: 5.4s
+2026-03-26 12:22:55,023 [INFO] scgg.training.trainer: Epoch 63/300 | Loss: 0.1932 | FM: 0.1104 | LR: 9.20e-04 | Time: 5.4s
+2026-03-26 12:23:03,000 [INFO] scgg.training.trainer: Epoch 64/300 | Loss: 0.5270 | FM: 0.3949 | LR: 9.17e-04 | Time: 8.0s
+2026-03-26 12:23:10,951 [INFO] scgg.training.trainer: Epoch 65/300 | Loss: 0.3953 | FM: 0.2811 | LR: 9.14e-04 | Time: 8.0s
+2026-03-26 12:23:11,071 [INFO] scgg.training.trainer:   Val Loss: 0.2763 | Val FM: 0.2763
+2026-03-26 12:23:19,053 [INFO] scgg.training.trainer: Epoch 66/300 | Loss: 0.3079 | FM: 0.1896 | LR: 9.11e-04 | Time: 8.0s
+2026-03-26 12:23:26,850 [INFO] scgg.training.trainer: Epoch 67/300 | Loss: 0.3419 | FM: 0.2329 | LR: 9.08e-04 | Time: 7.8s
+2026-03-26 12:23:34,890 [INFO] scgg.training.trainer: Epoch 68/300 | Loss: 0.2909 | FM: 0.1761 | LR: 9.05e-04 | Time: 8.0s
+2026-03-26 12:23:43,003 [INFO] scgg.training.trainer: Epoch 69/300 | Loss: 0.3554 | FM: 0.2381 | LR: 9.01e-04 | Time: 8.1s
+2026-03-26 12:23:51,073 [INFO] scgg.training.trainer: Epoch 70/300 | Loss: 0.2749 | FM: 0.1610 | LR: 8.98e-04 | Time: 8.1s
+2026-03-26 12:23:51,197 [INFO] scgg.training.trainer:   Val Loss: 0.1674 | Val FM: 0.1674
+2026-03-26 12:23:51,329 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch70.pt
+2026-03-26 12:23:51,474 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:23:52,056 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch70.pt
+2026-03-26 12:24:00,191 [INFO] scgg.training.trainer: Epoch 71/300 | Loss: 0.2929 | FM: 0.1868 | LR: 8.95e-04 | Time: 8.1s
+2026-03-26 12:24:08,107 [INFO] scgg.training.trainer: Epoch 72/300 | Loss: 0.2600 | FM: 0.1492 | LR: 8.91e-04 | Time: 7.9s
+2026-03-26 12:24:14,910 [INFO] scgg.training.trainer: Epoch 73/300 | Loss: 0.2857 | FM: 0.1967 | LR: 8.88e-04 | Time: 6.8s
+2026-03-26 12:24:21,772 [INFO] scgg.training.trainer: Epoch 74/300 | Loss: 0.2475 | FM: 0.1598 | LR: 8.85e-04 | Time: 6.9s
+2026-03-26 12:24:29,805 [INFO] scgg.training.trainer: Epoch 75/300 | Loss: 0.3606 | FM: 0.2508 | LR: 8.81e-04 | Time: 8.0s
+2026-03-26 12:24:29,925 [INFO] scgg.training.trainer:   Val Loss: 0.2883 | Val FM: 0.2883
+2026-03-26 12:24:37,907 [INFO] scgg.training.trainer: Epoch 76/300 | Loss: 0.2574 | FM: 0.1495 | LR: 8.78e-04 | Time: 8.0s
+2026-03-26 12:24:44,823 [INFO] scgg.training.trainer: Epoch 77/300 | Loss: 0.2824 | FM: 0.1973 | LR: 8.74e-04 | Time: 6.9s
+2026-03-26 12:24:52,771 [INFO] scgg.training.trainer: Epoch 78/300 | Loss: 0.3258 | FM: 0.2157 | LR: 8.70e-04 | Time: 7.9s
+2026-03-26 12:25:00,754 [INFO] scgg.training.trainer: Epoch 79/300 | Loss: 0.4185 | FM: 0.3113 | LR: 8.67e-04 | Time: 8.0s
+2026-03-26 12:25:08,728 [INFO] scgg.training.trainer:   Step 400 | Loss: 0.2661 | FM: 0.1654 | LR: 8.63e-04
+2026-03-26 12:25:08,742 [INFO] scgg.training.trainer: Epoch 80/300 | Loss: 0.2572 | FM: 0.1529 | LR: 8.63e-04 | Time: 8.0s
+2026-03-26 12:25:08,868 [INFO] scgg.training.trainer:   Val Loss: 0.2231 | Val FM: 0.2231
+2026-03-26 12:25:09,023 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch80.pt
+2026-03-26 12:25:17,016 [INFO] scgg.training.trainer: Epoch 81/300 | Loss: 0.2494 | FM: 0.1512 | LR: 8.59e-04 | Time: 8.0s
+2026-03-26 12:25:24,999 [INFO] scgg.training.trainer: Epoch 82/300 | Loss: 0.2764 | FM: 0.1722 | LR: 8.55e-04 | Time: 8.0s
+2026-03-26 12:25:32,849 [INFO] scgg.training.trainer: Epoch 83/300 | Loss: 0.2377 | FM: 0.1332 | LR: 8.52e-04 | Time: 7.8s
+2026-03-26 12:25:39,818 [INFO] scgg.training.trainer: Epoch 84/300 | Loss: 0.2945 | FM: 0.2102 | LR: 8.48e-04 | Time: 7.0s
+2026-03-26 12:25:47,838 [INFO] scgg.training.trainer: Epoch 85/300 | Loss: 0.2501 | FM: 0.1455 | LR: 8.44e-04 | Time: 8.0s
+2026-03-26 12:25:47,959 [INFO] scgg.training.trainer:   Val Loss: 0.2846 | Val FM: 0.2846
+2026-03-26 12:25:56,070 [INFO] scgg.training.trainer: Epoch 86/300 | Loss: 0.2152 | FM: 0.1144 | LR: 8.40e-04 | Time: 8.1s
+2026-03-26 12:26:03,052 [INFO] scgg.training.trainer: Epoch 87/300 | Loss: 0.3798 | FM: 0.2978 | LR: 8.36e-04 | Time: 7.0s
+2026-03-26 12:26:10,014 [INFO] scgg.training.trainer: Epoch 88/300 | Loss: 0.2446 | FM: 0.1626 | LR: 8.32e-04 | Time: 7.0s
+2026-03-26 12:26:17,881 [INFO] scgg.training.trainer: Epoch 89/300 | Loss: 0.2306 | FM: 0.1423 | LR: 8.28e-04 | Time: 7.9s
+2026-03-26 12:26:25,864 [INFO] scgg.training.trainer: Epoch 90/300 | Loss: 0.2500 | FM: 0.1470 | LR: 8.24e-04 | Time: 8.0s
+2026-03-26 12:26:25,986 [INFO] scgg.training.trainer:   Val Loss: 0.1525 | Val FM: 0.1525
+2026-03-26 12:26:26,139 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch90.pt
+2026-03-26 12:26:26,313 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:26:27,590 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch90.pt
+2026-03-26 12:26:35,620 [INFO] scgg.training.trainer: Epoch 91/300 | Loss: 0.2723 | FM: 0.1756 | LR: 8.20e-04 | Time: 8.0s
+2026-03-26 12:26:43,522 [INFO] scgg.training.trainer: Epoch 92/300 | Loss: 0.2282 | FM: 0.1240 | LR: 8.15e-04 | Time: 7.9s
+2026-03-26 12:26:51,470 [INFO] scgg.training.trainer: Epoch 93/300 | Loss: 0.3057 | FM: 0.2060 | LR: 8.11e-04 | Time: 7.9s
+2026-03-26 12:26:59,419 [INFO] scgg.training.trainer: Epoch 94/300 | Loss: 0.2929 | FM: 0.2024 | LR: 8.07e-04 | Time: 7.9s
+2026-03-26 12:27:07,261 [INFO] scgg.training.trainer: Epoch 95/300 | Loss: 0.2309 | FM: 0.1434 | LR: 8.03e-04 | Time: 7.8s
+2026-03-26 12:27:07,378 [INFO] scgg.training.trainer:   Val Loss: 0.1541 | Val FM: 0.1541
+2026-03-26 12:27:14,292 [INFO] scgg.training.trainer: Epoch 96/300 | Loss: 0.2205 | FM: 0.1416 | LR: 7.98e-04 | Time: 6.9s
+2026-03-26 12:27:22,257 [INFO] scgg.training.trainer: Epoch 97/300 | Loss: 0.2102 | FM: 0.1158 | LR: 7.94e-04 | Time: 8.0s
+2026-03-26 12:27:30,235 [INFO] scgg.training.trainer: Epoch 98/300 | Loss: 0.1840 | FM: 0.1022 | LR: 7.89e-04 | Time: 8.0s
+2026-03-26 12:27:38,237 [INFO] scgg.training.trainer: Epoch 99/300 | Loss: 0.2596 | FM: 0.1717 | LR: 7.85e-04 | Time: 8.0s
+2026-03-26 12:27:46,205 [INFO] scgg.training.trainer:   Step 500 | Loss: 0.2017 | FM: 0.1219 | LR: 7.81e-04
+2026-03-26 12:27:46,216 [INFO] scgg.training.trainer: Epoch 100/300 | Loss: 0.2268 | FM: 0.1444 | LR: 7.81e-04 | Time: 8.0s
+2026-03-26 12:27:46,334 [INFO] scgg.training.trainer:   Val Loss: 0.2497 | Val FM: 0.2497
+2026-03-26 12:27:46,464 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch100.pt
+2026-03-26 12:27:54,328 [INFO] scgg.training.trainer: Epoch 101/300 | Loss: 0.1805 | FM: 0.1000 | LR: 7.76e-04 | Time: 7.9s
+2026-03-26 12:28:02,426 [INFO] scgg.training.trainer: Epoch 102/300 | Loss: 0.2317 | FM: 0.1379 | LR: 7.72e-04 | Time: 8.1s
+2026-03-26 12:28:10,343 [INFO] scgg.training.trainer: Epoch 103/300 | Loss: 0.1858 | FM: 0.0929 | LR: 7.67e-04 | Time: 7.9s
+2026-03-26 12:28:18,410 [INFO] scgg.training.trainer: Epoch 104/300 | Loss: 0.2522 | FM: 0.1619 | LR: 7.62e-04 | Time: 8.1s
+2026-03-26 12:28:26,467 [INFO] scgg.training.trainer: Epoch 105/300 | Loss: 0.2044 | FM: 0.1121 | LR: 7.58e-04 | Time: 8.1s
+2026-03-26 12:28:26,585 [INFO] scgg.training.trainer:   Val Loss: 0.2292 | Val FM: 0.2292
+2026-03-26 12:28:34,552 [INFO] scgg.training.trainer: Epoch 106/300 | Loss: 0.1906 | FM: 0.1075 | LR: 7.53e-04 | Time: 8.0s
+2026-03-26 12:28:42,677 [INFO] scgg.training.trainer: Epoch 107/300 | Loss: 0.1884 | FM: 0.1060 | LR: 7.48e-04 | Time: 8.1s
+2026-03-26 12:28:50,758 [INFO] scgg.training.trainer: Epoch 108/300 | Loss: 0.2328 | FM: 0.1424 | LR: 7.44e-04 | Time: 8.1s
+2026-03-26 12:28:58,838 [INFO] scgg.training.trainer: Epoch 109/300 | Loss: 0.2169 | FM: 0.1310 | LR: 7.39e-04 | Time: 8.1s
+2026-03-26 12:29:06,739 [INFO] scgg.training.trainer: Epoch 110/300 | Loss: 0.2962 | FM: 0.2183 | LR: 7.34e-04 | Time: 7.9s
+2026-03-26 12:29:06,860 [INFO] scgg.training.trainer:   Val Loss: 0.1841 | Val FM: 0.1841
+2026-03-26 12:29:06,991 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch110.pt
+2026-03-26 12:29:14,971 [INFO] scgg.training.trainer: Epoch 111/300 | Loss: 0.2059 | FM: 0.1218 | LR: 7.29e-04 | Time: 8.0s
+2026-03-26 12:29:22,838 [INFO] scgg.training.trainer: Epoch 112/300 | Loss: 0.4917 | FM: 0.4013 | LR: 7.25e-04 | Time: 7.9s
+2026-03-26 12:29:30,706 [INFO] scgg.training.trainer: Epoch 113/300 | Loss: 0.2058 | FM: 0.1187 | LR: 7.20e-04 | Time: 7.9s
+2026-03-26 12:29:37,587 [INFO] scgg.training.trainer: Epoch 114/300 | Loss: 0.2557 | FM: 0.1833 | LR: 7.15e-04 | Time: 6.9s
+2026-03-26 12:29:43,090 [INFO] scgg.training.trainer: Epoch 115/300 | Loss: 0.1798 | FM: 0.1175 | LR: 7.10e-04 | Time: 5.5s
+2026-03-26 12:29:43,211 [INFO] scgg.training.trainer:   Val Loss: 0.1951 | Val FM: 0.1951
+2026-03-26 12:29:51,300 [INFO] scgg.training.trainer: Epoch 116/300 | Loss: 0.2393 | FM: 0.1581 | LR: 7.05e-04 | Time: 8.1s
+2026-03-26 12:29:59,204 [INFO] scgg.training.trainer: Epoch 117/300 | Loss: 0.2241 | FM: 0.1474 | LR: 7.00e-04 | Time: 7.9s
+2026-03-26 12:30:07,128 [INFO] scgg.training.trainer: Epoch 118/300 | Loss: 0.2040 | FM: 0.1243 | LR: 6.95e-04 | Time: 7.9s
+2026-03-26 12:30:15,114 [INFO] scgg.training.trainer: Epoch 119/300 | Loss: 0.2161 | FM: 0.1411 | LR: 6.90e-04 | Time: 8.0s
+2026-03-26 12:30:23,043 [INFO] scgg.training.trainer:   Step 600 | Loss: 0.1609 | FM: 0.0899 | LR: 6.85e-04
+2026-03-26 12:30:23,053 [INFO] scgg.training.trainer: Epoch 120/300 | Loss: 0.1646 | FM: 0.0911 | LR: 6.85e-04 | Time: 7.9s
+2026-03-26 12:30:23,174 [INFO] scgg.training.trainer:   Val Loss: 0.3583 | Val FM: 0.3583
+2026-03-26 12:30:23,303 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch120.pt
+2026-03-26 12:30:31,280 [INFO] scgg.training.trainer: Epoch 121/300 | Loss: 0.2187 | FM: 0.1359 | LR: 6.80e-04 | Time: 8.0s
+2026-03-26 12:30:38,239 [INFO] scgg.training.trainer: Epoch 122/300 | Loss: 0.4161 | FM: 0.3451 | LR: 6.75e-04 | Time: 7.0s
+2026-03-26 12:30:46,206 [INFO] scgg.training.trainer: Epoch 123/300 | Loss: 0.2146 | FM: 0.1380 | LR: 6.70e-04 | Time: 8.0s
+2026-03-26 12:30:54,250 [INFO] scgg.training.trainer: Epoch 124/300 | Loss: 0.1863 | FM: 0.1027 | LR: 6.65e-04 | Time: 8.0s
+2026-03-26 12:31:01,101 [INFO] scgg.training.trainer: Epoch 125/300 | Loss: 0.2102 | FM: 0.1437 | LR: 6.60e-04 | Time: 6.8s
+2026-03-26 12:31:01,221 [INFO] scgg.training.trainer:   Val Loss: 0.0942 | Val FM: 0.0942
+2026-03-26 12:31:01,366 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch125.pt
+2026-03-26 12:31:01,524 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:31:09,965 [INFO] scgg.training.trainer: Epoch 126/300 | Loss: 0.1848 | FM: 0.1055 | LR: 6.55e-04 | Time: 8.0s
+2026-03-26 12:31:16,786 [INFO] scgg.training.trainer: Epoch 127/300 | Loss: 0.1893 | FM: 0.1255 | LR: 6.49e-04 | Time: 6.8s
+2026-03-26 12:31:22,124 [INFO] scgg.training.trainer: Epoch 128/300 | Loss: 0.1558 | FM: 0.0999 | LR: 6.44e-04 | Time: 5.3s
+2026-03-26 12:31:30,043 [INFO] scgg.training.trainer: Epoch 129/300 | Loss: 0.2640 | FM: 0.1933 | LR: 6.39e-04 | Time: 7.9s
+2026-03-26 12:31:38,044 [INFO] scgg.training.trainer: Epoch 130/300 | Loss: 0.3343 | FM: 0.2516 | LR: 6.34e-04 | Time: 8.0s
+2026-03-26 12:31:38,162 [INFO] scgg.training.trainer:   Val Loss: 0.1355 | Val FM: 0.1355
+2026-03-26 12:31:38,290 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch130.pt
+2026-03-26 12:31:45,231 [INFO] scgg.training.trainer: Epoch 131/300 | Loss: 0.2072 | FM: 0.1418 | LR: 6.29e-04 | Time: 6.9s
+2026-03-26 12:31:53,070 [INFO] scgg.training.trainer: Epoch 132/300 | Loss: 0.2068 | FM: 0.1369 | LR: 6.23e-04 | Time: 7.8s
+2026-03-26 12:32:01,024 [INFO] scgg.training.trainer: Epoch 133/300 | Loss: 0.1844 | FM: 0.1094 | LR: 6.18e-04 | Time: 8.0s
+2026-03-26 12:32:06,400 [INFO] scgg.training.trainer: Epoch 134/300 | Loss: 0.1630 | FM: 0.1083 | LR: 6.13e-04 | Time: 5.4s
+2026-03-26 12:32:14,250 [INFO] scgg.training.trainer: Epoch 135/300 | Loss: 0.2566 | FM: 0.1881 | LR: 6.07e-04 | Time: 7.8s
+2026-03-26 12:32:14,373 [INFO] scgg.training.trainer:   Val Loss: 0.6415 | Val FM: 0.6415
+2026-03-26 12:32:22,404 [INFO] scgg.training.trainer: Epoch 136/300 | Loss: 0.1963 | FM: 0.1223 | LR: 6.02e-04 | Time: 8.0s
+2026-03-26 12:32:30,262 [INFO] scgg.training.trainer: Epoch 137/300 | Loss: 0.1784 | FM: 0.1111 | LR: 5.97e-04 | Time: 7.9s
+2026-03-26 12:32:38,243 [INFO] scgg.training.trainer: Epoch 138/300 | Loss: 0.5175 | FM: 0.4415 | LR: 5.92e-04 | Time: 8.0s
+2026-03-26 12:32:46,287 [INFO] scgg.training.trainer: Epoch 139/300 | Loss: 0.2954 | FM: 0.2133 | LR: 5.86e-04 | Time: 8.0s
+2026-03-26 12:32:53,206 [INFO] scgg.training.trainer:   Step 700 | Loss: 0.2152 | FM: 0.1519 | LR: 5.81e-04
+2026-03-26 12:32:53,216 [INFO] scgg.training.trainer: Epoch 140/300 | Loss: 0.3291 | FM: 0.2644 | LR: 5.81e-04 | Time: 6.9s
+2026-03-26 12:32:53,337 [INFO] scgg.training.trainer:   Val Loss: 0.1437 | Val FM: 0.1437
+2026-03-26 12:32:53,474 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch140.pt
+2026-03-26 12:33:01,275 [INFO] scgg.training.trainer: Epoch 141/300 | Loss: 0.3548 | FM: 0.2847 | LR: 5.76e-04 | Time: 7.8s
+2026-03-26 12:33:09,172 [INFO] scgg.training.trainer: Epoch 142/300 | Loss: 0.2747 | FM: 0.1990 | LR: 5.70e-04 | Time: 7.9s
+2026-03-26 12:33:17,115 [INFO] scgg.training.trainer: Epoch 143/300 | Loss: 0.2025 | FM: 0.1200 | LR: 5.65e-04 | Time: 7.9s
+2026-03-26 12:33:25,162 [INFO] scgg.training.trainer: Epoch 144/300 | Loss: 0.3369 | FM: 0.2588 | LR: 5.59e-04 | Time: 8.0s
+2026-03-26 12:33:33,130 [INFO] scgg.training.trainer: Epoch 145/300 | Loss: 0.2028 | FM: 0.1187 | LR: 5.54e-04 | Time: 8.0s
+2026-03-26 12:33:33,252 [INFO] scgg.training.trainer:   Val Loss: 0.3504 | Val FM: 0.3504
+2026-03-26 12:33:41,318 [INFO] scgg.training.trainer: Epoch 146/300 | Loss: 0.1904 | FM: 0.1152 | LR: 5.49e-04 | Time: 8.1s
+2026-03-26 12:33:48,109 [INFO] scgg.training.trainer: Epoch 147/300 | Loss: 0.2728 | FM: 0.2103 | LR: 5.43e-04 | Time: 6.8s
+2026-03-26 12:33:56,111 [INFO] scgg.training.trainer: Epoch 148/300 | Loss: 0.3639 | FM: 0.2941 | LR: 5.38e-04 | Time: 8.0s
+2026-03-26 12:34:04,070 [INFO] scgg.training.trainer: Epoch 149/300 | Loss: 0.2155 | FM: 0.1387 | LR: 5.32e-04 | Time: 8.0s
+2026-03-26 12:34:12,086 [INFO] scgg.training.trainer: Epoch 150/300 | Loss: 0.2626 | FM: 0.1848 | LR: 5.27e-04 | Time: 8.0s
+2026-03-26 12:34:12,208 [INFO] scgg.training.trainer:   Val Loss: 0.1203 | Val FM: 0.1203
+2026-03-26 12:34:12,337 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch150.pt
+2026-03-26 12:34:20,316 [INFO] scgg.training.trainer: Epoch 151/300 | Loss: 0.2671 | FM: 0.1916 | LR: 5.22e-04 | Time: 8.0s
+2026-03-26 12:34:28,275 [INFO] scgg.training.trainer: Epoch 152/300 | Loss: 0.1666 | FM: 0.0970 | LR: 5.16e-04 | Time: 8.0s
+2026-03-26 12:34:35,155 [INFO] scgg.training.trainer: Epoch 153/300 | Loss: 0.1713 | FM: 0.1132 | LR: 5.11e-04 | Time: 6.9s
+2026-03-26 12:34:41,952 [INFO] scgg.training.trainer: Epoch 154/300 | Loss: 0.1536 | FM: 0.0962 | LR: 5.05e-04 | Time: 6.8s
+2026-03-26 12:34:49,852 [INFO] scgg.training.trainer: Epoch 155/300 | Loss: 0.1626 | FM: 0.0887 | LR: 5.00e-04 | Time: 7.9s
+2026-03-26 12:34:49,975 [INFO] scgg.training.trainer:   Val Loss: 0.0852 | Val FM: 0.0852
+2026-03-26 12:34:50,110 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch155.pt
+2026-03-26 12:34:50,251 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:34:58,608 [INFO] scgg.training.trainer: Epoch 156/300 | Loss: 0.1491 | FM: 0.0866 | LR: 4.95e-04 | Time: 8.0s
+2026-03-26 12:35:06,520 [INFO] scgg.training.trainer: Epoch 157/300 | Loss: 0.4130 | FM: 0.3419 | LR: 4.89e-04 | Time: 7.9s
+2026-03-26 12:35:14,496 [INFO] scgg.training.trainer: Epoch 158/300 | Loss: 0.1965 | FM: 0.1290 | LR: 4.84e-04 | Time: 8.0s
+2026-03-26 12:35:22,547 [INFO] scgg.training.trainer: Epoch 159/300 | Loss: 0.1835 | FM: 0.1093 | LR: 4.78e-04 | Time: 8.0s
+2026-03-26 12:35:30,563 [INFO] scgg.training.trainer:   Step 800 | Loss: 0.1722 | FM: 0.1001 | LR: 4.73e-04
+2026-03-26 12:35:30,573 [INFO] scgg.training.trainer: Epoch 160/300 | Loss: 0.1760 | FM: 0.1030 | LR: 4.73e-04 | Time: 8.0s
+2026-03-26 12:35:30,699 [INFO] scgg.training.trainer:   Val Loss: 0.1038 | Val FM: 0.1038
+2026-03-26 12:35:30,828 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch160.pt
+2026-03-26 12:35:36,258 [INFO] scgg.training.trainer: Epoch 161/300 | Loss: 0.1640 | FM: 0.1141 | LR: 4.68e-04 | Time: 5.4s
+2026-03-26 12:35:44,343 [INFO] scgg.training.trainer: Epoch 162/300 | Loss: 0.1602 | FM: 0.0945 | LR: 4.62e-04 | Time: 8.1s
+2026-03-26 12:35:52,307 [INFO] scgg.training.trainer: Epoch 163/300 | Loss: 0.2002 | FM: 0.1276 | LR: 4.57e-04 | Time: 8.0s
+2026-03-26 12:36:00,337 [INFO] scgg.training.trainer: Epoch 164/300 | Loss: 0.1738 | FM: 0.1075 | LR: 4.51e-04 | Time: 8.0s
+2026-03-26 12:36:07,177 [INFO] scgg.training.trainer: Epoch 165/300 | Loss: 0.1334 | FM: 0.0773 | LR: 4.46e-04 | Time: 6.8s
+2026-03-26 12:36:07,299 [INFO] scgg.training.trainer:   Val Loss: 0.0832 | Val FM: 0.0832
+2026-03-26 12:36:07,475 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch165.pt
+2026-03-26 12:36:07,615 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:36:16,123 [INFO] scgg.training.trainer: Epoch 166/300 | Loss: 0.1631 | FM: 0.0909 | LR: 4.41e-04 | Time: 8.0s
+2026-03-26 12:36:24,132 [INFO] scgg.training.trainer: Epoch 167/300 | Loss: 0.1608 | FM: 0.0925 | LR: 4.35e-04 | Time: 8.0s
+2026-03-26 12:36:32,062 [INFO] scgg.training.trainer: Epoch 168/300 | Loss: 0.1629 | FM: 0.0954 | LR: 4.30e-04 | Time: 7.9s
+2026-03-26 12:36:38,890 [INFO] scgg.training.trainer: Epoch 169/300 | Loss: 0.1631 | FM: 0.1083 | LR: 4.24e-04 | Time: 6.8s
+2026-03-26 12:36:46,996 [INFO] scgg.training.trainer: Epoch 170/300 | Loss: 0.1663 | FM: 0.0945 | LR: 4.19e-04 | Time: 8.1s
+2026-03-26 12:36:47,117 [INFO] scgg.training.trainer:   Val Loss: 0.0998 | Val FM: 0.0998
+2026-03-26 12:36:47,244 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch170.pt
+2026-03-26 12:36:55,301 [INFO] scgg.training.trainer: Epoch 171/300 | Loss: 0.1497 | FM: 0.0865 | LR: 4.14e-04 | Time: 8.1s
+2026-03-26 12:37:00,656 [INFO] scgg.training.trainer: Epoch 172/300 | Loss: 0.1382 | FM: 0.0909 | LR: 4.08e-04 | Time: 5.4s
+2026-03-26 12:37:08,651 [INFO] scgg.training.trainer: Epoch 173/300 | Loss: 0.2350 | FM: 0.1716 | LR: 4.03e-04 | Time: 8.0s
+2026-03-26 12:37:15,482 [INFO] scgg.training.trainer: Epoch 174/300 | Loss: 0.1702 | FM: 0.1152 | LR: 3.98e-04 | Time: 6.8s
+2026-03-26 12:37:23,353 [INFO] scgg.training.trainer: Epoch 175/300 | Loss: 0.2146 | FM: 0.1546 | LR: 3.93e-04 | Time: 7.9s
+2026-03-26 12:37:23,481 [INFO] scgg.training.trainer:   Val Loss: 0.1109 | Val FM: 0.1109
+2026-03-26 12:37:31,337 [INFO] scgg.training.trainer: Epoch 176/300 | Loss: 0.1587 | FM: 0.0997 | LR: 3.87e-04 | Time: 7.9s
+2026-03-26 12:37:39,252 [INFO] scgg.training.trainer: Epoch 177/300 | Loss: 0.1566 | FM: 0.0902 | LR: 3.82e-04 | Time: 7.9s
+2026-03-26 12:37:47,114 [INFO] scgg.training.trainer: Epoch 178/300 | Loss: 0.1969 | FM: 0.1273 | LR: 3.77e-04 | Time: 7.9s
+2026-03-26 12:37:54,975 [INFO] scgg.training.trainer: Epoch 179/300 | Loss: 0.1575 | FM: 0.0886 | LR: 3.71e-04 | Time: 7.9s
+2026-03-26 12:38:02,798 [INFO] scgg.training.trainer:   Step 900 | Loss: 0.1428 | FM: 0.0856 | LR: 3.66e-04
+2026-03-26 12:38:02,812 [INFO] scgg.training.trainer: Epoch 180/300 | Loss: 0.1491 | FM: 0.0912 | LR: 3.66e-04 | Time: 7.8s
+2026-03-26 12:38:02,938 [INFO] scgg.training.trainer:   Val Loss: 0.1494 | Val FM: 0.1494
+2026-03-26 12:38:03,066 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch180.pt
+2026-03-26 12:38:11,082 [INFO] scgg.training.trainer: Epoch 181/300 | Loss: 0.1805 | FM: 0.1155 | LR: 3.61e-04 | Time: 8.0s
+2026-03-26 12:38:19,030 [INFO] scgg.training.trainer: Epoch 182/300 | Loss: 0.1582 | FM: 0.0901 | LR: 3.56e-04 | Time: 7.9s
+2026-03-26 12:38:26,878 [INFO] scgg.training.trainer: Epoch 183/300 | Loss: 0.1524 | FM: 0.0952 | LR: 3.51e-04 | Time: 7.8s
+2026-03-26 12:38:34,718 [INFO] scgg.training.trainer: Epoch 184/300 | Loss: 0.1298 | FM: 0.0731 | LR: 3.45e-04 | Time: 7.8s
+2026-03-26 12:38:42,606 [INFO] scgg.training.trainer: Epoch 185/300 | Loss: 0.1574 | FM: 0.0973 | LR: 3.40e-04 | Time: 7.9s
+2026-03-26 12:38:42,726 [INFO] scgg.training.trainer:   Val Loss: 0.1605 | Val FM: 0.1605
+2026-03-26 12:38:48,150 [INFO] scgg.training.trainer: Epoch 186/300 | Loss: 0.1315 | FM: 0.0862 | LR: 3.35e-04 | Time: 5.4s
+2026-03-26 12:38:53,549 [INFO] scgg.training.trainer: Epoch 187/300 | Loss: 0.1210 | FM: 0.0759 | LR: 3.30e-04 | Time: 5.4s
+2026-03-26 12:39:01,381 [INFO] scgg.training.trainer: Epoch 188/300 | Loss: 0.1277 | FM: 0.0710 | LR: 3.25e-04 | Time: 7.8s
+2026-03-26 12:39:06,771 [INFO] scgg.training.trainer: Epoch 189/300 | Loss: 0.1424 | FM: 0.0979 | LR: 3.20e-04 | Time: 5.4s
+2026-03-26 12:39:14,666 [INFO] scgg.training.trainer: Epoch 190/300 | Loss: 0.1276 | FM: 0.0716 | LR: 3.15e-04 | Time: 7.9s
+2026-03-26 12:39:14,787 [INFO] scgg.training.trainer:   Val Loss: 0.1498 | Val FM: 0.1498
+2026-03-26 12:39:14,922 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch190.pt
+2026-03-26 12:39:22,983 [INFO] scgg.training.trainer: Epoch 191/300 | Loss: 0.1678 | FM: 0.1039 | LR: 3.10e-04 | Time: 8.1s
+2026-03-26 12:39:30,926 [INFO] scgg.training.trainer: Epoch 192/300 | Loss: 0.1282 | FM: 0.0680 | LR: 3.05e-04 | Time: 7.9s
+2026-03-26 12:39:37,758 [INFO] scgg.training.trainer: Epoch 193/300 | Loss: 0.2042 | FM: 0.1530 | LR: 3.00e-04 | Time: 6.8s
+2026-03-26 12:39:45,729 [INFO] scgg.training.trainer: Epoch 194/300 | Loss: 0.1457 | FM: 0.0818 | LR: 2.95e-04 | Time: 8.0s
+2026-03-26 12:39:52,589 [INFO] scgg.training.trainer: Epoch 195/300 | Loss: 0.1633 | FM: 0.1122 | LR: 2.90e-04 | Time: 6.9s
+2026-03-26 12:39:52,711 [INFO] scgg.training.trainer:   Val Loss: 0.0858 | Val FM: 0.0858
+2026-03-26 12:40:00,675 [INFO] scgg.training.trainer: Epoch 196/300 | Loss: 0.1609 | FM: 0.0978 | LR: 2.85e-04 | Time: 8.0s
+2026-03-26 12:40:08,600 [INFO] scgg.training.trainer: Epoch 197/300 | Loss: 0.1387 | FM: 0.0756 | LR: 2.80e-04 | Time: 7.9s
+2026-03-26 12:40:14,045 [INFO] scgg.training.trainer: Epoch 198/300 | Loss: 0.1188 | FM: 0.0748 | LR: 2.75e-04 | Time: 5.4s
+2026-03-26 12:40:21,958 [INFO] scgg.training.trainer: Epoch 199/300 | Loss: 0.1468 | FM: 0.0809 | LR: 2.71e-04 | Time: 7.9s
+2026-03-26 12:40:29,848 [INFO] scgg.training.trainer:   Step 1000 | Loss: 0.1496 | FM: 0.0840 | LR: 2.66e-04
+2026-03-26 12:40:29,857 [INFO] scgg.training.trainer: Epoch 200/300 | Loss: 0.1466 | FM: 0.0807 | LR: 2.66e-04 | Time: 7.9s
+2026-03-26 12:40:29,980 [INFO] scgg.training.trainer:   Val Loss: 0.0929 | Val FM: 0.0929
+2026-03-26 12:40:30,110 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch200.pt
+2026-03-26 12:40:38,097 [INFO] scgg.training.trainer: Epoch 201/300 | Loss: 0.1774 | FM: 0.1186 | LR: 2.61e-04 | Time: 8.0s
+2026-03-26 12:40:45,024 [INFO] scgg.training.trainer: Epoch 202/300 | Loss: 0.1555 | FM: 0.1052 | LR: 2.56e-04 | Time: 6.9s
+2026-03-26 12:40:53,053 [INFO] scgg.training.trainer: Epoch 203/300 | Loss: 0.1490 | FM: 0.0834 | LR: 2.52e-04 | Time: 8.0s
+2026-03-26 12:41:00,978 [INFO] scgg.training.trainer: Epoch 204/300 | Loss: 0.1400 | FM: 0.0817 | LR: 2.47e-04 | Time: 7.9s
+2026-03-26 12:41:06,286 [INFO] scgg.training.trainer: Epoch 205/300 | Loss: 0.1264 | FM: 0.0830 | LR: 2.42e-04 | Time: 5.3s
+2026-03-26 12:41:06,416 [INFO] scgg.training.trainer:   Val Loss: 0.0856 | Val FM: 0.0856
+2026-03-26 12:41:14,347 [INFO] scgg.training.trainer: Epoch 206/300 | Loss: 0.1553 | FM: 0.0933 | LR: 2.38e-04 | Time: 7.9s
+2026-03-26 12:41:22,315 [INFO] scgg.training.trainer: Epoch 207/300 | Loss: 0.1359 | FM: 0.0740 | LR: 2.33e-04 | Time: 8.0s
+2026-03-26 12:41:30,300 [INFO] scgg.training.trainer: Epoch 208/300 | Loss: 0.1304 | FM: 0.0726 | LR: 2.28e-04 | Time: 8.0s
+2026-03-26 12:41:38,152 [INFO] scgg.training.trainer: Epoch 209/300 | Loss: 0.1480 | FM: 0.0871 | LR: 2.24e-04 | Time: 7.9s
+2026-03-26 12:41:46,039 [INFO] scgg.training.trainer: Epoch 210/300 | Loss: 0.1313 | FM: 0.0701 | LR: 2.19e-04 | Time: 7.9s
+2026-03-26 12:41:46,157 [INFO] scgg.training.trainer:   Val Loss: 0.1021 | Val FM: 0.1021
+2026-03-26 12:41:46,299 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch210.pt
+2026-03-26 12:41:51,722 [INFO] scgg.training.trainer: Epoch 211/300 | Loss: 0.1238 | FM: 0.0802 | LR: 2.15e-04 | Time: 5.4s
+2026-03-26 12:41:58,688 [INFO] scgg.training.trainer: Epoch 212/300 | Loss: 0.1336 | FM: 0.0840 | LR: 2.11e-04 | Time: 7.0s
+2026-03-26 12:42:06,681 [INFO] scgg.training.trainer: Epoch 213/300 | Loss: 0.1458 | FM: 0.0847 | LR: 2.06e-04 | Time: 8.0s
+2026-03-26 12:42:13,538 [INFO] scgg.training.trainer: Epoch 214/300 | Loss: 0.1343 | FM: 0.0850 | LR: 2.02e-04 | Time: 6.9s
+2026-03-26 12:42:18,947 [INFO] scgg.training.trainer: Epoch 215/300 | Loss: 0.1165 | FM: 0.0734 | LR: 1.97e-04 | Time: 5.4s
+2026-03-26 12:42:19,066 [INFO] scgg.training.trainer:   Val Loss: 0.0753 | Val FM: 0.0753
+2026-03-26 12:42:19,202 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch215.pt
+2026-03-26 12:42:19,361 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:42:27,831 [INFO] scgg.training.trainer: Epoch 216/300 | Loss: 0.1308 | FM: 0.0769 | LR: 1.93e-04 | Time: 8.0s
+2026-03-26 12:42:34,759 [INFO] scgg.training.trainer: Epoch 217/300 | Loss: 0.1303 | FM: 0.0816 | LR: 1.89e-04 | Time: 6.9s
+2026-03-26 12:42:42,560 [INFO] scgg.training.trainer: Epoch 218/300 | Loss: 0.1213 | FM: 0.0677 | LR: 1.85e-04 | Time: 7.8s
+2026-03-26 12:42:50,524 [INFO] scgg.training.trainer: Epoch 219/300 | Loss: 0.1439 | FM: 0.0835 | LR: 1.80e-04 | Time: 8.0s
+2026-03-26 12:42:55,862 [INFO] scgg.training.trainer:   Step 1100 | Loss: 0.1210 | FM: 0.0803 | LR: 1.76e-04
+2026-03-26 12:42:55,871 [INFO] scgg.training.trainer: Epoch 220/300 | Loss: 0.1230 | FM: 0.0807 | LR: 1.76e-04 | Time: 5.3s
+2026-03-26 12:42:55,996 [INFO] scgg.training.trainer:   Val Loss: 0.1073 | Val FM: 0.1073
+2026-03-26 12:42:56,136 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch220.pt
+2026-03-26 12:43:01,429 [INFO] scgg.training.trainer: Epoch 221/300 | Loss: 0.1125 | FM: 0.0704 | LR: 1.72e-04 | Time: 5.3s
+2026-03-26 12:43:09,485 [INFO] scgg.training.trainer: Epoch 222/300 | Loss: 0.1338 | FM: 0.0737 | LR: 1.68e-04 | Time: 8.1s
+2026-03-26 12:43:17,463 [INFO] scgg.training.trainer: Epoch 223/300 | Loss: 0.1265 | FM: 0.0665 | LR: 1.64e-04 | Time: 8.0s
+2026-03-26 12:43:22,824 [INFO] scgg.training.trainer: Epoch 224/300 | Loss: 0.1239 | FM: 0.0820 | LR: 1.60e-04 | Time: 5.4s
+2026-03-26 12:43:29,649 [INFO] scgg.training.trainer: Epoch 225/300 | Loss: 0.1262 | FM: 0.0782 | LR: 1.56e-04 | Time: 6.8s
+2026-03-26 12:43:29,769 [INFO] scgg.training.trainer:   Val Loss: 0.0874 | Val FM: 0.0874
+2026-03-26 12:43:37,706 [INFO] scgg.training.trainer: Epoch 226/300 | Loss: 0.1274 | FM: 0.0712 | LR: 1.52e-04 | Time: 7.9s
+2026-03-26 12:43:45,695 [INFO] scgg.training.trainer: Epoch 227/300 | Loss: 0.1281 | FM: 0.0719 | LR: 1.48e-04 | Time: 8.0s
+2026-03-26 12:43:53,727 [INFO] scgg.training.trainer: Epoch 228/300 | Loss: 0.1218 | FM: 0.0656 | LR: 1.45e-04 | Time: 8.0s
+2026-03-26 12:44:01,693 [INFO] scgg.training.trainer: Epoch 229/300 | Loss: 0.1344 | FM: 0.0749 | LR: 1.41e-04 | Time: 8.0s
+2026-03-26 12:44:07,053 [INFO] scgg.training.trainer: Epoch 230/300 | Loss: 0.1090 | FM: 0.0673 | LR: 1.37e-04 | Time: 5.4s
+2026-03-26 12:44:07,172 [INFO] scgg.training.trainer:   Val Loss: 0.0772 | Val FM: 0.0772
+2026-03-26 12:44:07,305 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch230.pt
+2026-03-26 12:44:15,198 [INFO] scgg.training.trainer: Epoch 231/300 | Loss: 0.1258 | FM: 0.0732 | LR: 1.33e-04 | Time: 7.9s
+2026-03-26 12:44:23,161 [INFO] scgg.training.trainer: Epoch 232/300 | Loss: 0.1293 | FM: 0.0702 | LR: 1.30e-04 | Time: 8.0s
+2026-03-26 12:44:31,148 [INFO] scgg.training.trainer: Epoch 233/300 | Loss: 0.1130 | FM: 0.0612 | LR: 1.26e-04 | Time: 8.0s
+2026-03-26 12:44:39,070 [INFO] scgg.training.trainer: Epoch 234/300 | Loss: 0.1238 | FM: 0.0716 | LR: 1.22e-04 | Time: 7.9s
+2026-03-26 12:44:46,986 [INFO] scgg.training.trainer: Epoch 235/300 | Loss: 0.1308 | FM: 0.0717 | LR: 1.19e-04 | Time: 7.9s
+2026-03-26 12:44:47,107 [INFO] scgg.training.trainer:   Val Loss: 0.0726 | Val FM: 0.0726
+2026-03-26 12:44:47,235 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch235.pt
+2026-03-26 12:44:47,383 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:44:55,824 [INFO] scgg.training.trainer: Epoch 236/300 | Loss: 0.1232 | FM: 0.0677 | LR: 1.15e-04 | Time: 8.1s
+2026-03-26 12:45:03,743 [INFO] scgg.training.trainer: Epoch 237/300 | Loss: 0.1313 | FM: 0.0689 | LR: 1.12e-04 | Time: 7.9s
+2026-03-26 12:45:09,176 [INFO] scgg.training.trainer: Epoch 238/300 | Loss: 0.1042 | FM: 0.0628 | LR: 1.09e-04 | Time: 5.4s
+2026-03-26 12:45:17,265 [INFO] scgg.training.trainer: Epoch 239/300 | Loss: 0.1252 | FM: 0.0665 | LR: 1.05e-04 | Time: 8.1s
+2026-03-26 12:45:25,200 [INFO] scgg.training.trainer:   Step 1200 | Loss: 0.1106 | FM: 0.0602 | LR: 1.02e-04
+2026-03-26 12:45:25,210 [INFO] scgg.training.trainer: Epoch 240/300 | Loss: 0.1164 | FM: 0.0650 | LR: 1.02e-04 | Time: 7.9s
+2026-03-26 12:45:25,333 [INFO] scgg.training.trainer:   Val Loss: 0.0638 | Val FM: 0.0638
+2026-03-26 12:45:25,460 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch240.pt
+2026-03-26 12:45:25,620 [INFO] scgg.training.trainer: Saved best model: checkpoints/best_model.pt
+2026-03-26 12:45:26,142 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch240.pt
+2026-03-26 12:45:34,185 [INFO] scgg.training.trainer: Epoch 241/300 | Loss: 0.1309 | FM: 0.0688 | LR: 9.87e-05 | Time: 8.0s
+2026-03-26 12:45:42,175 [INFO] scgg.training.trainer: Epoch 242/300 | Loss: 0.1212 | FM: 0.0626 | LR: 9.55e-05 | Time: 8.0s
+2026-03-26 12:45:50,064 [INFO] scgg.training.trainer: Epoch 243/300 | Loss: 0.1218 | FM: 0.0631 | LR: 9.23e-05 | Time: 7.9s
+2026-03-26 12:45:57,870 [INFO] scgg.training.trainer: Epoch 244/300 | Loss: 0.1215 | FM: 0.0701 | LR: 8.92e-05 | Time: 7.8s
+2026-03-26 12:46:05,666 [INFO] scgg.training.trainer: Epoch 245/300 | Loss: 0.1186 | FM: 0.0674 | LR: 8.62e-05 | Time: 7.8s
+2026-03-26 12:46:05,786 [INFO] scgg.training.trainer:   Val Loss: 0.0670 | Val FM: 0.0670
+2026-03-26 12:46:13,543 [INFO] scgg.training.trainer: Epoch 246/300 | Loss: 0.1179 | FM: 0.0666 | LR: 8.31e-05 | Time: 7.8s
+2026-03-26 12:46:21,421 [INFO] scgg.training.trainer: Epoch 247/300 | Loss: 0.1205 | FM: 0.0689 | LR: 8.02e-05 | Time: 7.9s
+2026-03-26 12:46:29,462 [INFO] scgg.training.trainer: Epoch 248/300 | Loss: 0.1282 | FM: 0.0696 | LR: 7.73e-05 | Time: 8.0s
+2026-03-26 12:46:34,857 [INFO] scgg.training.trainer: Epoch 249/300 | Loss: 0.1101 | FM: 0.0690 | LR: 7.44e-05 | Time: 5.4s
+2026-03-26 12:46:42,858 [INFO] scgg.training.trainer: Epoch 250/300 | Loss: 0.1276 | FM: 0.0660 | LR: 7.16e-05 | Time: 8.0s
+2026-03-26 12:46:42,976 [INFO] scgg.training.trainer:   Val Loss: 0.0752 | Val FM: 0.0752
+2026-03-26 12:46:43,101 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch250.pt
+2026-03-26 12:46:51,171 [INFO] scgg.training.trainer: Epoch 251/300 | Loss: 0.1209 | FM: 0.0624 | LR: 6.88e-05 | Time: 8.1s
+2026-03-26 12:46:56,525 [INFO] scgg.training.trainer: Epoch 252/300 | Loss: 0.1094 | FM: 0.0685 | LR: 6.61e-05 | Time: 5.4s
+2026-03-26 12:47:04,418 [INFO] scgg.training.trainer: Epoch 253/300 | Loss: 0.1243 | FM: 0.0696 | LR: 6.34e-05 | Time: 7.9s
+2026-03-26 12:47:12,348 [INFO] scgg.training.trainer: Epoch 254/300 | Loss: 0.1192 | FM: 0.0644 | LR: 6.08e-05 | Time: 7.9s
+2026-03-26 12:47:20,280 [INFO] scgg.training.trainer: Epoch 255/300 | Loss: 0.1191 | FM: 0.0642 | LR: 5.82e-05 | Time: 7.9s
+2026-03-26 12:47:20,402 [INFO] scgg.training.trainer:   Val Loss: 0.0707 | Val FM: 0.0707
+2026-03-26 12:47:25,797 [INFO] scgg.training.trainer: Epoch 256/300 | Loss: 0.1084 | FM: 0.0671 | LR: 5.57e-05 | Time: 5.4s
+2026-03-26 12:47:33,782 [INFO] scgg.training.trainer: Epoch 257/300 | Loss: 0.1188 | FM: 0.0640 | LR: 5.33e-05 | Time: 8.0s
+2026-03-26 12:47:40,681 [INFO] scgg.training.trainer: Epoch 258/300 | Loss: 0.1228 | FM: 0.0759 | LR: 5.09e-05 | Time: 6.9s
+2026-03-26 12:47:46,074 [INFO] scgg.training.trainer: Epoch 259/300 | Loss: 0.1072 | FM: 0.0669 | LR: 4.85e-05 | Time: 5.4s
+2026-03-26 12:47:53,012 [INFO] scgg.training.trainer:   Step 1300 | Loss: 0.1090 | FM: 0.0639 | LR: 4.62e-05
+2026-03-26 12:47:53,022 [INFO] scgg.training.trainer: Epoch 260/300 | Loss: 0.1155 | FM: 0.0690 | LR: 4.62e-05 | Time: 6.9s
+2026-03-26 12:47:53,156 [INFO] scgg.training.trainer:   Val Loss: 0.0704 | Val FM: 0.0704
+2026-03-26 12:47:53,281 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch260.pt
+2026-03-26 12:47:58,742 [INFO] scgg.training.trainer: Epoch 261/300 | Loss: 0.1047 | FM: 0.0642 | LR: 4.40e-05 | Time: 5.5s
+2026-03-26 12:48:05,631 [INFO] scgg.training.trainer: Epoch 262/300 | Loss: 0.1160 | FM: 0.0694 | LR: 4.18e-05 | Time: 6.9s
+2026-03-26 12:48:13,616 [INFO] scgg.training.trainer: Epoch 263/300 | Loss: 0.1227 | FM: 0.0679 | LR: 3.96e-05 | Time: 8.0s
+2026-03-26 12:48:19,037 [INFO] scgg.training.trainer: Epoch 264/300 | Loss: 0.1059 | FM: 0.0655 | LR: 3.75e-05 | Time: 5.4s
+2026-03-26 12:48:26,949 [INFO] scgg.training.trainer: Epoch 265/300 | Loss: 0.1218 | FM: 0.0673 | LR: 3.55e-05 | Time: 7.9s
+2026-03-26 12:48:27,070 [INFO] scgg.training.trainer:   Val Loss: 0.0696 | Val FM: 0.0696
+2026-03-26 12:48:34,989 [INFO] scgg.training.trainer: Epoch 266/300 | Loss: 0.1273 | FM: 0.0694 | LR: 3.35e-05 | Time: 7.9s
+2026-03-26 12:48:40,464 [INFO] scgg.training.trainer: Epoch 267/300 | Loss: 0.1038 | FM: 0.0636 | LR: 3.16e-05 | Time: 5.5s
+2026-03-26 12:48:48,437 [INFO] scgg.training.trainer: Epoch 268/300 | Loss: 0.1267 | FM: 0.0688 | LR: 2.97e-05 | Time: 8.0s
+2026-03-26 12:48:53,811 [INFO] scgg.training.trainer: Epoch 269/300 | Loss: 0.1051 | FM: 0.0649 | LR: 2.79e-05 | Time: 5.4s
+2026-03-26 12:48:59,191 [INFO] scgg.training.trainer: Epoch 270/300 | Loss: 0.1053 | FM: 0.0650 | LR: 2.62e-05 | Time: 5.4s
+2026-03-26 12:48:59,311 [INFO] scgg.training.trainer:   Val Loss: 0.0683 | Val FM: 0.0683
+2026-03-26 12:48:59,504 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch270.pt
+2026-03-26 12:49:07,472 [INFO] scgg.training.trainer: Epoch 271/300 | Loss: 0.1270 | FM: 0.0655 | LR: 2.45e-05 | Time: 8.0s
+2026-03-26 12:49:12,855 [INFO] scgg.training.trainer: Epoch 272/300 | Loss: 0.1068 | FM: 0.0664 | LR: 2.28e-05 | Time: 5.4s
+2026-03-26 12:49:20,768 [INFO] scgg.training.trainer: Epoch 273/300 | Loss: 0.1273 | FM: 0.0662 | LR: 2.12e-05 | Time: 7.9s
+2026-03-26 12:49:28,650 [INFO] scgg.training.trainer: Epoch 274/300 | Loss: 0.1243 | FM: 0.0632 | LR: 1.97e-05 | Time: 7.9s
+2026-03-26 12:49:35,594 [INFO] scgg.training.trainer: Epoch 275/300 | Loss: 0.1117 | FM: 0.0657 | LR: 1.82e-05 | Time: 6.9s
+2026-03-26 12:49:35,715 [INFO] scgg.training.trainer:   Val Loss: 0.0675 | Val FM: 0.0675
+2026-03-26 12:49:42,547 [INFO] scgg.training.trainer: Epoch 276/300 | Loss: 0.1140 | FM: 0.0678 | LR: 1.68e-05 | Time: 6.8s
+2026-03-26 12:49:49,466 [INFO] scgg.training.trainer: Epoch 277/300 | Loss: 0.1149 | FM: 0.0688 | LR: 1.54e-05 | Time: 6.9s
+2026-03-26 12:49:57,554 [INFO] scgg.training.trainer: Epoch 278/300 | Loss: 0.1257 | FM: 0.0678 | LR: 1.41e-05 | Time: 8.1s
+2026-03-26 12:50:05,343 [INFO] scgg.training.trainer: Epoch 279/300 | Loss: 0.1187 | FM: 0.0681 | LR: 1.29e-05 | Time: 7.8s
+2026-03-26 12:50:13,267 [INFO] scgg.training.trainer:   Step 1400 | Loss: 0.1230 | FM: 0.0657 | LR: 1.17e-05
+2026-03-26 12:50:13,281 [INFO] scgg.training.trainer: Epoch 280/300 | Loss: 0.1248 | FM: 0.0671 | LR: 1.17e-05 | Time: 7.9s
+2026-03-26 12:50:13,402 [INFO] scgg.training.trainer:   Val Loss: 0.0657 | Val FM: 0.0657
+2026-03-26 12:50:13,533 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch280.pt
+2026-03-26 12:50:21,523 [INFO] scgg.training.trainer: Epoch 281/300 | Loss: 0.1203 | FM: 0.0625 | LR: 1.06e-05 | Time: 8.0s
+2026-03-26 12:50:29,417 [INFO] scgg.training.trainer: Epoch 282/300 | Loss: 0.1187 | FM: 0.0683 | LR: 9.48e-06 | Time: 7.9s
+2026-03-26 12:50:36,276 [INFO] scgg.training.trainer: Epoch 283/300 | Loss: 0.1150 | FM: 0.0686 | LR: 8.46e-06 | Time: 6.9s
+2026-03-26 12:50:44,135 [INFO] scgg.training.trainer: Epoch 284/300 | Loss: 0.1178 | FM: 0.0636 | LR: 7.49e-06 | Time: 7.9s
+2026-03-26 12:50:52,069 [INFO] scgg.training.trainer: Epoch 285/300 | Loss: 0.1227 | FM: 0.0685 | LR: 6.59e-06 | Time: 7.9s
+2026-03-26 12:50:52,189 [INFO] scgg.training.trainer:   Val Loss: 0.0684 | Val FM: 0.0684
+2026-03-26 12:51:00,160 [INFO] scgg.training.trainer: Epoch 286/300 | Loss: 0.1176 | FM: 0.0634 | LR: 5.74e-06 | Time: 8.0s
+2026-03-26 12:51:08,098 [INFO] scgg.training.trainer: Epoch 287/300 | Loss: 0.1276 | FM: 0.0662 | LR: 4.95e-06 | Time: 7.9s
+2026-03-26 12:51:15,995 [INFO] scgg.training.trainer: Epoch 288/300 | Loss: 0.1241 | FM: 0.0632 | LR: 4.22e-06 | Time: 7.9s
+2026-03-26 12:51:23,923 [INFO] scgg.training.trainer: Epoch 289/300 | Loss: 0.1177 | FM: 0.0633 | LR: 3.55e-06 | Time: 7.9s
+2026-03-26 12:51:29,333 [INFO] scgg.training.trainer: Epoch 290/300 | Loss: 0.1069 | FM: 0.0666 | LR: 2.93e-06 | Time: 5.4s
+2026-03-26 12:51:29,452 [INFO] scgg.training.trainer:   Val Loss: 0.0671 | Val FM: 0.0671
+2026-03-26 12:51:29,587 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch290.pt
+2026-03-26 12:51:37,622 [INFO] scgg.training.trainer: Epoch 291/300 | Loss: 0.1261 | FM: 0.0685 | LR: 2.37e-06 | Time: 8.0s
+2026-03-26 12:51:45,629 [INFO] scgg.training.trainer: Epoch 292/300 | Loss: 0.1177 | FM: 0.0637 | LR: 1.88e-06 | Time: 8.0s
+2026-03-26 12:51:50,932 [INFO] scgg.training.trainer: Epoch 293/300 | Loss: 0.1062 | FM: 0.0662 | LR: 1.44e-06 | Time: 5.3s
+2026-03-26 12:51:58,908 [INFO] scgg.training.trainer: Epoch 294/300 | Loss: 0.1206 | FM: 0.0661 | LR: 1.06e-06 | Time: 8.0s
+2026-03-26 12:52:06,840 [INFO] scgg.training.trainer: Epoch 295/300 | Loss: 0.1228 | FM: 0.0684 | LR: 7.33e-07 | Time: 7.9s
+2026-03-26 12:52:06,960 [INFO] scgg.training.trainer:   Val Loss: 0.0724 | Val FM: 0.0724
+2026-03-26 12:52:14,864 [INFO] scgg.training.trainer: Epoch 296/300 | Loss: 0.1201 | FM: 0.0657 | LR: 4.69e-07 | Time: 7.9s
+2026-03-26 12:52:21,744 [INFO] scgg.training.trainer: Epoch 297/300 | Loss: 0.1136 | FM: 0.0673 | LR: 2.64e-07 | Time: 6.9s
+2026-03-26 12:52:29,719 [INFO] scgg.training.trainer: Epoch 298/300 | Loss: 0.1170 | FM: 0.0628 | LR: 1.17e-07 | Time: 8.0s
+2026-03-26 12:52:37,709 [INFO] scgg.training.trainer: Epoch 299/300 | Loss: 0.1222 | FM: 0.0679 | LR: 2.93e-08 | Time: 8.0s
+2026-03-26 12:52:44,560 [INFO] scgg.training.trainer:   Step 1500 | Loss: 0.1097 | FM: 0.0642 | LR: 0.00e+00
+2026-03-26 12:52:44,570 [INFO] scgg.training.trainer: Epoch 300/300 | Loss: 0.1117 | FM: 0.0655 | LR: 0.00e+00 | Time: 6.9s
+2026-03-26 12:52:44,690 [INFO] scgg.training.trainer:   Val Loss: 0.0671 | Val FM: 0.0671
+2026-03-26 12:52:44,866 [INFO] scgg.training.trainer: Saved checkpoint: checkpoints/checkpoint_epoch300.pt
+2026-03-26 12:52:44,868 [INFO] scgg.training.trainer: Training complete! Total time: 37.6 min

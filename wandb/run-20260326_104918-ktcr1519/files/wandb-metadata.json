@@ -1,0 +1,38 @@
+{
+  "os": "Linux-5.15.0-173-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.12",
+  "startedAt": "2026-03-26T10:49:18.280874Z",
+  "args": [
+    "--data_path",
+    "/lustre/scratch126/cellgen/lotfollahi/DATASETS/silver/mmb0-1b_smb1-1b_2p/harmonised_merfish_mouse_brain_239-batch_batch82.h5ad",
+    "--epochs",
+    "50",
+    "--wandb",
+    "--wandb_project",
+    "scgg",
+    "--wandb_tags",
+    "merfish",
+    "mouse_brain"
+  ],
+  "program": "-m scgg.train",
+  "git": {
+    "remote": "https://github.com/Lotfollahi-lab/scgg.git",
+    "commit": "84f901dea941512a6e70f60c53e0be0a97e30a59"
+  },
+  "email": "sb75@sanger.ac.uk",
+  "root": "/nfs/team361/sb75/scgg",
+  "host": "farm22-head1",
+  "executable": "/nfs/team361/sb75/.venvs/scgg/bin/python",
+  "cpu_count": 32,
+  "cpu_count_logical": 64,
+  "disk": {
+    "/": {
+      "total": "134145380352",
+      "used": "91570737152"
+    }
+  },
+  "memory": {
+    "total": "810195505152"
+  },
+  "writerId": "9b0doawt7znczsro47wcmb9vc80s6xcz"
+}
