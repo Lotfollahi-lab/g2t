@@ -22,12 +22,25 @@ model:
     subsample_size: 4096  # max cells to use for section embedding computation
 
   # Metric head (used when training.objective == "contrastive")
-  # Projects (cell_embed, section_embed) -> d-dim normalized embedding for kNN.
+  # Two architectures, selected by `type`:
+  #   * "cross_attention" (default, recommended): LUNA-style multi-head
+  #       self-attention over all cells in a slice. Lets each cell's metric
+  #       embedding depend on every other cell — essential for breaking
+  #       ties between same-type cells in the same slice.
+  #   * "mlp": per-cell MLP using (cell_embed, section_embed). Cheaper but
+  #       fundamentally limited (no cell-to-cell info flow).
   metric_head:
-    hidden_dims: [256, 128]
-    embed_dim: 32           # d for the metric space (32 is a reasonable default)
-    normalize: true         # L2-normalize so FAISS L2 == cosine ranking
+    type: "cross_attention"   # mlp | cross_attention
+    embed_dim: 64             # output dimension of the metric space
+    normalize: true           # L2-normalize so FAISS L2 == cosine ranking
     dropout: 0.1
+    # cross_attention-specific
+    n_layers: 2
+    n_heads: 4
+    ff_mult: 4
+    use_section_embed: false  # attention already integrates slice context
+    # mlp-specific (ignored for cross_attention)
+    hidden_dims: [256, 128]
 
   # Velocity network (only built when objective == "flow_matching")
   velocity_net:
@@ -86,10 +99,13 @@ training:
 
   # ===== Loss configuration =====
   loss:
-    # Settings for the primary contrastive criterion (objective=contrastive)
+    # Settings for the primary contrastive criterion (objective=contrastive).
+    # The default uses supervised contrastive (SupCon, Khosla 2020): for each
+    # anchor, ALL in-batch GT neighbors are positives. This gives ~k× stronger
+    # gradient signal than single-positive InfoNCE at no extra cost.
     contrastive:
-      temperature: 0.1
-      positives_per_anchor: 1   # >1 covers more of the k=10 GT neighborhood
+      temperature: 0.07           # SupCon / SimCLR convention
+      max_positives_per_anchor: null   # null = use all in-batch positives
       exclude_self: true
 
     # Legacy settings for the flow-matching objective. Only used when

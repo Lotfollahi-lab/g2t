@@ -32,7 +32,7 @@ from ..data.dataset import (
     SpatialTranscriptomicsDataset,
     create_cell_batches,
 )
-from .losses import ContrastiveRankingLoss, FlowMatchingLoss
+from .losses import ContrastiveRankingLoss, FlowMatchingLoss, CellClassAuxLoss
 from .ood_losses import (
     CrossModalityContrastiveLoss,
     SectionEmbeddingConsistencyLoss,
@@ -92,10 +92,14 @@ class Trainer:
                 "normalize", True
             )
             self.criterion = ContrastiveRankingLoss(
-                temperature=cl_cfg.get("temperature", 0.1),
-                positives_per_anchor=cl_cfg.get("positives_per_anchor", 1),
+                temperature=cl_cfg.get("temperature", 0.07),
+                max_positives_per_anchor=cl_cfg.get(
+                    "max_positives_per_anchor",
+                    # Back-compat: old key name was `positives_per_anchor=1`,
+                    # which we now treat as "no cap" (SupCon over all positives).
+                    cl_cfg.get("positives_per_anchor", None),
+                ),
                 exclude_self=cl_cfg.get("exclude_self", True),
-                # If the metric head already normalizes, skip double-norm.
                 normalize_inputs=not mh_normalizes,
             )
         elif self.objective == "flow_matching":

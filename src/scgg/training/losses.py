@@ -37,35 +37,38 @@ logger = logging.getLogger(__name__)
 
 
 class ContrastiveRankingLoss(nn.Module):
-    """Primary ScGG loss: supervised InfoNCE on the metric embedding.
+    """Primary ScGG loss: supervised contrastive (SupCon, Khosla 2020) on the
+    metric embedding.
 
-    For each anchor cell *i*, one positive p_i is sampled from its in-batch
-    ground-truth spatial neighbors and all other cells in the batch are
-    treated as negatives. The loss is the standard InfoNCE cross-entropy:
+    For each anchor cell *i*, ALL of its in-batch ground-truth spatial
+    neighbors are positives; all other cells in the batch (excluding self)
+    are negatives. The loss is averaged log-softmax over the positive set:
 
-        L_i = -log( exp(sim(z_i, z_{p_i})/tau)
-                    / sum_{j in batch, j != i} exp(sim(z_i, z_j)/tau) )
+        L_i = -1/|P_i| * sum_{p in P_i} log( exp(sim(z_i, z_p)/tau)
+                                              / sum_{j != i} exp(sim(z_i, z_j)/tau) )
+
+    Compared to the single-positive InfoNCE used previously, SupCon gives
+    ~k× stronger gradient signal per step (where k is the GT graph degree,
+    typically 10) at essentially zero extra cost. Khosla et al. (2020)
+    showed this generalizes better than single-positive InfoNCE in
+    classification settings; the spatial-graph case is analogous.
 
     Implementation notes:
 
-    * Fully vectorized — no Python loop over anchors. Builds a dense (B, B)
-      positive mask once per mini-batch, samples a single positive per anchor
-      via masked-argmax, and gathers similarities with `torch.gather`. This is
-      ~50–100× faster than a per-cell Python loop on GPU.
-    * Defensive against self-loops in the adjacency. We force the diagonal of
-      the positive mask to False so `pos_idx` can never equal `i`, even if the
-      GT graph accidentally contains a self-loop (which can happen with
-      duplicate coordinates + FAISS).
-    * Defensive against non-finite per-anchor losses. Any anchor that produces
-      `inf` or `nan` is dropped with a warning instead of poisoning the batch
-      loss. The number dropped is exposed as `n_anchors_clamped`.
+    * Fully vectorized: one matmul for similarity, one logsumexp for the
+      denominator, one masked sum for the numerator. No Python loop.
+    * Defensive against self-loops in the adjacency: the positive mask
+      diagonal is forced to False.
+    * Defensive against non-finite per-anchor losses: `n_anchors_clamped`
+      counts how many anchors had to be dropped (should always be 0).
 
     Args:
-        temperature: InfoNCE temperature; smaller -> sharper, larger -> softer.
-        positives_per_anchor: Currently the vectorized path samples one positive
-            per anchor per forward. Higher values are accepted but are
-            silently treated as 1 for now (the loop-based multi-positive
-            variant was the source of the slowdown).
+        temperature: SupCon temperature. Smaller = sharper, harder positives.
+            Default 0.07 (SimCLR / SupCon convention).
+        max_positives_per_anchor: Cap the number of positives used per anchor
+            for memory reasons. None or <=0 means "use all in-batch positives"
+            (recommended). Set to a small int (e.g. 4) if memory pressure
+            requires it.
         exclude_self: If True, exclude the anchor itself from the candidate set.
         normalize_inputs: If True, L2-normalize embeddings before similarity.
             Pass False if the MetricHead already normalizes (avoids double work).
@@ -73,23 +76,25 @@ class ContrastiveRankingLoss(nn.Module):
 
     def __init__(
         self,
-        temperature: float = 0.1,
-        positives_per_anchor: int = 1,
+        temperature: float = 0.07,
+        max_positives_per_anchor: Optional[int] = None,
         exclude_self: bool = True,
         normalize_inputs: bool = False,
+        # Backwards-compat alias (older configs used `positives_per_anchor`).
+        positives_per_anchor: Optional[int] = None,
     ):
         super().__init__()
         self.temperature = temperature
-        self.positives_per_anchor = positives_per_anchor
         self.exclude_self = exclude_self
         self.normalize_inputs = normalize_inputs
-        if positives_per_anchor != 1:
-            logger.warning(
-                "positives_per_anchor=%d is currently treated as 1 in the "
-                "vectorized path. The previous loop-based multi-positive "
-                "implementation was a major training-time bottleneck.",
-                positives_per_anchor,
-            )
+
+        if positives_per_anchor is not None and max_positives_per_anchor is None:
+            # Treat legacy positives_per_anchor=1 as "no cap" — i.e., default
+            # to all-positives SupCon. We never want the old 1-positive mode
+            # because it strictly under-uses the supervision signal.
+            if positives_per_anchor != 1:
+                max_positives_per_anchor = positives_per_anchor
+        self.max_positives_per_anchor = max_positives_per_anchor
 
     def _build_pos_mask(
         self,
@@ -127,7 +132,8 @@ class ContrastiveRankingLoss(nn.Module):
         spatial_adj: sparse.csr_matrix,
         batch_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
+        """Supervised contrastive (SupCon) loss with all in-batch positives.
+
         Args:
             embeddings: (B, d) metric embeddings for the batch.
             spatial_adj: sparse (N_section, N_section) GT adjacency for the
@@ -136,48 +142,52 @@ class ContrastiveRankingLoss(nn.Module):
                 If None, batch == full section.
 
         Returns:
-            loss: scalar InfoNCE loss (zero tensor with grad_fn if no usable
-                anchors, so the trainer's backward call stays well-defined).
+            loss: scalar loss (zero tensor with grad_fn if no usable anchors).
             metrics: dict with diagnostic counters.
         """
         device = embeddings.device
         B = embeddings.shape[0]
 
-        # Trivial cases.
         if B < 4:
             return embeddings.sum() * 0.0, {
                 "contrastive_loss": 0.0,
                 "n_anchors_used": 0,
                 "n_anchors_skipped": B,
                 "n_anchors_clamped": 0,
+                "mean_positives_per_anchor": 0.0,
             }
 
         pos_mask = self._build_pos_mask(spatial_adj, batch_indices, B, device)
-        has_pos = pos_mask.any(dim=1)  # (B,) — True if anchor has any positive
+
+        # Optional cap on positives per anchor (memory; usually leave uncapped).
+        cap = self.max_positives_per_anchor
+        if cap is not None and cap > 0:
+            # For each row, keep at most `cap` positives chosen at random.
+            rand = torch.rand(B, B, device=device, dtype=embeddings.dtype)
+            rand = rand.masked_fill(~pos_mask, float("-inf"))
+            # Get the top-`cap` indices per row; build a new mask.
+            topk = min(cap, B)
+            _, kept_idx = rand.topk(topk, dim=1)
+            capped = torch.zeros_like(pos_mask)
+            capped.scatter_(1, kept_idx, True)
+            pos_mask = pos_mask & capped
+
+        n_pos_per_anchor = pos_mask.sum(dim=1)  # (B,)
+        has_pos = n_pos_per_anchor > 0
         if not has_pos.any():
             return embeddings.sum() * 0.0, {
                 "contrastive_loss": 0.0,
                 "n_anchors_used": 0,
                 "n_anchors_skipped": int(B),
                 "n_anchors_clamped": 0,
+                "mean_positives_per_anchor": 0.0,
             }
 
         if self.normalize_inputs:
             embeddings = F.normalize(embeddings, dim=-1)
 
-        # Scaled similarity matrix (B, B). If embeddings are L2-normalized,
-        # this is cosine sim / temperature.
+        # Scaled similarity matrix (B, B). Cosine if L2-normalized.
         sim = (embeddings @ embeddings.t()) / self.temperature
-
-        # Sample one positive per anchor: pick the argmax of (uniform noise
-        # masked to -inf on non-positives). Anchors with no positives get a
-        # garbage value that we drop via `has_pos`.
-        rand = torch.rand(B, B, device=device, dtype=embeddings.dtype)
-        rand = rand.masked_fill(~pos_mask, float("-inf"))
-        pos_idx = rand.argmax(dim=1)  # (B,)
-
-        # Gather positive logits in a vectorized way.
-        pos_logits = torch.gather(sim, 1, pos_idx.unsqueeze(1)).squeeze(1)  # (B,)
 
         # Denominator: log-sum-exp over all candidates excluding self.
         if self.exclude_self:
@@ -185,15 +195,20 @@ class ContrastiveRankingLoss(nn.Module):
             sim_denom = sim.masked_fill(eye, float("-inf"))
         else:
             sim_denom = sim
-        denom = torch.logsumexp(sim_denom, dim=1)  # (B,)
+        log_denom = torch.logsumexp(sim_denom, dim=1, keepdim=True)  # (B, 1)
 
-        # Per-anchor InfoNCE cross-entropy.
-        loss_per_anchor = denom - pos_logits  # (B,)
+        # Log-softmax over candidates: P(j | i) = exp(sim_ij/tau) / sum_l exp(sim_il/tau)
+        log_p = sim - log_denom  # (B, B)
+
+        # For each anchor i, average log P(p | i) over its positives p.
+        pos_mask_f = pos_mask.float()
+        # sum_{p in P_i} log P(p | i)
+        sum_log_p_pos = (log_p * pos_mask_f).sum(dim=1)  # (B,)
+        loss_per_anchor = -sum_log_p_pos / n_pos_per_anchor.clamp(min=1).float()
+
         loss_per_anchor = loss_per_anchor[has_pos]
 
-        # Drop any anchors that came out non-finite (defensive; should not
-        # happen now that we force the pos-mask diagonal to False, but cheap
-        # to check).
+        # Defensive: drop non-finite anchors with a warning.
         finite = torch.isfinite(loss_per_anchor)
         n_clamped = int((~finite).sum().item())
         if n_clamped > 0:
@@ -209,18 +224,73 @@ class ContrastiveRankingLoss(nn.Module):
             return embeddings.sum() * 0.0, {
                 "contrastive_loss": 0.0,
                 "n_anchors_used": 0,
-                "n_anchors_skipped": int(B - has_pos.sum().item()),
+                "n_anchors_skipped": int(B - int(has_pos.sum().item())),
                 "n_anchors_clamped": n_clamped,
+                "mean_positives_per_anchor": 0.0,
             }
 
         loss = loss_per_anchor.mean()
-
         n_used = int(has_pos.sum().item()) - n_clamped
+        mean_pos = float(n_pos_per_anchor[has_pos].float().mean().item())
+
         return loss, {
             "contrastive_loss": loss.item(),
             "n_anchors_used": n_used,
-            "n_anchors_skipped": int(B - has_pos.sum().item()),
+            "n_anchors_skipped": int(B - int(has_pos.sum().item())),
             "n_anchors_clamped": n_clamped,
+            "mean_positives_per_anchor": mean_pos,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Optional cell-class auxiliary classification head
+# ---------------------------------------------------------------------------
+
+
+class CellClassAuxLoss(nn.Module):
+    """Optional auxiliary cell-class classifier on the encoder embedding.
+
+    Adds a small head on top of the cell embedding and trains it with cross
+    entropy against GT cell-class labels. Same-class cells often co-localize
+    spatially in tissue (cortical layers, glomerular structures, etc.), so a
+    class-aware encoder is a useful inductive bias for spatial-graph
+    prediction.
+
+    Default `enabled: false` in config; when enabled, weighted into the
+    primary loss via `loss.cell_class_aux.weight`.
+    """
+
+    def __init__(
+        self,
+        cell_embed_dim: int,
+        n_classes: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        layers: list = []
+        if hidden_dim > 0:
+            layers += [nn.Linear(cell_embed_dim, hidden_dim), nn.GELU()]
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+        else:
+            in_dim = cell_embed_dim
+        layers.append(nn.Linear(in_dim, n_classes))
+        self.head = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        cell_embed: torch.Tensor,
+        class_labels: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        logits = self.head(cell_embed)
+        loss = F.cross_entropy(logits, class_labels)
+        with torch.no_grad():
+            acc = (logits.argmax(dim=-1) == class_labels).float().mean().item()
+        return loss, {
+            "cellclass_aux_loss": loss.item(),
+            "cellclass_aux_acc": acc,
         }
 
 

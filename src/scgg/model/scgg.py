@@ -24,13 +24,14 @@ from scipy import sparse
 from typing import Optional, Tuple, Union, List
 
 from .encoder import GeneExpressionEncoder, SectionEncoder
-from .metric_head import MetricHead
+from .metric_head import MetricHead, CrossCellMetricHead
 from .velocity_net import VelocityNetwork
 from .flow_matching import ConditionalFlowMatching
 from .graph_constructor import GraphConstructor
 
 
 VALID_OBJECTIVES = ("contrastive", "flow_matching")
+VALID_METRIC_HEAD_TYPES = ("mlp", "cross_attention")
 
 
 class ScGG(nn.Module):
@@ -75,17 +76,39 @@ class ScGG(nn.Module):
         )
 
         # ---- Metric head (contrastive mode) ---------------------------------
-        self.metric_head: Optional[MetricHead] = None
+        self.metric_head: Optional[nn.Module] = None
         if self.objective == "contrastive":
             mh_cfg = model_cfg.get("metric_head", {})
-            self.metric_head = MetricHead(
-                cell_embed_dim=enc_cfg["embed_dim"],
-                section_embed_dim=sec_cfg["embed_dim"],
-                hidden_dims=mh_cfg.get("hidden_dims", [256, 128]),
-                embed_dim=mh_cfg.get("embed_dim", 32),
-                normalize=mh_cfg.get("normalize", True),
-                dropout=mh_cfg.get("dropout", 0.1),
-            )
+            mh_type = mh_cfg.get("type", "cross_attention")
+            if mh_type not in VALID_METRIC_HEAD_TYPES:
+                raise ValueError(
+                    f"model.metric_head.type={mh_type!r} not in "
+                    f"{VALID_METRIC_HEAD_TYPES}"
+                )
+            if mh_type == "mlp":
+                self.metric_head = MetricHead(
+                    cell_embed_dim=enc_cfg["embed_dim"],
+                    section_embed_dim=sec_cfg["embed_dim"],
+                    hidden_dims=mh_cfg.get("hidden_dims", [256, 128]),
+                    embed_dim=mh_cfg.get("embed_dim", 64),
+                    normalize=mh_cfg.get("normalize", True),
+                    dropout=mh_cfg.get("dropout", 0.1),
+                )
+            else:  # cross_attention
+                self.metric_head = CrossCellMetricHead(
+                    cell_embed_dim=enc_cfg["embed_dim"],
+                    section_embed_dim=sec_cfg["embed_dim"],
+                    embed_dim=mh_cfg.get("embed_dim", 64),
+                    n_layers=mh_cfg.get("n_layers", 2),
+                    n_heads=mh_cfg.get("n_heads", 4),
+                    ff_mult=mh_cfg.get("ff_mult", 4),
+                    dropout=mh_cfg.get("dropout", 0.1),
+                    normalize=mh_cfg.get("normalize", True),
+                    use_section_embed=mh_cfg.get("use_section_embed", False),
+                )
+            self.metric_head_type = mh_type
+        else:
+            self.metric_head_type = None
 
         # ---- Flow matching (ablation mode) ----------------------------------
         self.velocity_net: Optional[VelocityNetwork] = None
@@ -198,6 +221,22 @@ class ScGG(nn.Module):
             else:
                 sec_in = self.encoder(gene_expr)
         section_embed = self.section_encoder(sec_in)
+
+        # NOTE: For metric_head_type == "cross_attention", cells in different
+        # chunks won't see each other through attention. If the section is
+        # larger than `batch_size`, this gives chunk-local attention which is
+        # NOT what we want. For LUNA cortex (sections < 7,500 cells) and the
+        # default batch_size=16384, this never triggers. We emit a one-time
+        # warning if a larger section comes in.
+        if self.metric_head_type == "cross_attention" and n > batch_size:
+            import warnings
+            warnings.warn(
+                f"embed_batched: section has {n} cells but batch_size is "
+                f"{batch_size}. With cross_attention metric head this gives "
+                "chunk-local attention. Increase batch_size to fit the whole "
+                "section in one pass, or switch to metric_head.type='mlp'.",
+                RuntimeWarning,
+            )
 
         outs: List[torch.Tensor] = []
         for start in range(0, n, batch_size):
