@@ -34,5 +34,26 @@ include = ["scgg", "scgg.*"]
 "scgg.configs" = ["*.yaml"]
 
 [build-system]
-requires = ["setuptools>=68.0"]
+# setuptools >= 64 is the first version with PEP 660 (build_editable) support.
+# We require >= 68 to pick up modern wheel-building behavior.
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+# --- uv-specific configuration (ignored by pip) -----------------------------
+# Direct torch to the CUDA-12.4 wheel index. We use `explicit = true` so the
+# custom index is ONLY consulted for torch — every other dependency still
+# resolves against PyPI normally. Adjust the URL if your driver supports a
+# different CUDA runtime:
+#   cu121  -> https://download.pytorch.org/whl/cu121
+#   cu124  -> https://download.pytorch.org/whl/cu124   (default; matches the cluster)
+#   cu126  -> https://download.pytorch.org/whl/cu126
+#   cu128  -> https://download.pytorch.org/whl/cu128
+#   cpu    -> https://download.pytorch.org/whl/cpu
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true

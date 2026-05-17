@@ -15,23 +15,60 @@ in particular, the [API documentation][].
 
 ## Installation
 
-You need to have Python 3.10 or newer installed on your system.
-If you don't have Python installed, we recommend installing [uv][].
+You need Python 3.10 or newer.
 
-There are several alternative options to install scgg:
-
-<!--
-1) Install the latest release of `scgg` from [PyPI][]:
+### Quick install (recommended)
 
 ```bash
-pip install scgg
+bash install.sh
 ```
--->
 
-1. Install the latest development version:
+Detects your CUDA driver via `nvidia-smi`, installs the matching PyTorch
+wheel, then installs `scgg` in editable mode. Pass `--cpu` for CPU-only,
+`--cuda 12.4` to force a specific wheel, or `--skip-torch` if you've already
+installed torch yourself.
+
+### Manual install
+
+### 1. Install PyTorch matching your CUDA driver
+
+`scgg` declares `torch>=2.0` but does NOT pin a CUDA build, because the correct
+wheel depends on your driver. Install it BEFORE `scgg` so pip doesn't pull the
+default (latest-CUDA) wheel:
 
 ```bash
-pip install git+https://github.com/sebastianbirk/scgg.git@main
+# CPU-only
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# NVIDIA driver 550+ (CUDA 12.4)
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# NVIDIA driver 530+ (CUDA 12.1) — works with driver 12.4 too
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# NVIDIA driver 560+ (CUDA 12.6)
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+```
+
+Check your driver's max CUDA version with `nvidia-smi` (top-right). Pick the
+PyTorch wheel for a CUDA version ≤ that. If you see
+`The NVIDIA driver on your system is too old (found version 1240X)` when
+importing torch, you installed a wheel built for a newer CUDA than your
+driver supports — uninstall and reinstall from the lower index above.
+
+### 2. Install scgg
+
+```bash
+pip install -e /path/to/scgg
+```
+
+If `pip install -e .` fails with
+`build backend is missing the 'build_editable' hook`, upgrade your build
+tooling first:
+
+```bash
+pip install --upgrade pip setuptools wheel
+pip install -e .
 ```
 
 ## Release notes
