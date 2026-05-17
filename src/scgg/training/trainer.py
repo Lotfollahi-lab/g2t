@@ -385,7 +385,7 @@ class Trainer:
                 batch_indices=batch_indices,
             )
             metrics = {"contrastive_loss": primary_metrics["contrastive_loss"]}
-            for k in ("n_anchors_used", "n_anchors_skipped"):
+            for k in ("n_anchors_used", "n_anchors_skipped", "n_anchors_clamped"):
                 if k in primary_metrics:
                     metrics[k] = primary_metrics[k]
 
@@ -514,6 +514,9 @@ class Trainer:
             "global_step": self.global_step,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": (
+                self.scheduler.state_dict() if self.scheduler is not None else None
+            ),
             "best_val_loss": self.best_val_loss,
             "config": self.config,
             "ood_state_dicts": {
@@ -541,6 +544,15 @@ class Trainer:
         state = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        sched_state = state.get("scheduler_state_dict", None)
+        if sched_state is not None and self.scheduler is not None:
+            self.scheduler.load_state_dict(sched_state)
+        elif sched_state is None and self.scheduler is not None:
+            logger.warning(
+                "Checkpoint did not include scheduler_state_dict; LR schedule "
+                "will restart from step 0. Resuming a long run can produce a "
+                "different LR trajectory than the original."
+            )
         for name, sd in state.get("ood_state_dicts", {}).items():
             if name in self.ood_components and isinstance(
                 self.ood_components[name], nn.Module

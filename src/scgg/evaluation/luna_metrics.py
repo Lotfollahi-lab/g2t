@@ -198,10 +198,17 @@ def compute_contact(
 # ---------------------------------------------------------------------------
 
 
-def _filter_nan_inf(arr: np.ndarray) -> np.ndarray:
-    """Drop rows containing NaN or Inf — LUNA does this before Kabsch."""
-    mask = np.isfinite(arr).all(axis=1)
-    return arr[mask]
+def _filter_nan_inf_pair(
+    a: np.ndarray, b: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Drop rows where EITHER input has NaN/Inf, preserving row correspondence.
+
+    LUNA's reference code filters `a` and `b` independently, which silently
+    breaks the row alignment if only one has a NaN row. We always use the
+    intersection mask so `a[i]` and `b[i]` stay paired.
+    """
+    mask = np.isfinite(a).all(axis=1) & np.isfinite(b).all(axis=1)
+    return a[mask], b[mask]
 
 
 def compute_kabsch_rssd(
@@ -210,9 +217,10 @@ def compute_kabsch_rssd(
 ) -> float:
     """Kabsch-aligned Root Sum Squared Deviation on 2-D coordinates.
 
-    Pads the input to 3-D with Z=0 (LUNA's convention), filters NaN/Inf rows,
-    then calls scipy.spatial.transform.Rotation.align_vectors which performs
-    the Kabsch–Umeyama optimal rotation and returns the RSSD.
+    Pads the input to 3-D with Z=0 (LUNA's convention), filters NaN/Inf rows
+    (using a joint mask to preserve row correspondence), then calls
+    scipy.spatial.transform.Rotation.align_vectors which performs the
+    Kabsch–Umeyama optimal rotation and returns the RSSD.
 
     Args:
         coords_true_2d: (N, 2).
@@ -231,9 +239,8 @@ def compute_kabsch_rssd(
 
     a = np.pad(a, ((0, 0), (0, 1)), mode="constant")  # -> (N, 3)
     b = np.pad(b, ((0, 0), (0, 1)), mode="constant")
-    a = _filter_nan_inf(a)
-    b = _filter_nan_inf(b)
-    if a.shape[0] == 0 or b.shape[0] == 0:
+    a, b = _filter_nan_inf_pair(a, b)
+    if a.shape[0] == 0:
         return float("inf")
 
     try:

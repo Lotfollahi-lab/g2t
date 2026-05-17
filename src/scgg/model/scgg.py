@@ -185,12 +185,15 @@ class ScGG(nn.Module):
         device = gene_expr.device
         n = gene_expr.shape[0]
 
-        # Section embedding once
+        # Section embedding once. If the section is large, take a
+        # deterministic equidistant subsample so the same cells are picked
+        # across repeated inference passes (so the benchmark headline
+        # number doesn't wobble between runs of the same checkpoint).
         if section_gene_expr is not None:
             sec_in = self.encoder(section_gene_expr)
         else:
             if n > 8192:
-                idx = torch.randperm(n, device=device)[:8192]
+                idx = torch.linspace(0, n - 1, 8192, dtype=torch.long, device=device)
                 sec_in = self.encoder(gene_expr[idx])
             else:
                 sec_in = self.encoder(gene_expr)

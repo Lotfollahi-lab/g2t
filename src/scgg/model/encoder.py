@@ -140,8 +140,15 @@ class SectionEncoder(nn.Module):
         """
         n_cells = cell_embeddings.shape[0]
 
-        # Subsample for scalability
-        if self.subsample_size is not None and n_cells > self.subsample_size:
+        # Subsample for scalability — ONLY during training. At eval we use the
+        # full set so the section embedding is deterministic across runs and
+        # the headline benchmark numbers don't wobble between repeated
+        # inference passes on the same checkpoint.
+        if (
+            self.training
+            and self.subsample_size is not None
+            and n_cells > self.subsample_size
+        ):
             idx = torch.randperm(n_cells, device=cell_embeddings.device)[: self.subsample_size]
             cell_embeddings = cell_embeddings[idx]
 
