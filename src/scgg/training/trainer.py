@@ -32,7 +32,12 @@ from ..data.dataset import (
     SpatialTranscriptomicsDataset,
     create_cell_batches,
 )
-from .losses import ContrastiveRankingLoss, FlowMatchingLoss, CellClassAuxLoss
+from .losses import (
+    ContrastiveRankingLoss,
+    FlowMatchingLoss,
+    CellClassAuxLoss,
+    DistanceRegressionLoss,
+)
 from .ood_losses import (
     CrossModalityContrastiveLoss,
     SectionEmbeddingConsistencyLoss,
@@ -87,7 +92,7 @@ class Trainer:
         # ---- Primary criterion ----------------------------------------------
         loss_cfg = train_cfg.get("loss", {})
         if self.objective == "contrastive":
-            cl_cfg = loss_cfg.get("contrastive", {})
+            cl_cfg = loss_cfg.get("contrastive", {}) or {}
             mh_normalizes = config["model"].get("metric_head", {}).get(
                 "normalize", True
             )
@@ -95,13 +100,28 @@ class Trainer:
                 temperature=cl_cfg.get("temperature", 0.07),
                 max_positives_per_anchor=cl_cfg.get(
                     "max_positives_per_anchor",
-                    # Back-compat: old key name was `positives_per_anchor=1`,
-                    # which we now treat as "no cap" (SupCon over all positives).
                     cl_cfg.get("positives_per_anchor", None),
                 ),
                 exclude_self=cl_cfg.get("exclude_self", True),
                 normalize_inputs=not mh_normalizes,
             )
+            self.contrastive_weight = float(cl_cfg.get("weight", 1.0))
+
+            # Optional pairwise distance regression (LUNA eq. 11 analog).
+            dr_cfg = loss_cfg.get("distance_regression", {}) or {}
+            self.use_distance_loss = bool(dr_cfg.get("enabled", True))
+            self.distance_loss_weight = float(dr_cfg.get("weight", 1.0))
+            if self.use_distance_loss:
+                self.distance_criterion = DistanceRegressionLoss(
+                    use_squared=dr_cfg.get("use_squared", True),
+                )
+                logger.info(
+                    "Distance regression loss ENABLED "
+                    f"(weight={self.distance_loss_weight}, use_squared="
+                    f"{dr_cfg.get('use_squared', True)})"
+                )
+            else:
+                self.distance_criterion = None
         elif self.objective == "flow_matching":
             self.criterion = FlowMatchingLoss(
                 lambda_contrastive=loss_cfg.get("contrastive_spatial", 0.1),
@@ -297,14 +317,16 @@ class Trainer:
             primary_loss_name = (
                 "contrastive_loss" if self.objective == "contrastive" else "fm_loss"
             )
-            logger.info(
-                f"Epoch {epoch + 1}/{n_epochs} | "
-                f"Total: {epoch_metrics.get('total_loss', float('nan')):.4f} | "
-                f"{primary_loss_name}: "
-                f"{epoch_metrics.get(primary_loss_name, float('nan')):.4f} | "
-                f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
-                f"Time: {epoch_time:.1f}s"
-            )
+            parts = [
+                f"Epoch {epoch + 1}/{n_epochs}",
+                f"Total: {epoch_metrics.get('total_loss', float('nan')):.4f}",
+                f"{primary_loss_name}: {epoch_metrics.get(primary_loss_name, float('nan')):.4f}",
+            ]
+            if "distance_pearson" in epoch_metrics:
+                parts.append(f"dist_pearson: {epoch_metrics['distance_pearson']:.4f}")
+            parts.append(f"LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+            parts.append(f"Time: {epoch_time:.1f}s")
+            logger.info(" | ".join(parts))
 
             epoch_metrics["epoch_time_s"] = epoch_time
             epoch_metrics["epoch"] = epoch + 1
@@ -381,17 +403,28 @@ class Trainer:
         batch_indices = batch.get("batch_indices_in_section", None)
 
         if self.objective == "contrastive":
-            # Single forward through metric head; one loss.
             emb = self.model.embed(gene_expr, section_expr)
-            loss, primary_metrics = self.criterion(
+
+            # Primary: SupCon contrastive (top-k retrieval).
+            c_loss, c_metrics = self.criterion(
                 embeddings=emb,
                 spatial_adj=gt_graph,
                 batch_indices=batch_indices,
             )
-            metrics = {"contrastive_loss": primary_metrics["contrastive_loss"]}
-            for k in ("n_anchors_used", "n_anchors_skipped", "n_anchors_clamped"):
-                if k in primary_metrics:
-                    metrics[k] = primary_metrics[k]
+            metrics = {"contrastive_loss": c_metrics["contrastive_loss"]}
+            for k in ("n_anchors_used", "n_anchors_skipped", "n_anchors_clamped",
+                      "mean_positives_per_anchor"):
+                if k in c_metrics:
+                    metrics[k] = c_metrics[k]
+
+            # Optional: pairwise-distance regression (Spearman-aligned).
+            loss = self.contrastive_weight * c_loss
+            if self.use_distance_loss and self.distance_criterion is not None:
+                coords = batch["coords"].to(self.device)
+                d_loss, d_metrics = self.distance_criterion(emb, coords)
+                loss = loss + self.distance_loss_weight * d_loss
+                metrics["distance_loss"] = d_metrics["distance_loss"]
+                metrics["distance_pearson"] = d_metrics["distance_pearson"]
 
         else:  # flow_matching
             coords = batch["coords"].to(self.device)
@@ -442,12 +475,15 @@ class Trainer:
             primary_name = (
                 "contrastive_loss" if self.objective == "contrastive" else "fm_loss"
             )
-            logger.info(
-                f"  Step {self.global_step} | "
-                f"Total: {metrics['total_loss']:.4f} | "
-                f"{primary_name}: {metrics.get(primary_name, float('nan')):.4f} | "
-                f"LR: {lr:.2e}"
-            )
+            parts = [
+                f"Step {self.global_step}",
+                f"Total: {metrics['total_loss']:.4f}",
+                f"{primary_name}: {metrics.get(primary_name, float('nan')):.4f}",
+            ]
+            if "distance_pearson" in metrics:
+                parts.append(f"dist_pearson: {metrics['distance_pearson']:.4f}")
+            parts.append(f"LR: {lr:.2e}")
+            logger.info("  " + " | ".join(parts))
             self._log_wandb(metrics, prefix="train/step")
 
         return metrics
@@ -474,15 +510,23 @@ class Trainer:
 
                 if self.objective == "contrastive":
                     emb = self.model.embed(gene_expr, section_expr)
-                    loss, m = self.criterion(
+                    c_loss, c_m = self.criterion(
                         embeddings=emb,
                         spatial_adj=gt_graph,
                         batch_indices=batch_indices,
                     )
-                    val_metrics.append(
-                        {"contrastive_loss": m["contrastive_loss"],
-                         "total_loss": loss.item()}
-                    )
+                    total_loss_val = self.contrastive_weight * c_loss
+                    val_entry = {
+                        "contrastive_loss": c_m["contrastive_loss"],
+                    }
+                    if self.use_distance_loss and self.distance_criterion is not None:
+                        coords = batch["coords"].to(self.device)
+                        d_loss, d_m = self.distance_criterion(emb, coords)
+                        total_loss_val = total_loss_val + self.distance_loss_weight * d_loss
+                        val_entry["distance_loss"] = d_m["distance_loss"]
+                        val_entry["distance_pearson"] = d_m["distance_pearson"]
+                    val_entry["total_loss"] = total_loss_val.item()
+                    val_metrics.append(val_entry)
                 else:
                     coords = batch["coords"].to(self.device)
                     k_val = batch["k_target"]

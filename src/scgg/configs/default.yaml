@@ -98,15 +98,29 @@ training:
   grad_clip: 1.0
 
   # ===== Loss configuration =====
+  # Two complementary losses run together by default in contrastive mode:
+  #
+  #   contrastive (SupCon) — top-k retrieval; sharpens the kNN that becomes
+  #       the final output. Drives contact precision/F1.
+  #
+  #   distance_regression — pairwise-distance Pearson correlation (LUNA-style).
+  #       Directly optimizes the structural target the Spearman eval metric
+  #       measures. Without this, the model only cares about top-k and gets
+  #       penalized on the full pairwise-distance Spearman.
+  #
+  # Both are enabled by default with weight=1.0. If you want to ablate one,
+  # set its weight to 0 or its `enabled: false` flag.
   loss:
-    # Settings for the primary contrastive criterion (objective=contrastive).
-    # The default uses supervised contrastive (SupCon, Khosla 2020): for each
-    # anchor, ALL in-batch GT neighbors are positives. This gives ~k× stronger
-    # gradient signal than single-positive InfoNCE at no extra cost.
     contrastive:
+      weight: 1.0
       temperature: 0.07           # SupCon / SimCLR convention
       max_positives_per_anchor: null   # null = use all in-batch positives
       exclude_self: true
+
+    distance_regression:
+      enabled: true
+      weight: 1.0
+      use_squared: true           # squared Euclidean distances (smoother grads)
 
     # Legacy settings for the flow-matching objective. Only used when
     # objective == "flow_matching"; ignored in contrastive mode.

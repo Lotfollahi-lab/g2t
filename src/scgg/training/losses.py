@@ -243,6 +243,102 @@ class ContrastiveRankingLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Pairwise distance regression (LUNA-style; optimizes the Spearman target)
+# ---------------------------------------------------------------------------
+
+
+class DistanceRegressionLoss(nn.Module):
+    """LUNA-style pairwise distance preservation, via Pearson correlation.
+
+    LUNA's coordinate generator is trained with a pairwise-distance MSE
+    objective (eq. 11 of the paper):
+
+        L = (1/m^2) * sum_{i,j} (||r_pred_i - r_pred_j||^2 - ||r_true_i - r_true_j||^2)^2
+
+    That objective is the structural reason LUNA scores high on the Spearman
+    metric — the metric is per-cell Spearman of pairwise distance rows, so a
+    model that preserves all pairwise distances directly optimizes it.
+
+    Our SupCon contrastive loss only cares about the top-k neighborhood; two
+    cells at GT distance 3 and 30 are both "negatives" and get pushed away
+    identically, even though their relative ordering is the whole point of
+    Spearman. This module adds the structural-distance term back in.
+
+    Implementation:
+      * Pairwise squared Euclidean distance between cells in BOTH the metric
+        embedding space (B, d) and the GT coordinate space (B, 2).
+      * Take the upper triangle (i < j) to avoid self-pairs and double-counting.
+      * Standardize both vectors (z-score) and compute Pearson correlation =
+        mean of the element-wise product.
+      * Loss = 1 - Pearson, so minimizing it maximizes correlation.
+
+    Why squared distance rather than Euclidean?
+      For L2-normalized embeddings, ||z_i - z_j||^2 = 2 - 2*cos(z_i, z_j),
+      so this is monotonic in cosine similarity and has slightly smoother
+      gradients than raw Euclidean.
+
+    Why Pearson rather than MSE?
+      Pearson is scale-invariant in both arguments. The L2-normalized
+      embedding's distances are bounded in [0, 2] (so squared in [0, 4]),
+      while GT coords have arbitrary scale; MSE would couple the loss to
+      that scale mismatch, Pearson sidesteps it entirely.
+
+    Args:
+        use_squared: Use squared distances if True (default), Euclidean if False.
+        eps: Numerical safety for the standardization step.
+    """
+
+    def __init__(self, use_squared: bool = True, eps: float = 1e-8):
+        super().__init__()
+        self.use_squared = use_squared
+        self.eps = eps
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        coords: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            embeddings: (B, d) metric embeddings for the batch.
+            coords: (B, 2) ground-truth 2-D coordinates for the same B cells.
+
+        Returns:
+            loss in [0, 2], metrics dict.
+        """
+        B = embeddings.shape[0]
+        if B < 4 or coords.shape[0] != B:
+            return embeddings.sum() * 0.0, {
+                "distance_pearson": 0.0,
+                "distance_loss": 0.0,
+            }
+
+        pred_d = torch.cdist(embeddings, embeddings)
+        true_d = torch.cdist(coords, coords)
+        if self.use_squared:
+            pred_d = pred_d ** 2
+            true_d = true_d ** 2
+
+        # Upper triangle (i < j); avoids self-pairs and counts each pair once.
+        triu = torch.triu_indices(B, B, offset=1, device=embeddings.device)
+        pred_v = pred_d[triu[0], triu[1]]
+        true_v = true_d[triu[0], triu[1]]
+
+        # Standardize both vectors. Mean of pairwise products of z-scored
+        # vectors equals Pearson correlation.
+        pred_v = (pred_v - pred_v.mean()) / (pred_v.std() + self.eps)
+        true_v = (true_v - true_v.mean()) / (true_v.std() + self.eps)
+
+        pearson = (pred_v * true_v).mean()
+        loss = 1.0 - pearson  # in [0, 2]
+
+        return loss, {
+            "distance_pearson": float(pearson.item()),
+            "distance_loss": float(loss.item()),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Optional cell-class auxiliary classification head
 # ---------------------------------------------------------------------------
 
