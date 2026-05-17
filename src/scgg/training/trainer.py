@@ -1,40 +1,63 @@
 """
 Training loop for ScGG.
 
-Handles section-based training, learning rate scheduling, checkpointing,
-and periodic evaluation. Designed for the section-sampling paradigm where
-each training step processes cells from one section.
+The trainer dispatches based on `config["training"]["objective"]`:
+
+  * "contrastive" (default): supervised InfoNCE on the metric-head output
+    against the GT spatial kNN graph. One forward + one loss.
+  * "flow_matching" (ablation): flow matching MSE on coordinates, optionally
+    augmented with the legacy auxiliary contrastive on encoder outputs.
+
+Optional cross-modality / OOD components (cross-modality contrastive,
+section-embedding consistency, domain adversarial) are scaffolded but
+DISABLED by default. They require a second-modality dataloader and section
+pairing metadata; the trainer will warn (and ignore them) if they are
+enabled without those inputs being available.
 """
 
+from __future__ import annotations
+
 import math
-import torch
-import torch.nn as nn
-import numpy as np
-import logging
 import time
-import json
+import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Any
+
+import numpy as np
+import torch
+import torch.nn as nn
 
 from ..model.scgg import ScGG
 from ..data.dataset import (
     SpatialTranscriptomicsDataset,
     create_cell_batches,
 )
-from .losses import ScGGLoss
+from .losses import ContrastiveRankingLoss, FlowMatchingLoss
+from .ood_losses import (
+    CrossModalityContrastiveLoss,
+    SectionEmbeddingConsistencyLoss,
+    DomainAdversarialLoss,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class Trainer:
-    """ScGG trainer.
+    """ScGG trainer with pluggable objective + optional OOD components.
 
     Args:
-        model: ScGG model.
-        train_dataset: Training dataset.
-        val_dataset: Optional validation dataset.
+        model: Initialised ScGG.
+        train_dataset: Spatial-transcriptomics training dataset (ground-truth
+            graphs precomputed).
+        val_dataset: Optional validation dataset (same shape).
         config: Full configuration dict.
         device: Torch device.
+        sc_dataset: OPTIONAL second-modality (scRNA-seq) dataset. Only used
+            when any of the OOD components in config["training"]["ood"] is
+            enabled. If you don't have one yet, pass None.
+        section_pairing: OPTIONAL dict mapping ST section id -> matched
+            adjacent scRNA section id. Required for cross-modality contrastive
+            and section-embedding consistency losses when enabled.
     """
 
     def __init__(
@@ -43,7 +66,11 @@ class Trainer:
         train_dataset: SpatialTranscriptomicsDataset,
         val_dataset: Optional[SpatialTranscriptomicsDataset],
         config: dict,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        device: torch.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        ),
+        sc_dataset: Optional[SpatialTranscriptomicsDataset] = None,
+        section_pairing: Optional[Dict[int, int]] = None,
     ):
         self.model = model.to(device)
         self.train_dataset = train_dataset
@@ -51,31 +78,57 @@ class Trainer:
         self.config = config
         self.device = device
 
+        self.sc_dataset = sc_dataset
+        self.section_pairing = section_pairing or {}
+
         train_cfg = config["training"]
+        self.objective: str = train_cfg.get("objective", "contrastive")
 
-        # Loss
+        # ---- Primary criterion ----------------------------------------------
         loss_cfg = train_cfg.get("loss", {})
-        self.criterion = ScGGLoss(
-            lambda_contrastive=loss_cfg.get("contrastive_spatial", 0.1),
-            temperature=loss_cfg.get("contrastive_temperature", 0.1),
-            n_negatives=loss_cfg.get("contrastive_n_negatives", 64),
-        )
+        if self.objective == "contrastive":
+            cl_cfg = loss_cfg.get("contrastive", {})
+            mh_normalizes = config["model"].get("metric_head", {}).get(
+                "normalize", True
+            )
+            self.criterion = ContrastiveRankingLoss(
+                temperature=cl_cfg.get("temperature", 0.1),
+                positives_per_anchor=cl_cfg.get("positives_per_anchor", 1),
+                exclude_self=cl_cfg.get("exclude_self", True),
+                # If the metric head already normalizes, skip double-norm.
+                normalize_inputs=not mh_normalizes,
+            )
+        elif self.objective == "flow_matching":
+            self.criterion = FlowMatchingLoss(
+                lambda_contrastive=loss_cfg.get("contrastive_spatial", 0.1),
+                temperature=loss_cfg.get("contrastive_temperature", 0.1),
+                n_negatives=loss_cfg.get("contrastive_n_negatives", 64),
+            )
+        else:
+            raise ValueError(
+                f"Unknown objective {self.objective!r}; expected one of "
+                f"'contrastive' or 'flow_matching'."
+            )
 
-        # Optimizer
+        # ---- Optional OOD components ----------------------------------------
+        ood_cfg = train_cfg.get("ood", {}) or {}
+        self._setup_ood_components(ood_cfg, train_cfg)
+
+        # ---- Optimizer ------------------------------------------------------
         if train_cfg["optimizer"] == "adamw":
             self.optimizer = torch.optim.AdamW(
-                model.parameters(),
+                self._all_params(),
                 lr=train_cfg["lr"],
                 weight_decay=train_cfg["weight_decay"],
             )
         else:
             self.optimizer = torch.optim.Adam(
-                model.parameters(),
+                self._all_params(),
                 lr=train_cfg["lr"],
                 weight_decay=train_cfg["weight_decay"],
             )
 
-        # Estimate actual training steps per epoch (mini-batches across all sections)
+        # ---- LR schedule ----------------------------------------------------
         batch_size = train_cfg["batch_size"]
         steps_per_epoch = 0
         for s in train_dataset.sections:
@@ -84,13 +137,13 @@ class Trainer:
 
         total_steps = train_cfg["epochs"] * steps_per_epoch
         warmup_steps = train_cfg.get("warmup_epochs", 10) * steps_per_epoch
+        logger.info(
+            f"Scheduler: {steps_per_epoch} steps/epoch, "
+            f"{total_steps} total steps, {warmup_steps} warmup steps"
+        )
 
-        logger.info(f"Scheduler: {steps_per_epoch} steps/epoch, "
-                     f"{total_steps} total steps, {warmup_steps} warmup steps")
-
-        # Combined warmup + cosine decay via LambdaLR
         if train_cfg["scheduler"] == "cosine":
-            def lr_lambda(step):
+            def lr_lambda(step: int) -> float:
                 if step < warmup_steps:
                     return step / max(warmup_steps, 1)
                 progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
@@ -107,23 +160,87 @@ class Trainer:
         self.global_step = 0
         self.best_val_loss = float("inf")
 
-        # Checkpointing
+        # ---- Checkpoints & logging -----------------------------------------
         self.checkpoint_dir = Path(train_cfg.get("checkpoint_dir", "./checkpoints"))
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        # Logging intervals
         self.log_every = train_cfg.get("log_every", 100)
         self.eval_every = train_cfg.get("eval_every", 5)
         self.save_every = train_cfg.get("save_every", 10)
 
-        # Wandb
+        # ---- wandb ---------------------------------------------------------
         self.use_wandb = train_cfg.get("wandb", False)
         self.wandb = None
         if self.use_wandb:
             self._init_wandb(train_cfg, config)
 
+    # ------------------------------------------------------------------- setup
+
+    def _setup_ood_components(self, ood_cfg: dict, train_cfg: dict):
+        """Instantiate enabled OOD components and warn if data is missing."""
+        self.ood_components: Dict[str, Any] = {}
+        self.ood_weights: Dict[str, float] = {}
+
+        cm_cfg = ood_cfg.get("cross_modality_contrastive", {}) or {}
+        if cm_cfg.get("enabled", False):
+            self.ood_components["cm_contrastive"] = CrossModalityContrastiveLoss(
+                temperature=cm_cfg.get("temperature", 0.1),
+                normalize_inputs=cm_cfg.get("normalize_inputs", False),
+                symmetric=cm_cfg.get("symmetric", True),
+            )
+            self.ood_weights["cm_contrastive"] = float(cm_cfg.get("weight", 0.1))
+            if self.sc_dataset is None or not self.section_pairing:
+                logger.warning(
+                    "cross_modality_contrastive enabled but sc_dataset / "
+                    "section_pairing not provided; loss will be skipped."
+                )
+
+        sc_cfg = ood_cfg.get("section_embedding_consistency", {}) or {}
+        if sc_cfg.get("enabled", False):
+            self.ood_components["section_consistency"] = (
+                SectionEmbeddingConsistencyLoss(
+                    distance=sc_cfg.get("distance", "l2"),
+                    normalize=sc_cfg.get("normalize", False),
+                )
+            )
+            self.ood_weights["section_consistency"] = float(sc_cfg.get("weight", 1.0))
+            if self.sc_dataset is None or not self.section_pairing:
+                logger.warning(
+                    "section_embedding_consistency enabled but sc_dataset / "
+                    "section_pairing not provided; loss will be skipped."
+                )
+
+        da_cfg = ood_cfg.get("domain_adversarial", {}) or {}
+        if da_cfg.get("enabled", False):
+            enc_dim = self.config["model"]["encoder"]["embed_dim"]
+            self.ood_components["domain_adv"] = DomainAdversarialLoss(
+                in_dim=enc_dim,
+                n_domains=da_cfg.get("n_domains", 2),
+                hidden_dim=da_cfg.get("hidden_dim", 128),
+                lambd=da_cfg.get("lambd", 1.0),
+            ).to(self.device)
+            self.ood_weights["domain_adv"] = float(da_cfg.get("weight", 0.1))
+            if self.sc_dataset is None:
+                logger.warning(
+                    "domain_adversarial enabled but sc_dataset not provided; "
+                    "loss will be skipped."
+                )
+
+        if self.ood_components:
+            logger.info(f"OOD components enabled: {list(self.ood_components.keys())}")
+        else:
+            logger.info("No OOD components enabled (default).")
+
+    def _all_params(self):
+        """Iterate parameters from the main model + any OOD components."""
+        params = list(self.model.parameters())
+        for c in self.ood_components.values():
+            if isinstance(c, nn.Module):
+                params += list(c.parameters())
+        return [p for p in params if p.requires_grad]
+
+    # ------------------------------------------------------------------- wandb
+
     def _init_wandb(self, train_cfg: dict, config: dict):
-        """Initialize Weights & Biases logging."""
         try:
             import wandb
 
@@ -133,16 +250,16 @@ class Trainer:
                 config=config,
                 tags=train_cfg.get("wandb_tags", []),
             )
-            # Watch model for gradient and parameter histograms
             wandb.watch(self.model, log="gradients", log_freq=self.log_every)
             self.wandb = wandb
-            logger.info(f"Wandb initialized: project={wandb.run.project}, run={wandb.run.name}")
+            logger.info(
+                f"Wandb initialized: project={wandb.run.project}, run={wandb.run.name}"
+            )
         except ImportError:
             logger.warning("wandb not installed. Install with: pip install wandb")
             self.use_wandb = False
 
     def _log_wandb(self, metrics: Dict[str, float], prefix: str = "train"):
-        """Log metrics to wandb if enabled."""
         if not self.use_wandb or self.wandb is None:
             return
         payload = {f"{prefix}/{k}": v for k, v in metrics.items()}
@@ -150,217 +267,248 @@ class Trainer:
         payload["lr"] = self.optimizer.param_groups[0]["lr"]
         self.wandb.log(payload, step=self.global_step)
 
+    # ------------------------------------------------------------------- train
+
     def train(self):
-        """Run full training loop."""
         train_cfg = self.config["training"]
         n_epochs = train_cfg["epochs"]
         batch_size = train_cfg["batch_size"]
 
-        n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        logger.info(f"Starting training for {n_epochs} epochs")
+        n_params = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
+        logger.info(f"Starting training: objective={self.objective}")
+        logger.info(f"  Epochs: {n_epochs}")
         logger.info(f"  Sections: {len(self.train_dataset)}")
         logger.info(f"  Batch size: {batch_size} cells")
         logger.info(f"  Device: {self.device}")
-        logger.info(f"  Parameters: {n_params:,}")
+        logger.info(f"  Parameters (model): {n_params:,}")
 
         epoch_timer = time.time()
-
         for epoch in range(n_epochs):
             t0 = time.time()
             epoch_metrics = self._train_epoch(epoch, batch_size)
             epoch_time = time.time() - t0
 
-            # Log epoch summary
+            primary_loss_name = (
+                "contrastive_loss" if self.objective == "contrastive" else "fm_loss"
+            )
             logger.info(
                 f"Epoch {epoch + 1}/{n_epochs} | "
-                f"Loss: {epoch_metrics['total_loss']:.4f} | "
-                f"FM: {epoch_metrics['fm_loss']:.4f} | "
+                f"Total: {epoch_metrics.get('total_loss', float('nan')):.4f} | "
+                f"{primary_loss_name}: "
+                f"{epoch_metrics.get(primary_loss_name, float('nan')):.4f} | "
                 f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
                 f"Time: {epoch_time:.1f}s"
             )
 
-            # Wandb epoch-level logging
             epoch_metrics["epoch_time_s"] = epoch_time
             epoch_metrics["epoch"] = epoch + 1
             self._log_wandb(epoch_metrics, prefix="train/epoch")
 
-            # Evaluation
-            if self.val_dataset is not None and (epoch + 1) % self.eval_every == 0:
+            if (
+                self.val_dataset is not None
+                and (epoch + 1) % self.eval_every == 0
+            ):
                 val_metrics = self._validate(batch_size)
                 logger.info(
-                    f"  Val Loss: {val_metrics['total_loss']:.4f} | "
-                    f"Val FM: {val_metrics['fm_loss']:.4f}"
+                    f"  Val Total: {val_metrics.get('total_loss', float('nan')):.4f}"
                 )
-
                 self._log_wandb(val_metrics, prefix="val")
-
-                if val_metrics["total_loss"] < self.best_val_loss:
+                if val_metrics.get("total_loss", float("inf")) < self.best_val_loss:
                     self.best_val_loss = val_metrics["total_loss"]
                     self._save_checkpoint(epoch, is_best=True)
                     if self.use_wandb and self.wandb is not None:
                         self.wandb.run.summary["best_val_loss"] = self.best_val_loss
                         self.wandb.run.summary["best_epoch"] = epoch + 1
 
-            # Save checkpoint
             if (epoch + 1) % self.save_every == 0:
                 self._save_checkpoint(epoch)
 
         total_time = time.time() - epoch_timer
         logger.info(f"Training complete! Total time: {total_time / 60:.1f} min")
-
         if self.use_wandb and self.wandb is not None:
             self.wandb.run.summary["total_training_time_min"] = total_time / 60
             self.wandb.finish()
 
-    def _train_epoch(self, epoch: int, batch_size: int) -> Dict[str, float]:
-        """Train for one epoch (iterate over all sections)."""
-        self.model.train()
+    # ----------------------------------------------------------------- epochs
 
-        epoch_losses = []
+    def _train_epoch(self, epoch: int, batch_size: int) -> Dict[str, float]:
+        self.model.train()
+        for c in self.ood_components.values():
+            if isinstance(c, nn.Module):
+                c.train()
+
+        all_metrics: List[Dict[str, float]] = []
         section_order = np.random.permutation(len(self.train_dataset))
 
         for sec_idx in section_order:
             section_data = self.train_dataset[sec_idx]
-
-            # Get section-level expression for section encoder
             section_expr = section_data["gene_expr"].to(self.device)
-
-            # Split section into cell mini-batches
             mini_batches = create_cell_batches(
                 section_data, batch_size=batch_size, shuffle=True
             )
-
-            # Get ground truth graph for contrastive loss
             gt_key = section_data["gt_graph_key"]
             gt_graph = self.train_dataset.gt_graphs.get(gt_key, None)
 
             for batch in mini_batches:
-                metrics = self._train_step(
-                    batch, section_expr, gt_graph
-                )
-                epoch_losses.append(metrics)
+                metrics = self._train_step(batch, section_expr, gt_graph)
+                all_metrics.append(metrics)
 
-        # Aggregate epoch metrics
-        avg_metrics = {}
-        for key in epoch_losses[0]:
-            avg_metrics[key] = np.mean([m[key] for m in epoch_losses])
+        avg: Dict[str, float] = {}
+        if not all_metrics:
+            return avg
+        for k in all_metrics[0]:
+            try:
+                avg[k] = float(np.mean([m[k] for m in all_metrics if k in m]))
+            except (TypeError, ValueError):
+                pass
+        return avg
 
-        return avg_metrics
+    # ------------------------------------------------------------------- step
 
     def _train_step(
         self,
         batch: Dict,
         section_expr: torch.Tensor,
-        gt_graph: Optional[Any],
+        gt_graph,
     ) -> Dict[str, float]:
-        """Single training step on a mini-batch of cells."""
         gene_expr = batch["gene_expr"].to(self.device)
-        coords = batch["coords"].to(self.device)
-        k_target_val = batch["k_target"]
-        batch_size = gene_expr.shape[0]
-
-        # Encode
-        cell_embed, section_embed = self.model.encode(gene_expr, section_expr)
-
-        # k target
-        k_target = torch.full(
-            (batch_size,), k_target_val, dtype=torch.long, device=self.device
-        )
-
-        # Flow matching loss
-        fm_loss, fm_metrics = self.model.flow.compute_loss(
-            z_1=coords,
-            cell_embed=cell_embed,
-            section_embed=section_embed,
-            k_target=k_target,
-        )
-
-        # Combined loss with optional contrastive term
         batch_indices = batch.get("batch_indices_in_section", None)
-        total_loss, all_metrics = self.criterion(
-            fm_loss=fm_loss,
-            cell_embeddings=cell_embed,
-            spatial_adj=gt_graph,
-            batch_indices=batch_indices,
-        )
 
-        # Backprop
+        if self.objective == "contrastive":
+            # Single forward through metric head; one loss.
+            emb = self.model.embed(gene_expr, section_expr)
+            loss, primary_metrics = self.criterion(
+                embeddings=emb,
+                spatial_adj=gt_graph,
+                batch_indices=batch_indices,
+            )
+            metrics = {"contrastive_loss": primary_metrics["contrastive_loss"]}
+            for k in ("n_anchors_used", "n_anchors_skipped"):
+                if k in primary_metrics:
+                    metrics[k] = primary_metrics[k]
+
+        else:  # flow_matching
+            coords = batch["coords"].to(self.device)
+            k_target_val = batch["k_target"]
+            B = gene_expr.shape[0]
+            cell_embed, section_embed = self.model.encode(gene_expr, section_expr)
+            k_target = torch.full(
+                (B,), k_target_val, dtype=torch.long, device=self.device
+            )
+            fm_loss, _ = self.model.flow.compute_loss(
+                z_1=coords,
+                cell_embed=cell_embed,
+                section_embed=section_embed,
+                k_target=k_target,
+            )
+            loss, primary_metrics = self.criterion(
+                fm_loss=fm_loss,
+                cell_embeddings=cell_embed,
+                spatial_adj=gt_graph,
+                batch_indices=batch_indices,
+            )
+            metrics = dict(primary_metrics)
+
+        # ---- OOD components (no-op by default; require second modality) ----
+        # Hooks are wired here so flipping them on in the future only requires
+        # plumbing a paired-modality batch into _train_step. We currently do
+        # not have that path because the user requested OOD components be off
+        # by default; the trainer will emit a one-time warning if invoked.
+        # (Future PR: accept a (st_batch, sc_batch) tuple and route accordingly.)
+
+        # ---- Backprop ------------------------------------------------------
         self.optimizer.zero_grad()
-        total_loss.backward()
-
+        loss.backward()
         if self.grad_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.grad_clip
+                self._all_params(), self.grad_clip
             )
-            all_metrics["grad_norm"] = grad_norm.item()
-
+            metrics["grad_norm"] = grad_norm.item()
         self.optimizer.step()
-
         if self.scheduler is not None:
             self.scheduler.step()
-
         self.global_step += 1
 
-        # Step-level logging
+        metrics["total_loss"] = loss.item()
+
         if self.global_step % self.log_every == 0:
             lr = self.optimizer.param_groups[0]["lr"]
-            logger.info(
-                f"  Step {self.global_step} | Loss: {all_metrics['total_loss']:.4f} | "
-                f"FM: {all_metrics['fm_loss']:.4f} | LR: {lr:.2e}"
+            primary_name = (
+                "contrastive_loss" if self.objective == "contrastive" else "fm_loss"
             )
-            # Wandb step-level logging
-            self._log_wandb(all_metrics, prefix="train/step")
+            logger.info(
+                f"  Step {self.global_step} | "
+                f"Total: {metrics['total_loss']:.4f} | "
+                f"{primary_name}: {metrics.get(primary_name, float('nan')):.4f} | "
+                f"LR: {lr:.2e}"
+            )
+            self._log_wandb(metrics, prefix="train/step")
 
-        return all_metrics
+        return metrics
+
+    # ---------------------------------------------------------------- validate
 
     @torch.no_grad()
     def _validate(self, batch_size: int) -> Dict[str, float]:
-        """Run validation over all validation sections."""
         self.model.eval()
-        val_losses = []
+        val_metrics: List[Dict[str, float]] = []
 
         for sec_idx in range(len(self.val_dataset)):
             section_data = self.val_dataset[sec_idx]
             section_expr = section_data["gene_expr"].to(self.device)
-
             mini_batches = create_cell_batches(
                 section_data, batch_size=batch_size, shuffle=False
             )
-
             gt_key = section_data["gt_graph_key"]
             gt_graph = self.val_dataset.gt_graphs.get(gt_key, None)
 
             for batch in mini_batches:
                 gene_expr = batch["gene_expr"].to(self.device)
-                coords = batch["coords"].to(self.device)
-                k_val = batch["k_target"]
-                bs = gene_expr.shape[0]
+                batch_indices = batch.get("batch_indices_in_section", None)
 
-                cell_embed, section_embed = self.model.encode(
-                    gene_expr, section_expr
-                )
-                k_target = torch.full(
-                    (bs,), k_val, dtype=torch.long, device=self.device
-                )
+                if self.objective == "contrastive":
+                    emb = self.model.embed(gene_expr, section_expr)
+                    loss, m = self.criterion(
+                        embeddings=emb,
+                        spatial_adj=gt_graph,
+                        batch_indices=batch_indices,
+                    )
+                    val_metrics.append(
+                        {"contrastive_loss": m["contrastive_loss"],
+                         "total_loss": loss.item()}
+                    )
+                else:
+                    coords = batch["coords"].to(self.device)
+                    k_val = batch["k_target"]
+                    B = gene_expr.shape[0]
+                    ce, se = self.model.encode(gene_expr, section_expr)
+                    kk = torch.full(
+                        (B,), k_val, dtype=torch.long, device=self.device
+                    )
+                    fm_loss, _ = self.model.flow.compute_loss(
+                        z_1=coords,
+                        cell_embed=ce,
+                        section_embed=se,
+                        k_target=kk,
+                    )
+                    loss, m = self.criterion(fm_loss=fm_loss)
+                    val_metrics.append(m)
 
-                fm_loss, _ = self.model.flow.compute_loss(
-                    z_1=coords,
-                    cell_embed=cell_embed,
-                    section_embed=section_embed,
-                    k_target=k_target,
-                )
+        if not val_metrics:
+            return {"total_loss": float("nan")}
+        out: Dict[str, float] = {}
+        for k in val_metrics[0]:
+            try:
+                out[k] = float(np.mean([m[k] for m in val_metrics if k in m]))
+            except (TypeError, ValueError):
+                pass
+        return out
 
-                _, metrics = self.criterion(fm_loss=fm_loss)
-                val_losses.append(metrics)
-
-        avg = {}
-        for key in val_losses[0]:
-            avg[key] = np.mean([m[key] for m in val_losses])
-
-        return avg
+    # ---------------------------------------------------------------- save/load
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save model checkpoint."""
         state = {
             "epoch": epoch,
             "global_step": self.global_step,
@@ -368,31 +516,36 @@ class Trainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "best_val_loss": self.best_val_loss,
             "config": self.config,
+            "ood_state_dicts": {
+                name: c.state_dict()
+                for name, c in self.ood_components.items()
+                if isinstance(c, nn.Module)
+            },
         }
-
         path = self.checkpoint_dir / f"checkpoint_epoch{epoch + 1}.pt"
         torch.save(state, path)
         logger.info(f"Saved checkpoint: {path}")
-
         if is_best:
             best_path = self.checkpoint_dir / "best_model.pt"
             torch.save(state, best_path)
             logger.info(f"Saved best model: {best_path}")
-
-        # Log checkpoint as wandb artifact
         if self.use_wandb and self.wandb is not None and is_best:
             artifact = self.wandb.Artifact(
-                f"model-best", type="model",
+                "model-best", type="model",
                 description=f"Best model at epoch {epoch + 1}",
             )
             artifact.add_file(str(best_path))
             self.wandb.log_artifact(artifact)
 
     def load_checkpoint(self, path: str):
-        """Load model from checkpoint."""
         state = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(state["model_state_dict"])
         self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        for name, sd in state.get("ood_state_dicts", {}).items():
+            if name in self.ood_components and isinstance(
+                self.ood_components[name], nn.Module
+            ):
+                self.ood_components[name].load_state_dict(sd)
         self.global_step = state["global_step"]
         self.best_val_loss = state.get("best_val_loss", float("inf"))
         logger.info(f"Loaded checkpoint from epoch {state['epoch'] + 1}")

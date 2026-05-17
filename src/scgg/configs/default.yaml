@@ -1,5 +1,9 @@
-# ScGG: Spatial Graph Generation via Conditional Flow Matching
+# ScGG: Spatial Graph Generation
 # Default configuration
+#
+# Primary objective is "contrastive" (PinSage-style supervised InfoNCE on a
+# learned metric embedding, evaluated against the GT spatial kNN graph).
+# Flow matching is retained as an ablation via training.objective: flow_matching.
 
 # --- Model ---
 model:
@@ -17,49 +21,62 @@ model:
     n_attention_heads: 4
     subsample_size: 4096  # max cells to use for section embedding computation
 
-  # Velocity network
+  # Metric head (used when training.objective == "contrastive")
+  # Projects (cell_embed, section_embed) -> d-dim normalized embedding for kNN.
+  metric_head:
+    hidden_dims: [256, 128]
+    embed_dim: 32           # d for the metric space (32 is a reasonable default)
+    normalize: true         # L2-normalize so FAISS L2 == cosine ranking
+    dropout: 0.1
+
+  # Velocity network (only built when objective == "flow_matching")
   velocity_net:
     hidden_dims: [512, 512, 256]
     time_embed_dim: 64
     k_embed_dim: 16
     dropout: 0.1
 
-  # Spatial embedding dimension (output of flow)
-  spatial_dim: 2  # 2D coordinates; set to higher for learned embeddings
+  # Spatial dim for the flow-matching ablation (target is GT 2D coords)
+  spatial_dim: 2
 
-  # Flow matching
+  # Flow matching (only used when objective == "flow_matching")
   flow:
-    sigma_min: 1.0e-4  # minimum noise for OT paths
+    sigma_min: 1.0e-4
     solver: "euler"     # euler | midpoint | rk4
-    n_steps: 100        # ODE integration steps at inference
+    n_steps: 100
 
 # --- Graph ---
 graph:
-  k_default: 10            # default kNN parameter
-  k_train_range: [5, 30]   # range of k values seen during training
-  k_train_probs: null       # if null, sample uniformly
-  backend: "faiss"          # faiss | sklearn
+  k_default: 10            # default kNN parameter (the user's k=10)
+  k_train_range: [5, 30]   # range of k values seen during flow-matching training
+  k_train_probs: null      # uniform if null
+  backend: "faiss"         # faiss | sklearn
   metric: "euclidean"
 
 # --- Data ---
 data:
   dataset: "merfish"
   data_dir: "./data/merfish"
-  gene_list: null           # if null, use all shared genes
-  n_top_hvg: null           # if set, select top N highly variable genes
-  normalize: true           # log1p normalization
-  scale: true               # z-score per gene
+  gene_list: null
+  n_top_hvg: null
+  normalize: true
+  scale: true
   min_cells_per_section: 100
-  coord_normalize: "per_section"  # per_section | global | none
+  coord_normalize: "per_section"
   coord_augment_rotation: true
   coord_center: true
 
 # --- Training ---
 training:
+  # ===== Objective =====
+  # "contrastive" (default): primary InfoNCE on the metric-head output.
+  # "flow_matching" (ablation): legacy flow matching on 2D coords.
+  objective: "contrastive"
+
   seed: 42
   epochs: 200
-  batch_size: 8192          # cells per batch
-  sections_per_epoch: null  # null = all sections
+  batch_size: 8192
+  sections_per_epoch: null
   lr: 1.0e-3
   weight_decay: 1.0e-4
   optimizer: "adamw"
@@ -67,34 +84,63 @@ training:
   warmup_epochs: 10
   grad_clip: 1.0
 
-  # Loss weights
+  # ===== Loss configuration =====
   loss:
-    flow_matching: 1.0
-    contrastive_spatial: 0.1   # weight for contrastive graph loss
+    # Settings for the primary contrastive criterion (objective=contrastive)
+    contrastive:
+      temperature: 0.1
+      positives_per_anchor: 1   # >1 covers more of the k=10 GT neighborhood
+      exclude_self: true
+
+    # Legacy settings for the flow-matching objective. Only used when
+    # objective == "flow_matching"; ignored in contrastive mode.
+    flow_matching: 1.0           # weight of the FM term in the legacy loss
+    contrastive_spatial: 0.1     # legacy aux contrastive on encoder outputs
     contrastive_temperature: 0.1
     contrastive_n_negatives: 64
 
-  # Checkpointing
+  # ===== Optional OOD / cross-modality components =====
+  # All disabled by default. Quantify the bare ST->scRNA gap first; flip
+  # these on later. None of them rely on PASTE-style cell pairing — they
+  # only assume section-level pairing between adjacent ST and scRNA sections.
+  ood:
+    cross_modality_contrastive:
+      enabled: false
+      weight: 0.1
+      temperature: 0.1
+      normalize_inputs: false
+      symmetric: true
+    section_embedding_consistency:
+      enabled: false
+      weight: 1.0
+      distance: "l2"        # l2 | cosine
+      normalize: false
+    domain_adversarial:
+      enabled: false
+      weight: 0.1
+      n_domains: 2
+      hidden_dim: 128
+      lambd: 1.0            # gradient-reversal strength
+
+  # ===== Checkpointing & logging =====
   checkpoint_dir: "./checkpoints"
   save_every: 10
-
-  # Logging
-  log_every: 100        # steps
-  eval_every: 5         # epochs
+  log_every: 100
+  eval_every: 5
 
   # Weights & Biases
   wandb: true
   wandb_project: "scgg"
-  wandb_run_name: null   # null = auto-generated by wandb
-  wandb_tags: []         # e.g. ["merfish", "mouse_brain", "debug"]
+  wandb_run_name: null
+  wandb_tags: []
 
 # --- Evaluation ---
 evaluation:
   k_values: [5, 10, 15, 20]
-  n_samples: 5             # number of flow samples for uncertainty
+  n_samples: 5
   metrics:
     - edge_f1
     - neighborhood_composition
     - spatial_autocorrelation
     - degree_distribution
-  n_eval_sections: 5       # sections to evaluate on
+  n_eval_sections: 5
