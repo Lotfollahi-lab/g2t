@@ -15,61 +15,54 @@ in particular, the [API documentation][].
 
 ## Installation
 
-You need Python 3.10 or newer.
+You need Python 3.10 or newer. The recommended workflow uses
+[uv](https://github.com/astral-sh/uv), which knows about per-package indexes
+and so handles the PyTorch CUDA wheel selection automatically.
 
-### Quick install (recommended)
+### Recommended: uv
 
 ```bash
-bash install.sh
+# 1. Install uv (one-time, ~10 MB)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. From the repo root: create .venv and install everything
+cd /path/to/scgg
+uv sync                  # or `uv pip install -e .` to install into a pre-existing venv
+source .venv/bin/activate
 ```
 
-Detects your CUDA driver via `nvidia-smi`, installs the matching PyTorch
-wheel, then installs `scgg` in editable mode. Pass `--cpu` for CPU-only,
-`--cuda 12.4` to force a specific wheel, or `--skip-torch` if you've already
-installed torch yourself.
+`pyproject.toml` already pins torch to the **CUDA 12.4 wheel index**
+(`[tool.uv.sources]` block). If your cluster has a different CUDA, change the
+URL in that section — e.g. `https://download.pytorch.org/whl/cu121` for CUDA
+12.1 or `https://download.pytorch.org/whl/cpu` for CPU-only. The available
+PyTorch CUDA builds are: cu121, cu124, cu126, cu128, cpu.
 
-### Manual install
+### Fallback: pip + install.sh
 
-### 1. Install PyTorch matching your CUDA driver
-
-`scgg` declares `torch>=2.0` but does NOT pin a CUDA build, because the correct
-wheel depends on your driver. Install it BEFORE `scgg` so pip doesn't pull the
-default (latest-CUDA) wheel:
+If you cannot use uv, the included `install.sh` detects your CUDA driver via
+`nvidia-smi` and installs the matching PyTorch wheel, then `scgg`:
 
 ```bash
-# CPU-only
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# NVIDIA driver 550+ (CUDA 12.4)
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-
-# NVIDIA driver 530+ (CUDA 12.1) — works with driver 12.4 too
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# NVIDIA driver 560+ (CUDA 12.6)
-pip install torch --index-url https://download.pytorch.org/whl/cu126
+bash install.sh                      # auto-detect
+bash install.sh --cuda 12.4          # force a specific wheel
+bash install.sh --cpu                # CPU only
 ```
 
-Check your driver's max CUDA version with `nvidia-smi` (top-right). Pick the
-PyTorch wheel for a CUDA version ≤ that. If you see
-`The NVIDIA driver on your system is too old (found version 1240X)` when
-importing torch, you installed a wheel built for a newer CUDA than your
-driver supports — uninstall and reinstall from the lower index above.
-
-### 2. Install scgg
+### Fallback: pure pip
 
 ```bash
+# Pick ONE of these depending on your CUDA driver:
+pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA 12.4
+pip install torch --index-url https://download.pytorch.org/whl/cu121  # CUDA 12.1
+pip install torch --index-url https://download.pytorch.org/whl/cpu    # CPU-only
+
+# Then:
 pip install -e /path/to/scgg
 ```
 
 If `pip install -e .` fails with
-`build backend is missing the 'build_editable' hook`, upgrade your build
-tooling first:
-
-```bash
-pip install --upgrade pip setuptools wheel
-pip install -e .
-```
+`build backend is missing the 'build_editable' hook`, upgrade build tooling
+first: `pip install --upgrade pip setuptools wheel`.
 
 ## Release notes
 
