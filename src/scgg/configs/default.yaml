@@ -31,13 +31,15 @@ model:
   #       fundamentally limited (no cell-to-cell info flow).
   metric_head:
     type: "cross_attention"   # mlp | cross_attention
-    # Output dimension of the metric space. Reduced from 64 to 8 so any
-    # 2-D spatial signal must live in axes that 2-D readouts can find —
-    # a 64-d unit-sphere embedding can hide spatial structure in
-    # lower-variance directions that PCA / linear readouts drop. 8 keeps
-    # plenty of capacity for cell-type structure while making the
-    # CoordRegressionLoss head's Linear(8, 2) projection effective.
-    embed_dim: 8
+    # Output dimension of the metric space. 32 is a compromise between the
+    # original 64 (more capacity but spatial signal can hide in
+    # lower-variance directions a linear readout drops) and 8 (forces
+    # extreme compression but starves the CoordRegressionLoss head when
+    # both cell-class structure and 2-D spatial axes need to coexist on
+    # a unit sphere). 32 gives the coord head's Linear(32, 2) plenty of
+    # room to find clean spatial axes while keeping the rest for class
+    # structure.
+    embed_dim: 32
     normalize: true           # L2-normalize so FAISS L2 == cosine ranking
     dropout: 0.1
     # cross_attention-specific
@@ -125,8 +127,26 @@ training:
 
     distance_regression:
       enabled: true
-      weight: 1.0
+      # Weight bumped from 1.0 to 2.0 to make the 2-D-coord pairwise
+      # structure loss matter relative to the SupCon contrastive term
+      # (which has weight 1.0). Together with coord_regression weight 5.0,
+      # the model now treats 2-D coord fidelity as the dominant training
+      # signal — exactly where we want it for LUNA-quality visuals.
+      weight: 2.0
       use_squared: true           # squared Euclidean distances (smoother grads)
+      # Which tensor to compute pairwise distance Pearson on:
+      #   'coord_head' (default when coord_regression.enabled is true):
+      #       operate on the 2-D output of the CoordRegressionLoss head.
+      #       Couples this loss directly to what gets visualized and stops
+      #       a single dominant embedding axis (depth in cortex) from
+      #       being a sufficient solution. *Both* output axes must be
+      #       right for the Pearson to be high.
+      #   'embedding' (legacy):
+      #       operate on the raw metric embedding (B, embed_dim). Closer
+      #       to the original LUNA-eq-11 formulation but lets the model
+      #       hide spatial signal in low-variance dimensions a linear
+      #       2-D readout can't see.
+      target: "coord_head"
       # When false (default), Pearson is computed on all in-batch pairs.
       # When true, Pearson is computed *per cell class* and averaged across
       # classes — between-class pairs no longer contribute. Use this when
@@ -149,7 +169,14 @@ training:
     # On by default; disable for ablations.
     coord_regression:
       enabled: true
-      weight: 1.0
+      # Weight bumped from 1.0 to 5.0 so the coord MSE dominates the total
+      # loss. Empirically the contrastive term sits around 6-7 while
+      # coord_loss sits around 0.3-1.0, so without a large multiplier the
+      # coord head barely shifts the encoder. With weight=5.0 it
+      # contributes 1.5-5.0 to the total — comparable to contrastive,
+      # which is what we want for 2-D coord fidelity to be the primary
+      # training signal.
+      weight: 5.0
       # If false (default), the alignment is rotation-only (det(R) = +1)
       # so the model can't satisfy the loss by mirroring its output.
       # True allows reflection — useful only for datasets without a

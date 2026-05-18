@@ -265,8 +265,14 @@ class DistanceRegressionLoss(nn.Module):
     Spearman. This module adds the structural-distance term back in.
 
     Implementation:
-      * Pairwise squared Euclidean distance between cells in BOTH the metric
-        embedding space (B, d) and the GT coordinate space (B, 2).
+      * Pairwise squared Euclidean distance between cells in BOTH the
+        prediction space (B, d) and the GT coordinate space (B, 2). The
+        prediction can be either the raw metric embedding OR the 2-D
+        output of the coord-regression head — the math is identical, the
+        caller chooses which is more useful. Routing through the 2-D head
+        makes the loss couple directly to what gets visualized and stops
+        a single dominant axis (depth in cortex) from being a sufficient
+        solution.
       * Take the upper triangle (i < j) to avoid self-pairs and double-counting.
       * Standardize both vectors (z-score) and compute Pearson correlation =
         mean of the element-wise product.
@@ -507,22 +513,32 @@ class CoordRegressionLoss(nn.Module):
         self.normalize_by_var = bool(normalize_by_var)
         self.eps = float(eps)
 
+    def project_2d(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Apply the learned head to produce (B, 2) coord predictions.
+
+        Exposed so callers (the trainer in particular) can compute the
+        2-D projection once per batch and route it through both this loss
+        and the distance-regression loss without paying for the head twice.
+        """
+        return self.head(embeddings)
+
     def forward(
         self,
-        embeddings: torch.Tensor,
+        pred_2d: torch.Tensor,
         coords: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Args:
-            embeddings: (B, embed_dim) metric embeddings.
+            pred_2d: (B, 2) predicted coords from the head. Pre-projected
+                so the caller can reuse them for other losses.
             coords: (B, 2) GT 2-D coordinates.
 
         Returns:
             loss (scalar) + metrics dict.
         """
-        B = embeddings.shape[0]
+        B = pred_2d.shape[0]
         zero_out = (
-            embeddings.sum() * 0.0,
+            pred_2d.sum() * 0.0,
             {
                 "coord_loss": 0.0,
                 "coord_mse": 0.0,
@@ -533,7 +549,7 @@ class CoordRegressionLoss(nn.Module):
         if B < 3 or coords.shape[0] != B:
             return zero_out
 
-        pred = self.head(embeddings)  # (B, 2)
+        pred = pred_2d  # alias, kept for the original math below
 
         # Procrustes / Kabsch-Umeyama similarity transform. Computed under
         # no_grad so gradients flow through pred only — the model can't

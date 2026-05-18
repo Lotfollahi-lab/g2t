@@ -114,6 +114,22 @@ class Trainer:
             dr_cfg = loss_cfg.get("distance_regression", {}) or {}
             self.use_distance_loss = bool(dr_cfg.get("enabled", True))
             self.distance_loss_weight = float(dr_cfg.get("weight", 1.0))
+            # When the coord head is enabled, by default route distance
+            # regression through its 2-D output instead of the raw embedding.
+            # Reasoning: pairwise-distance Pearson on the high-dim embedding
+            # is dominated by whichever axis carries the most variance (depth
+            # in cortex), which the model can satisfy without learning
+            # tangential structure. Computing it on the 2-D head output
+            # forces *both* output axes to be right.
+            self.distance_target = str(
+                dr_cfg.get("target", "coord_head")
+            ).lower()
+            if self.distance_target not in ("embedding", "coord_head"):
+                raise ValueError(
+                    f"loss.distance_regression.target must be one of "
+                    f"'embedding' or 'coord_head'; got {self.distance_target!r}"
+                )
+
             if self.use_distance_loss:
                 self.distance_criterion = DistanceRegressionLoss(
                     use_squared=dr_cfg.get("use_squared", True),
@@ -124,7 +140,8 @@ class Trainer:
                     "Distance regression loss ENABLED "
                     f"(weight={self.distance_loss_weight}, use_squared="
                     f"{dr_cfg.get('use_squared', True)}, class_stratified="
-                    f"{bool(dr_cfg.get('class_stratified', False))})"
+                    f"{bool(dr_cfg.get('class_stratified', False))}, "
+                    f"target={self.distance_target})"
                 )
             else:
                 self.distance_criterion = None
@@ -528,16 +545,37 @@ class Trainer:
                 if k in c_metrics:
                     metrics[k] = c_metrics[k]
 
-            # Optional: pairwise-distance regression (Spearman-aligned).
             loss = self.contrastive_weight * c_loss
             coords = None
+            # Compute the 2-D head projection once if either downstream loss
+            # is going to consume it.
+            pred_2d = None
+            need_pred_2d = (
+                self.use_coord_loss and self.coord_criterion is not None
+            ) or (
+                self.use_distance_loss
+                and self.distance_criterion is not None
+                and self.distance_target == "coord_head"
+                and getattr(self, "coord_criterion", None) is not None
+            )
+            if need_pred_2d:
+                pred_2d = self.coord_criterion.project_2d(emb)
+
+            # Optional: pairwise-distance regression. Operates on `pred_2d`
+            # when `loss.distance_regression.target=coord_head` (default),
+            # otherwise on the raw embedding. The 2-D variant directly
+            # couples the loss to what gets visualized.
             if self.use_distance_loss and self.distance_criterion is not None:
                 coords = batch["coords"].to(self.device)
                 cls_for_dist = batch.get("cell_class", None)
                 if cls_for_dist is not None:
                     cls_for_dist = cls_for_dist.to(self.device)
+                if self.distance_target == "coord_head" and pred_2d is not None:
+                    dr_input = pred_2d
+                else:
+                    dr_input = emb
                 d_loss, d_metrics = self.distance_criterion(
-                    emb, coords, cell_class=cls_for_dist,
+                    dr_input, coords, cell_class=cls_for_dist,
                 )
                 loss = loss + self.distance_loss_weight * d_loss
                 metrics["distance_loss"] = d_metrics["distance_loss"]
@@ -554,7 +592,7 @@ class Trainer:
             if self.use_coord_loss and self.coord_criterion is not None:
                 if coords is None:
                     coords = batch["coords"].to(self.device)
-                cr_loss, cr_metrics = self.coord_criterion(emb, coords)
+                cr_loss, cr_metrics = self.coord_criterion(pred_2d, coords)
                 loss = loss + self.coord_loss_weight * cr_loss
                 metrics["coord_loss"] = cr_metrics["coord_loss"]
                 metrics["coord_mse"] = cr_metrics["coord_mse"]
@@ -669,13 +707,32 @@ class Trainer:
                     total_loss_val = self.contrastive_weight * c_loss
                     val_entry = {"contrastive_loss": c_m["contrastive_loss"]}
                     coords_val = None
+                    pred_2d_val = None
+                    val_need_pred_2d = (
+                        self.use_coord_loss and self.coord_criterion is not None
+                    ) or (
+                        self.use_distance_loss
+                        and self.distance_criterion is not None
+                        and self.distance_target == "coord_head"
+                        and getattr(self, "coord_criterion", None) is not None
+                    )
+                    if val_need_pred_2d:
+                        pred_2d_val = self.coord_criterion.project_2d(emb)
+
                     if self.use_distance_loss and self.distance_criterion is not None:
                         coords_val = batch["coords"].to(self.device)
                         cls_for_dist = batch.get("cell_class", None)
                         if cls_for_dist is not None:
                             cls_for_dist = cls_for_dist.to(self.device)
+                        if (
+                            self.distance_target == "coord_head"
+                            and pred_2d_val is not None
+                        ):
+                            dr_input_val = pred_2d_val
+                        else:
+                            dr_input_val = emb
                         d_loss, d_m = self.distance_criterion(
-                            emb, coords_val, cell_class=cls_for_dist,
+                            dr_input_val, coords_val, cell_class=cls_for_dist,
                         )
                         total_loss_val = (
                             total_loss_val + self.distance_loss_weight * d_loss
@@ -692,7 +749,9 @@ class Trainer:
                     if self.use_coord_loss and self.coord_criterion is not None:
                         if coords_val is None:
                             coords_val = batch["coords"].to(self.device)
-                        cr_loss, cr_m = self.coord_criterion(emb, coords_val)
+                        cr_loss, cr_m = self.coord_criterion(
+                            pred_2d_val, coords_val,
+                        )
                         total_loss_val = (
                             total_loss_val + self.coord_loss_weight * cr_loss
                         )
