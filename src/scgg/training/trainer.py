@@ -17,9 +17,11 @@ enabled without those inputs being available.
 
 from __future__ import annotations
 
+import csv
 import math
 import time
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
@@ -220,6 +222,20 @@ class Trainer:
         self.eval_every = train_cfg.get("eval_every", 5)
         self.save_every = train_cfg.get("save_every", 10)
 
+        # CSV metrics log. Lives next to the checkpoint dir (so the model
+        # output directory has everything: checkpoints/ + metrics.csv +
+        # config.yaml + benchmark.log). Schema is a fixed superset of the
+        # known metric keys; unknown keys go to wandb but not to CSV.
+        self.metrics_csv_path = self.checkpoint_dir.parent / "metrics.csv"
+        self._csv_columns = [
+            "timestamp", "phase", "global_step", "epoch", "lr",
+            "total_loss",
+            "contrastive_loss", "n_anchors_used", "mean_positives_per_anchor",
+            "distance_loss", "distance_pearson", "distance_pearson_global",
+            "distance_n_classes_used",
+            "cellclass_aux_loss", "cellclass_aux_acc",
+        ]
+
         # ---- wandb ---------------------------------------------------------
         self.use_wandb = train_cfg.get("wandb", False)
         self.wandb = None
@@ -315,12 +331,44 @@ class Trainer:
             self.use_wandb = False
 
     def _log_wandb(self, metrics: Dict[str, float], prefix: str = "train"):
+        # Always write the CSV log, regardless of whether wandb is on —
+        # the CSV is the local source of truth for offline analysis.
+        self._log_metrics_csv(metrics, phase=prefix)
+
         if not self.use_wandb or self.wandb is None:
             return
         payload = {f"{prefix}/{k}": v for k, v in metrics.items()}
         payload["global_step"] = self.global_step
         payload["lr"] = self.optimizer.param_groups[0]["lr"]
         self.wandb.log(payload, step=self.global_step)
+
+    def _log_metrics_csv(self, metrics: Dict[str, float], phase: str) -> None:
+        """Append one row to metrics.csv with the well-known metric columns.
+
+        Phase is the same string passed to _log_wandb ("train/step",
+        "train/epoch", "val", ...). Unknown keys are silently dropped from
+        the CSV but still flow to wandb. The file is created with a header
+        on the first call; subsequent calls append.
+        """
+        try:
+            self.metrics_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            row = {c: "" for c in self._csv_columns}
+            row["timestamp"] = datetime.now().isoformat(timespec="seconds")
+            row["phase"] = phase
+            row["global_step"] = self.global_step
+            row["lr"] = self.optimizer.param_groups[0]["lr"]
+            for k, v in metrics.items():
+                if k in self._csv_columns:
+                    row[k] = v
+            new_file = not self.metrics_csv_path.exists()
+            with open(self.metrics_csv_path, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=self._csv_columns)
+                if new_file:
+                    w.writeheader()
+                w.writerow(row)
+        except OSError as e:
+            # Never let a CSV write failure crash training.
+            logger.warning(f"Failed to write metrics.csv row: {e}")
 
     # ------------------------------------------------------------------- train
 
@@ -368,6 +416,7 @@ class Trainer:
                 and (epoch + 1) % self.eval_every == 0
             ):
                 val_metrics = self._validate(batch_size)
+                val_metrics["epoch"] = epoch + 1
                 logger.info(
                     f"  Val Total: {val_metrics.get('total_loss', float('nan')):.4f}"
                 )

@@ -33,8 +33,8 @@ Inputs
                  when the target panel is Ensembl-namespaced).
   --species      mygene species name (default: mouse).
 
-Outputs (under --output_dir, default ../scgg-reproducibility/artifacts/<silver_dir_name>/)
-------------------------------------------------------------------------------------------
+Outputs (under --output_dir, default /nfs/team361/sb75/scgg-reproducibility/artifacts/<silver_dir_name>/inference/)
+-----------------------------------------------------------------------------------------------------------------
   <section>_predicted.h5ad     Copy of the input h5ad with
                                obsm['spatial_pred'] populated.
   <section>_comparison.svg     Side-by-side scatter: ground truth (left)
@@ -83,6 +83,13 @@ import numpy as np
 import yaml
 
 logger = logging.getLogger("scgg.infer_cns")
+
+
+# Default root for inference + model artifacts on the cluster (sb75 area).
+# Inference outputs land in {ARTIFACTS_ROOT}/{silver_dir.name}/inference/;
+# training outputs in {ARTIFACTS_ROOT}/{silver_dir.name}/model/ (see
+# scripts/run_luna_cortex_benchmark.py).
+_ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
 
 
 # ---------------------------------------------------------------------------
@@ -694,12 +701,67 @@ def _predict_embedding(
     return emb.detach().cpu().numpy()
 
 
-def _project_2d(emb_np: np.ndarray, method: str) -> np.ndarray:
-    """Project a (N, d) embedding to (N, 2) for plotting / RSSD."""
+def _project_2d(
+    emb_np: np.ndarray,
+    method: str,
+    coords_true: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Project a (N, d) embedding to (N, 2) for plotting / RSSD.
+
+    Methods:
+      * ``pca``        : fast linear projection on max-variance axes.
+                         Drops spatial signal that lives in low-variance
+                         directions (the typical failure mode after
+                         strong contrastive training).
+      * ``mds``        : preserves pairwise distances; O(N²) and slow.
+      * ``supervised`` : least-squares projection emb -> coords using
+                         the GT coords as target. Requires `coords_true`.
+                         Surfaces *exactly* the spatial signal already in
+                         the embedding (the projection is the optimal
+                         linear 2-D readout). Sub-second.
+    """
     from scgg.evaluation.luna_metrics import embedding_to_2d
     if emb_np.shape[1] == 2:
         return emb_np
+    if method == "supervised":
+        if coords_true is None:
+            logger.warning(
+                "  --projection supervised requested but no GT coords "
+                "available; falling back to PCA."
+            )
+            return embedding_to_2d(emb_np, method="pca")
+        return _supervised_lstsq_projection(emb_np, coords_true)
     return embedding_to_2d(emb_np, method=method)
+
+
+def _supervised_lstsq_projection(
+    emb_np: np.ndarray, coords_true: np.ndarray,
+) -> np.ndarray:
+    """Linear least-squares projection of the embedding onto GT coordinates.
+
+    Solves min ||(emb_c) @ W - coords_c||_F where emb_c, coords_c are
+    centered, then translates back so the prediction lives in the GT
+    coordinate frame. Optimal 2-D linear readout — if the embedding has
+    spatial signal, this surfaces it without max-variance bias.
+
+    This uses the GT to fit the projection; it is therefore *not* a fair
+    out-of-sample prediction (don't use the projected coords as a model
+    benchmark). It IS a valid diagnostic: shows whether the spatial
+    information is present in the d-dim embedding at all.
+    """
+    emb = np.asarray(emb_np, dtype=np.float64)
+    coords = np.asarray(coords_true[:, :2], dtype=np.float64)
+    finite = np.isfinite(emb).all(axis=1) & np.isfinite(coords).all(axis=1)
+    if finite.sum() < 3:
+        return emb_np[:, :2].astype(np.float32)
+    mu_e = emb[finite].mean(axis=0)
+    mu_c = coords[finite].mean(axis=0)
+    ec = emb[finite] - mu_e
+    cc = coords[finite] - mu_c
+    # W: (d, 2) such that ec @ W ≈ cc
+    W, *_ = np.linalg.lstsq(ec, cc, rcond=None)
+    proj = (emb - mu_e) @ W + mu_c
+    return proj.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -1233,10 +1295,10 @@ def run_inference(
 
     silver_path = Path(silver_dir)
     # Default output_dir derived from silver_dir.name so cortex inference
-    # lands in `../scgg-reproducibility/artifacts/mmc_luna/`
-    # and CNS inference in `.../cns_luna/` etc.
+    # lands in {ARTIFACTS_ROOT}/mmc_luna/inference/ and CNS inference in
+    # {ARTIFACTS_ROOT}/cns_luna/inference/ etc.
     if output_dir is None:
-        out_dir = Path("../scgg-reproducibility/artifacts") / silver_path.name
+        out_dir = _ARTIFACTS_ROOT / silver_path.name / "inference"
     else:
         out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1405,7 +1467,15 @@ def run_inference(
             )
 
         embedding = _predict_embedding(model, X_aligned, dev)
-        coords_pred = _project_2d(embedding, projection)
+        gt_for_projection = (
+            np.asarray(adata.obsm["spatial"], dtype=np.float32)
+            if "spatial" in adata.obsm
+            and adata.obsm["spatial"].shape[1] >= 2
+            else None
+        )
+        coords_pred = _project_2d(
+            embedding, projection, coords_true=gt_for_projection,
+        )
         elapsed = time.time() - t0
         logger.info(
             f"  inference done in {elapsed:.1f}s; "
@@ -1552,14 +1622,23 @@ def main() -> int:
         default=None,
         help="Where to write predicted h5ads and comparison SVGs. Default "
              "derives from --silver_dir's basename and points at "
-             "../scgg-reproducibility/artifacts/<silver_dir_name>/.",
+             "/nfs/team361/sb75/scgg-reproducibility/artifacts/"
+             "<silver_dir_name>/inference/.",
     )
     p.add_argument("--color", default="cell_class",
                    help="adata.obs column to color plots by (default: cell_class).")
     p.add_argument(
-        "--projection", default="pca", choices=("pca", "mds"),
+        "--projection", default="pca",
+        choices=("pca", "mds", "supervised"),
         help="2-D projection of the metric embedding (contrastive mode only). "
-             "Default: pca.",
+             "'pca' (default): fast, picks max-variance axes — can hide "
+             "spatial signal that lives in lower-variance directions. "
+             "'mds': preserves pairwise distances, O(N²), slow (minutes on "
+             "5k+ cells). "
+             "'supervised': least-squares fit emb -> GT coords. Sub-second "
+             "and surfaces whatever spatial signal is in the embedding, "
+             "but uses GT to fit the projection so it's a diagnostic only "
+             "(not a fair out-of-sample benchmark).",
     )
     p.add_argument("--device", default=None, help="cuda|cpu (auto if omitted)")
     p.add_argument(

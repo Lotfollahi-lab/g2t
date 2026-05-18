@@ -135,9 +135,12 @@ def _evaluate_split(
 # ---------------------------------------------------------------------------
 
 
+_ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
+
+
 def run_benchmark(
     data_dir: str,
-    output_dir: str = "./results/luna_cortex",
+    output_dir: Optional[str] = None,
     config_path: Optional[str] = None,
     epochs: Optional[int] = None,
     batch_size: Optional[int] = None,
@@ -163,7 +166,10 @@ def run_benchmark(
             Files like mmc_mouse{1,2}_slice{N}.h5ad (or the legacy
             merfish_mouse_cortex_mouse{1,2}_slice{N}.h5ad). Mouse 1
             is treated as TRAIN, Mouse 2 as TEST.
-        output_dir: Where to write per-slice + aggregated CSV/JSON results.
+        output_dir: Where to write the trained checkpoint + per-slice and
+            aggregated metrics. None (default) derives the path from
+            data_dir's basename: {ARTIFACTS_ROOT}/{data_dir.name}/model/
+            (e.g. /nfs/team361/sb75/scgg-reproducibility/artifacts/mmc_luna/model).
         config_path: Optional override path to a scgg config YAML.
         epochs / batch_size / lr / wandb / wandb_run_name: CLI overrides.
         val_fraction: Fraction of TRAIN slices held out for validation.
@@ -189,7 +195,11 @@ def run_benchmark(
     from scgg.training.trainer import Trainer
     from scgg.evaluation.luna_metrics import aggregate_slices
 
-    out_dir = Path(output_dir)
+    data_path = Path(data_dir)
+    if output_dir is None:
+        out_dir = _ARTIFACTS_ROOT / data_path.name / "model"
+    else:
+        out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -371,8 +381,11 @@ def main():
         help="Path to per-slice h5ad directory (LUNA cortex split).",
     )
     p.add_argument(
-        "--output_dir", default="./results/luna_cortex",
-        help="Where to write per-slice CSV and aggregate JSON.",
+        "--output_dir", default=None,
+        help="Where to write the trained checkpoint + per-slice / aggregate "
+             "metrics. Default derives from --data_dir's basename: "
+             "/nfs/team361/sb75/scgg-reproducibility/artifacts/"
+             "<data_dir_name>/model/.",
     )
     p.add_argument("--config", default=None, help="Optional config YAML override.")
     p.add_argument("--epochs", type=int, default=None)
