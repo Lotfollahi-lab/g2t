@@ -240,6 +240,14 @@ def run_training(
             "n_classes": int(data.get("n_classes") or 0),
             "train_cells": int(train_mask.sum()),
             "val_cells": int(val_mask.sum()),
+            "label_column": label_column,
+            "normalize": normalize,
+            "scale": scale,
+            # The exact gene order the model was trained on. Critical for
+            # downstream inference on data with a different gene panel
+            # (e.g. scRNA-seq): the inference script must reorder/pad the
+            # query expression matrix to match this order.
+            "gene_names": list(data.get("gene_names", [])),
         }, f, indent=2, default=str)
 
     t_start = time.time()
