@@ -49,6 +49,50 @@ logger = logging.getLogger("scgg.download_abc")
 S3_BUCKET_HTTPS = "https://allen-brain-cell-atlas.s3.us-west-2.amazonaws.com"
 
 
+def _list_s3_subdirs(prefix: str) -> list[str]:
+    """List the common-prefix subdirectories under an S3 prefix.
+
+    The Allen bucket is anonymous-readable. We use the unsigned REST API:
+    GET https://{bucket}/?list-type=2&prefix={prefix}&delimiter=/
+
+    Returns a list of subdirectory names (without the trailing slash).
+    """
+    import xml.etree.ElementTree as ET
+    import requests
+
+    url = f"{S3_BUCKET_HTTPS}/?list-type=2&prefix={prefix}&delimiter=/"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    root = ET.fromstring(r.content)
+    out: list[str] = []
+    for cp in root.findall("s3:CommonPrefixes", ns):
+        p = cp.find("s3:Prefix", ns)
+        if p is None or not p.text:
+            continue
+        name = p.text[len(prefix):].rstrip("/")
+        if name:
+            out.append(name)
+    return out
+
+
+def _discover_release_version() -> str:
+    """Find the latest Zhuang-ABCA-1 release present in the bucket.
+
+    We list `metadata/Zhuang-ABCA-1/` and pick the lexicographically latest
+    date-stamped subdirectory. The Allen team uses YYYYMMDD names.
+    """
+    versions = _list_s3_subdirs("metadata/Zhuang-ABCA-1/")
+    if not versions:
+        raise RuntimeError(
+            "Could not list metadata/Zhuang-ABCA-1/ on the ABC bucket. "
+            "Check network access to https://allen-brain-cell-atlas.s3.us-west-2.amazonaws.com"
+        )
+    # Sort lexicographically — works for YYYYMMDD-style names.
+    versions.sort()
+    return versions[-1]
+
+
 # ---------------------------------------------------------------------------
 # Path resolution (abc_atlas_access)
 # ---------------------------------------------------------------------------
@@ -140,51 +184,109 @@ def _download_via_https_fallback(
 ) -> None:
     """Plain HTTPS fallback when abc_atlas_access isn't installed.
 
-    The Allen ABC bucket exposes a directory listing via S3 ListObjectsV2.
-    We download an enumerated list of expected files; if any are missing
-    the user should bump --release_version or inspect the bucket directly:
-        aws s3 ls s3://allen-brain-cell-atlas/ --no-sign-request
+    Dynamically discovers the latest release version per dataset rather
+    than hard-coding a date (Allen rolls these forward periodically). Each
+    dataset (`Zhuang-ABCA-1`, `Zhuang-ABCA-1-CCF`, `WMB-taxonomy`) has its
+    own release directory, and the latest version may differ between them.
+
+    If `--release_version` is passed (not "latest"), uses that for all
+    datasets.
     """
-    import requests
+    pinned = release_version if release_version != "latest" else None
 
-    if release_version == "latest":
-        # The release directory layout is stable enough that bumping to
-        # the most recent version we know about works as a default. The
-        # user can override --release_version if Allen ships a newer one.
-        release_version = "20231215"
+    if pinned is None:
+        zh_ver = _discover_release_version()
+        logger.info(f"  discovered Zhuang-ABCA-1 release version: {zh_ver}")
+    else:
+        zh_ver = pinned
+        logger.info(f"  using pinned release version: {zh_ver}")
 
+    # The CCF and taxonomy datasets have their own release dirs; discover
+    # them independently with a one-shot listing so we don't 404 if Allen
+    # versions them out of sync.
+    if pinned is None:
+        try:
+            ccf_versions = _list_s3_subdirs("metadata/Zhuang-ABCA-1-CCF/")
+            ccf_ver = sorted(ccf_versions)[-1] if ccf_versions else zh_ver
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"  could not list Zhuang-ABCA-1-CCF/: {e}")
+            ccf_ver = zh_ver
+        try:
+            tax_versions = _list_s3_subdirs("metadata/WMB-taxonomy/")
+            tax_ver = sorted(tax_versions)[-1] if tax_versions else zh_ver
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"  could not list WMB-taxonomy/: {e}")
+            tax_ver = zh_ver
+        try:
+            expr_versions = _list_s3_subdirs("expression_matrices/Zhuang-ABCA-1/")
+            expr_ver = sorted(expr_versions)[-1] if expr_versions else zh_ver
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"  could not list expression_matrices/Zhuang-ABCA-1/: {e}")
+            expr_ver = zh_ver
+    else:
+        ccf_ver = tax_ver = expr_ver = pinned
+
+    logger.info(
+        f"  versions: Zhuang-ABCA-1={zh_ver} CCF={ccf_ver} "
+        f"WMB-taxonomy={tax_ver} expression={expr_ver}"
+    )
+
+    # File layout discovered from the bucket listing (Oct 2025 release):
+    #   metadata/Zhuang-ABCA-1/{ver}/
+    #       cell_metadata.csv         (~661 MB; raw per-cell metadata, no labels)
+    #       gene.csv                  (~80 KB; gene panel)
+    #       views/cell_metadata_with_cluster_annotation.csv
+    #                                 (~871 MB; cell_metadata pre-joined with
+    #                                  cluster/class/subclass/supertype names)
+    #   metadata/Zhuang-ABCA-1-CCF/{ver}/
+    #       ccf_coordinates.csv       (~221 MB; CCF 3D coords + parcellation)
+    #   expression_matrices/Zhuang-ABCA-1/{ver}/
+    #       Zhuang-ABCA-1-raw.h5ad    (~1.2 GB; sparse raw counts)
+    #
+    # We prefer the pre-joined view (so prepare_abc_silver.py doesn't need to
+    # join WMB-taxonomy itself). WMB-taxonomy files are still useful for
+    # gene-set-level analyses, so we fetch them as optional.
     files = [
-        # (subpath relative to bucket root, local destination)
-        (f"metadata/Zhuang-ABCA-1/{release_version}/views/cell_metadata.csv",
-         f"metadata/Zhuang-ABCA-1/{release_version}/views/cell_metadata.csv"),
-        (f"metadata/Zhuang-ABCA-1-CCF/{release_version}/views/"
-         f"cell_metadata_with_parcellation_annotation.csv",
-         f"metadata/Zhuang-ABCA-1-CCF/{release_version}/views/"
-         f"cell_metadata_with_parcellation_annotation.csv"),
-        (f"metadata/WMB-taxonomy/{release_version}/views/cluster.csv",
-         f"metadata/WMB-taxonomy/{release_version}/views/cluster.csv"),
-        (f"metadata/WMB-taxonomy/{release_version}/views/"
-         f"cluster_annotation_term.csv",
-         f"metadata/WMB-taxonomy/{release_version}/views/"
-         f"cluster_annotation_term.csv"),
-        (f"metadata/WMB-taxonomy/{release_version}/views/"
-         f"cluster_to_cluster_annotation_membership.csv",
-         f"metadata/WMB-taxonomy/{release_version}/views/"
-         f"cluster_to_cluster_annotation_membership.csv"),
-        (f"expression_matrices/Zhuang-ABCA-1/{release_version}/"
-         f"Zhuang-ABCA-1-raw.h5ad",
-         f"expression_matrices/Zhuang-ABCA-1/{release_version}/"
-         f"Zhuang-ABCA-1-raw.h5ad"),
+        # (s3 path, optional?)
+        (f"metadata/Zhuang-ABCA-1/{zh_ver}/cell_metadata.csv", False),
+        (f"metadata/Zhuang-ABCA-1/{zh_ver}/gene.csv", False),
+        (f"metadata/Zhuang-ABCA-1/{zh_ver}/views/"
+         f"cell_metadata_with_cluster_annotation.csv", False),
+        (f"metadata/Zhuang-ABCA-1-CCF/{ccf_ver}/ccf_coordinates.csv", False),
+        (f"metadata/WMB-taxonomy/{tax_ver}/cluster.csv", True),
+        (f"metadata/WMB-taxonomy/{tax_ver}/cluster_annotation_term.csv", True),
+        (f"metadata/WMB-taxonomy/{tax_ver}/"
+         f"cluster_to_cluster_annotation_membership.csv", True),
+        (f"expression_matrices/Zhuang-ABCA-1/{expr_ver}/Zhuang-ABCA-1-raw.h5ad", False),
     ]
-    for remote, local in files:
+
+    n_ok = 0
+    n_missing = 0
+    for remote, optional in files:
+        out = bronze_dir / remote
         url = f"{S3_BUCKET_HTTPS}/{remote}"
-        out = bronze_dir / local
         out.parent.mkdir(parents=True, exist_ok=True)
         if out.exists() and out.stat().st_size > 0:
             logger.info(f"  exists, skipping: {out}")
+            n_ok += 1
             continue
         logger.info(f"  GET {url} -> {out}")
-        _stream_download(url, out)
+        try:
+            _stream_download(url, out)
+            n_ok += 1
+        except Exception as e:  # noqa: BLE001
+            if optional:
+                logger.warning(f"    optional file unavailable, continuing: {e}")
+                n_missing += 1
+                continue
+            logger.error(
+                f"    REQUIRED file missing at {url}\n"
+                f"    Inspect the available files at: "
+                f"{S3_BUCKET_HTTPS}/?prefix={remote.rsplit('/', 1)[0]}/&delimiter=/"
+            )
+            raise
+
+    logger.info(f"  downloaded {n_ok} files, {n_missing} optional missing")
 
 
 def _stream_download(url: str, dest: Path, chunk: int = 8 << 20) -> None:
@@ -249,6 +351,7 @@ def main() -> int:
     logger.info(f"Bronze directory: {bronze.resolve()}")
 
     if args.force_https_fallback:
+        logger.info("Forcing HTTPS fallback (--force_https_fallback set).")
         _download_via_https_fallback(bronze, args.release_version)
         return 0
 
@@ -256,12 +359,18 @@ def main() -> int:
         _download_via_abc_atlas_access(bronze)
         return 0
     except ImportError:
-        logger.warning(
-            "abc_atlas_access not installed (`pip install abc_atlas_access` "
-            "or `uv add abc_atlas_access`). Falling back to plain HTTPS."
-        )
+        logger.warning("=" * 70)
+        logger.warning("abc_atlas_access library NOT INSTALLED.")
+        logger.warning("This is the SUPPORTED way to download Allen ABC data.")
+        logger.warning("Install with:")
+        logger.warning("    uv add abc_atlas_access")
+        logger.warning("    # or: pip install abc_atlas_access")
+        logger.warning("Falling back to plain HTTPS (less robust).")
+        logger.warning("=" * 70)
     except Exception as e:  # noqa: BLE001
-        logger.exception(f"abc_atlas_access path failed: {e}. Trying HTTPS fallback.")
+        logger.exception(
+            f"abc_atlas_access path failed: {e}. Trying HTTPS fallback."
+        )
 
     _download_via_https_fallback(bronze, args.release_version)
     return 0

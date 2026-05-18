@@ -79,43 +79,66 @@ def _discover_bronze_files(
     if release_version:
         ver = release_version
     else:
-        # Auto-discover version: look for any cell_metadata.csv path
-        candidates = list(bronze_dir.rglob("metadata/Zhuang-ABCA-1/*/views/cell_metadata.csv"))
+        # Auto-discover version: look for any cell_metadata.csv path.
+        # In the real ABC layout `cell_metadata.csv` lives directly in the
+        # version dir (not under views/), so look there.
+        candidates = list(bronze_dir.rglob("metadata/Zhuang-ABCA-1/*/cell_metadata.csv"))
         if not candidates:
             raise FileNotFoundError(
-                f"No metadata/Zhuang-ABCA-1/*/views/cell_metadata.csv under "
+                f"No metadata/Zhuang-ABCA-1/*/cell_metadata.csv under "
                 f"{bronze_dir}. Did the download finish?"
             )
-        versions = sorted({p.parent.parent.name for p in candidates})
+        versions = sorted({p.parent.name for p in candidates})
         ver = versions[-1]
-        logger.info(f"Auto-discovered release version: {ver}")
+        logger.info(f"Auto-discovered Zhuang-ABCA-1 release version: {ver}")
 
+    # Independent release versions per dataset (Allen rolls them out of sync).
+    def _discover(dataset_subpath: str, default: str) -> str:
+        cands = list(bronze_dir.glob(f"{dataset_subpath}/*/"))
+        if not cands:
+            return default
+        return sorted([c.name for c in cands])[-1]
+
+    ccf_ver = _discover("metadata/Zhuang-ABCA-1-CCF", ver)
+    tax_ver = _discover("metadata/WMB-taxonomy", ver)
+    expr_ver = _discover("expression_matrices/Zhuang-ABCA-1", ver)
+    logger.info(
+        f"Per-dataset versions: Zhuang-ABCA-1={ver} CCF={ccf_ver} "
+        f"WMB-taxonomy={tax_ver} expression={expr_ver}"
+    )
+
+    # Prefer the pre-joined `cell_metadata_with_cluster_annotation.csv` view
+    # (cell_metadata + class/subclass/supertype labels merged by Allen) over
+    # the bare cell_metadata.csv. Falls back to the bare file + WMB-taxonomy
+    # join if the pre-joined view isn't on disk.
+    out["cell_metadata_joined"] = _find_path(
+        bronze_dir,
+        f"metadata/Zhuang-ABCA-1/{ver}/views/"
+        f"cell_metadata_with_cluster_annotation.csv",
+    )
     out["cell_metadata"] = _find_path(
-        bronze_dir, f"metadata/Zhuang-ABCA-1/{ver}/views/cell_metadata.csv"
+        bronze_dir, f"metadata/Zhuang-ABCA-1/{ver}/cell_metadata.csv"
+    )
+    out["gene_metadata"] = _find_path(
+        bronze_dir, f"metadata/Zhuang-ABCA-1/{ver}/gene.csv"
     )
     out["ccf_coords"] = _find_path(
-        bronze_dir,
-        f"metadata/Zhuang-ABCA-1-CCF/{ver}/views/"
-        f"cell_metadata_with_parcellation_annotation.csv",
-    )
-    out["recon_coords"] = _find_path(
-        bronze_dir,
-        f"metadata/Zhuang-ABCA-1-CCF/{ver}/views/"
-        f"cell_metadata_with_reconstructed_coordinates.csv",
+        bronze_dir, f"metadata/Zhuang-ABCA-1-CCF/{ccf_ver}/ccf_coordinates.csv"
     )
     out["taxonomy_cluster"] = _find_path(
-        bronze_dir, f"metadata/WMB-taxonomy/{ver}/views/cluster.csv"
+        bronze_dir, f"metadata/WMB-taxonomy/{tax_ver}/cluster.csv"
     )
     out["taxonomy_term"] = _find_path(
-        bronze_dir, f"metadata/WMB-taxonomy/{ver}/views/cluster_annotation_term.csv"
+        bronze_dir, f"metadata/WMB-taxonomy/{tax_ver}/cluster_annotation_term.csv"
     )
     out["taxonomy_membership"] = _find_path(
         bronze_dir,
-        f"metadata/WMB-taxonomy/{ver}/views/"
+        f"metadata/WMB-taxonomy/{tax_ver}/"
         f"cluster_to_cluster_annotation_membership.csv",
     )
     out["expression"] = _find_path(
-        bronze_dir, f"expression_matrices/Zhuang-ABCA-1/{ver}/Zhuang-ABCA-1-raw.h5ad"
+        bronze_dir,
+        f"expression_matrices/Zhuang-ABCA-1/{expr_ver}/Zhuang-ABCA-1-raw.h5ad",
     )
 
     missing = [k for k, v in out.items() if v is None]
@@ -238,50 +261,81 @@ def assemble(
     silver_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 1. Load cell metadata -----------------------------------------
-    logger.info(f"Loading cell metadata: {paths['cell_metadata']}")
-    meta = pd.read_csv(paths["cell_metadata"])
+    # Prefer the pre-joined view (cell_metadata + class/subclass/supertype
+    # already merged by Allen). If unavailable, load the bare file and rely
+    # on the optional WMB-taxonomy join below.
+    if paths.get("cell_metadata_joined") is not None:
+        logger.info(f"Loading pre-joined metadata: {paths['cell_metadata_joined']}")
+        meta = pd.read_csv(paths["cell_metadata_joined"])
+        is_prejoined = True
+    else:
+        logger.info(f"Loading bare cell metadata: {paths['cell_metadata']}")
+        meta = pd.read_csv(paths["cell_metadata"])
+        is_prejoined = False
     logger.info(f"  cells: {len(meta):,}")
     logger.info(f"  columns: {list(meta.columns)}")
 
-    # Reconstructed XY coordinates: in Zhuang-ABCA-1 they live in either
-    # the CCF metadata table or the reconstructed-coords table.
-    coord_path = paths.get("recon_coords") or paths.get("ccf_coords")
-    if coord_path is None:
-        raise FileNotFoundError(
-            "Neither cell_metadata_with_reconstructed_coordinates.csv nor "
-            "cell_metadata_with_parcellation_annotation.csv was found in the "
-            "bronze directory. Both are needed for spatial coordinates."
-        )
-    logger.info(f"Loading reconstructed coordinates: {coord_path}")
-    coords = pd.read_csv(coord_path)
-
-    # Identify the join key (typically 'cell_label')
-    join_key = "cell_label"
-    for k in ("cell_label", "cell_id", "barcode"):
-        if k in meta.columns and k in coords.columns:
-            join_key = k
-            break
-
-    logger.info(f"Merging on key: {join_key}")
-    keep_coord_cols = [c for c in coords.columns
-                        if c in meta.columns or c in (
-                            "x_reconstructed", "y_reconstructed", "z_reconstructed",
-                            "x", "y", "z",
-                            "x_ccf", "y_ccf", "z_ccf",
-                            "parcellation_substructure", "parcellation_structure",
-                        )]
-    meta = meta.merge(
-        coords[[join_key] + [c for c in keep_coord_cols if c != join_key]],
-        on=join_key, how="left",
+    # Identify the cell-id join key (used later to align metadata with the
+    # expression AnnData's obs.index).
+    join_key = next(
+        (k for k in ("cell_label", "cell_id", "barcode") if k in meta.columns),
+        "cell_label",
     )
+    logger.info(f"  cell-id join key: {join_key!r}")
 
-    # ---- 2. Resolve cell labels via WMB taxonomy ----------------------
+    # Look for spatial coordinates. With the pre-joined view, x/y are often
+    # already in `meta`. If not, join the CCF coordinates table.
+    has_xy_in_meta = (
+        any(c in meta.columns for c in ("x_reconstructed", "x_section", "x_ccf", "x"))
+        and any(c in meta.columns for c in ("y_reconstructed", "y_section", "y_ccf", "y"))
+    )
+    if not has_xy_in_meta and paths.get("ccf_coords") is not None:
+        logger.info(f"Joining CCF coordinates: {paths['ccf_coords']}")
+        coords = pd.read_csv(paths["ccf_coords"])
+        if join_key not in coords.columns:
+            logger.warning(
+                f"  CCF coords table missing {join_key!r}; cannot merge. "
+                f"Will rely on coord columns inside the main metadata."
+            )
+        else:
+            keep_coord_cols = [c for c in coords.columns
+                                if c == join_key
+                                or c in (
+                                    "x_reconstructed", "y_reconstructed",
+                                    "z_reconstructed",
+                                    "x", "y", "z",
+                                    "x_ccf", "y_ccf", "z_ccf",
+                                    "parcellation_substructure",
+                                    "parcellation_structure",
+                                    "parcellation_division",
+                                )]
+            meta = meta.merge(coords[keep_coord_cols], on=join_key, how="left")
+    elif has_xy_in_meta:
+        logger.info(
+            "  spatial coords already in metadata; skipping CCF coordinate merge"
+        )
+
+    # ---- 2. Resolve cell labels via WMB taxonomy -----------------------
+    # If we're using the pre-joined view, class/subclass/supertype columns
+    # are already present. Otherwise, join the WMB-taxonomy tables manually.
     cluster_alias_col = next(
         (c for c in ("cluster_alias", "cluster_id_label", "cluster_label", "cluster")
          if c in meta.columns),
         None,
     )
-    if (cluster_alias_col is not None
+    label_cols_present = [
+        c for c in ("class", "subclass", "supertype", "neurotransmitter")
+        if c in meta.columns
+    ]
+    if is_prejoined and label_cols_present:
+        logger.info(
+            f"  pre-joined view already contains label columns: {label_cols_present}; "
+            "skipping WMB-taxonomy join"
+        )
+        # Rename `class` -> `cell_class` for downstream consistency.
+        if "class" in meta.columns and "cell_class" not in meta.columns:
+            meta = meta.rename(columns={"class": "cell_class"})
+    elif (cluster_alias_col is not None
             and paths.get("taxonomy_membership") is not None
             and paths.get("taxonomy_term") is not None):
         try:
@@ -292,15 +346,15 @@ def assemble(
                 lookup, left_on=cluster_alias_col, right_index=True, how="left"
             )
             logger.info(
-                "  joined taxonomy labels: "
+                "  joined WMB-taxonomy labels manually: "
                 f"{meta[['cell_class','subclass','supertype']].notna().sum().to_dict()}"
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"Taxonomy join failed ({e}); continuing without labels.")
+            logger.warning(f"  taxonomy join failed ({e}); continuing without labels.")
     else:
         logger.warning(
-            "Skipping taxonomy join — either cluster id column or taxonomy "
-            "tables are missing in the bronze cache."
+            "  skipping taxonomy join — either no cluster id column or "
+            "taxonomy tables missing, and view has no pre-joined labels."
         )
 
     # ---- 3. Pick the X / Y coordinate columns -------------------------
