@@ -172,7 +172,12 @@ def _build_luna_csv(
         df["coord_Y"] = xy[:, 1]
         df["cell_section"] = section_label
         df["cell_class"] = cell_class
-        df.index = adata.obs_names
+        # LUNA's DataModule does `cell_ID = torch.tensor(input_data.index)`
+        # which fails with "too many dimensions 'str'" on string-barcode
+        # indices. Use a per-section integer index instead — LUNA preserves
+        # it through to per-section ``metadata_pred.csv`` outputs, so row
+        # order is recoverable downstream.
+        df.index = range(len(df))
         df.index.name = "cell_id"
 
         df.to_csv(out_csv, mode="a", header=first)

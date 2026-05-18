@@ -318,7 +318,11 @@ def _build_luna_csv(
         df["coord_Y"] = xy[:, 1]
         df["cell_section"] = section_label
         df["cell_class"] = cell_class
-        df.index = adata.obs_names
+        # LUNA's DataModule does `cell_ID = torch.tensor(input_data.index)`
+        # which fails with "too many dimensions 'str'" on string-barcode
+        # indices. Use a per-section integer index instead — LUNA
+        # preserves it through to per-section metadata_pred.csv outputs.
+        df.index = range(len(df))
         df.index.name = "cell_id"
 
         df.to_csv(out_csv, mode="a", header=first)
@@ -675,26 +679,34 @@ def _write_pred_into_h5ad(
     pred_df: pd.DataFrame,
     out_h5ad: Path,
 ):
-    """Load original h5ad, attach obsm['spatial_pred'], save and return it."""
+    """Load original h5ad, attach obsm['spatial_pred'] from LUNA, save.
+
+    We pass per-section integer indices (0..N-1) to LUNA, so its per-
+    section ``metadata_pred.csv`` comes back with those same integer
+    indices. The integer index ``i`` corresponds to position ``i`` in
+    the h5ad's ``obs_names`` (we built the CSV by iterating h5ad rows in
+    order). We sort by index defensively in case LUNA shuffles internally.
+    """
     import anndata as ad
 
     adata = ad.read_h5ad(silver_h5ad)
-    if not pred_df.index.empty and adata.obs_names.isin(pred_df.index).any():
-        common = adata.obs_names.intersection(pred_df.index)
-        if len(common) < adata.n_obs:
-            logger.warning(
-                f"    only {len(common)}/{adata.n_obs} cells matched by "
-                "barcode; rest will get NaN predictions."
-            )
-        pred_aligned = pred_df.reindex(adata.obs_names)
-        coords = pred_aligned[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+
+    if len(pred_df) != adata.n_obs:
+        raise ValueError(
+            f"LUNA prediction count {len(pred_df)} != n_obs {adata.n_obs} "
+            f"for {silver_h5ad.name}. Cell count mismatch — was the same "
+            "silver h5ad used to build the test CSV?"
+        )
+
+    # Integer-index → row-position match. Sort to defend against any
+    # internal reordering on LUNA's side; if the index is non-numeric
+    # (legacy barcode-indexed CSV), fall through to the input order.
+    if pred_df.index.dtype.kind in ("i", "u", "f"):
+        pred_sorted = pred_df.sort_index()
     else:
-        if len(pred_df) != adata.n_obs:
-            raise ValueError(
-                f"Prediction count {len(pred_df)} != n_obs {adata.n_obs} "
-                f"for {silver_h5ad.name}, and no barcode overlap."
-            )
-        coords = pred_df[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+        pred_sorted = pred_df
+
+    coords = pred_sorted[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
     adata.obsm["spatial_pred"] = coords
     out_h5ad.parent.mkdir(parents=True, exist_ok=True)
     adata.write(out_h5ad)
