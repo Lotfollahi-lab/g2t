@@ -114,11 +114,14 @@ class Trainer:
             if self.use_distance_loss:
                 self.distance_criterion = DistanceRegressionLoss(
                     use_squared=dr_cfg.get("use_squared", True),
+                    class_stratified=bool(dr_cfg.get("class_stratified", False)),
+                    min_cells_per_class=int(dr_cfg.get("min_cells_per_class", 6)),
                 )
                 logger.info(
                     "Distance regression loss ENABLED "
                     f"(weight={self.distance_loss_weight}, use_squared="
-                    f"{dr_cfg.get('use_squared', True)})"
+                    f"{dr_cfg.get('use_squared', True)}, class_stratified="
+                    f"{bool(dr_cfg.get('class_stratified', False))})"
                 )
             else:
                 self.distance_criterion = None
@@ -452,10 +455,21 @@ class Trainer:
             loss = self.contrastive_weight * c_loss
             if self.use_distance_loss and self.distance_criterion is not None:
                 coords = batch["coords"].to(self.device)
-                d_loss, d_metrics = self.distance_criterion(emb, coords)
+                cls_for_dist = batch.get("cell_class", None)
+                if cls_for_dist is not None:
+                    cls_for_dist = cls_for_dist.to(self.device)
+                d_loss, d_metrics = self.distance_criterion(
+                    emb, coords, cell_class=cls_for_dist,
+                )
                 loss = loss + self.distance_loss_weight * d_loss
                 metrics["distance_loss"] = d_metrics["distance_loss"]
                 metrics["distance_pearson"] = d_metrics["distance_pearson"]
+                metrics["distance_pearson_global"] = d_metrics.get(
+                    "distance_pearson_global", d_metrics["distance_pearson"]
+                )
+                metrics["distance_n_classes_used"] = d_metrics.get(
+                    "n_classes_used", 0
+                )
 
             # Optional: cell-class auxiliary classifier on cell_embed.
             if self.use_cellclass_aux and self.cellclass_aux_criterion is not None:
@@ -567,12 +581,23 @@ class Trainer:
                     val_entry = {"contrastive_loss": c_m["contrastive_loss"]}
                     if self.use_distance_loss and self.distance_criterion is not None:
                         coords = batch["coords"].to(self.device)
-                        d_loss, d_m = self.distance_criterion(emb, coords)
+                        cls_for_dist = batch.get("cell_class", None)
+                        if cls_for_dist is not None:
+                            cls_for_dist = cls_for_dist.to(self.device)
+                        d_loss, d_m = self.distance_criterion(
+                            emb, coords, cell_class=cls_for_dist,
+                        )
                         total_loss_val = (
                             total_loss_val + self.distance_loss_weight * d_loss
                         )
                         val_entry["distance_loss"] = d_m["distance_loss"]
                         val_entry["distance_pearson"] = d_m["distance_pearson"]
+                        val_entry["distance_pearson_global"] = d_m.get(
+                            "distance_pearson_global", d_m["distance_pearson"]
+                        )
+                        val_entry["distance_n_classes_used"] = d_m.get(
+                            "n_classes_used", 0
+                        )
                     if (
                         self.use_cellclass_aux
                         and self.cellclass_aux_criterion is not None

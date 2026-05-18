@@ -283,35 +283,91 @@ class DistanceRegressionLoss(nn.Module):
       while GT coords have arbitrary scale; MSE would couple the loss to
       that scale mismatch, Pearson sidesteps it entirely.
 
+    Class-stratified variant (`class_stratified=True`)
+    --------------------------------------------------
+    The all-pairs Pearson above is dominated by between-class pair distances
+    in laminar tissues (different cortical layers are far apart; within-layer
+    distances are small). A model that perfectly clusters by cell type
+    already scores high Pearson without learning any within-class spatial
+    geometry — and that turns out to be exactly the failure mode the
+    inference UMAP diagnostic surfaces.
+
+    With `class_stratified=True`, the loss is computed *per cell class*:
+    for each class with >= `min_cells_per_class` cells in the batch, we
+    compute Pearson on within-class pairs, then average across classes.
+    Between-class pairs no longer contribute, so the gradient is pushed
+    entirely onto within-class pair ordering — which is the signal the
+    SupCon term is *not* providing.
+
+    `cell_class` must be passed to `forward()` when stratification is on.
+    Cells with `class == -1` (= unknown vocabulary, see ABC / cortex loaders)
+    are excluded. The unstratified metric is still reported alongside as
+    `distance_pearson_global` for direct comparison to the previous regime.
+
     Args:
         use_squared: Use squared distances if True (default), Euclidean if False.
         eps: Numerical safety for the standardization step.
+        class_stratified: If True, compute Pearson per cell class and average.
+        min_cells_per_class: A class needs at least this many cells in the
+            batch (so at least min_cells_per_class*(min_cells_per_class-1)/2
+            pairs) to be included in the per-class average. Default 6
+            (= 15 pairs minimum).
     """
 
-    def __init__(self, use_squared: bool = True, eps: float = 1e-8):
+    def __init__(
+        self,
+        use_squared: bool = True,
+        eps: float = 1e-8,
+        class_stratified: bool = False,
+        min_cells_per_class: int = 6,
+    ):
         super().__init__()
         self.use_squared = use_squared
         self.eps = eps
+        self.class_stratified = class_stratified
+        self.min_cells_per_class = int(min_cells_per_class)
+
+    @staticmethod
+    def _pair_pearson(
+        pred_d: torch.Tensor,
+        true_d: torch.Tensor,
+        rows: torch.Tensor,
+        cols: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Pearson correlation between selected pairwise-distance entries."""
+        pred_v = pred_d[rows, cols]
+        true_v = true_d[rows, cols]
+        pred_v = (pred_v - pred_v.mean()) / (pred_v.std() + eps)
+        true_v = (true_v - true_v.mean()) / (true_v.std() + eps)
+        return (pred_v * true_v).mean()
 
     def forward(
         self,
         embeddings: torch.Tensor,
         coords: torch.Tensor,
+        cell_class: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Args:
             embeddings: (B, d) metric embeddings for the batch.
             coords: (B, 2) ground-truth 2-D coordinates for the same B cells.
+            cell_class: (B,) long tensor of integer class ids, or None.
+                Required when `class_stratified=True`. Cells with class < 0
+                are excluded.
 
         Returns:
             loss in [0, 2], metrics dict.
         """
         B = embeddings.shape[0]
+        zero_out = (embeddings.sum() * 0.0, {
+            "distance_pearson": 0.0,
+            "distance_loss": 0.0,
+            "distance_pearson_global": 0.0,
+            "n_classes_used": 0,
+        })
         if B < 4 or coords.shape[0] != B:
-            return embeddings.sum() * 0.0, {
-                "distance_pearson": 0.0,
-                "distance_loss": 0.0,
-            }
+            return zero_out
 
         pred_d = torch.cdist(embeddings, embeddings)
         true_d = torch.cdist(coords, coords)
@@ -319,22 +375,70 @@ class DistanceRegressionLoss(nn.Module):
             pred_d = pred_d ** 2
             true_d = true_d ** 2
 
-        # Upper triangle (i < j); avoids self-pairs and counts each pair once.
+        # Always compute the global (all-pairs) Pearson as a diagnostic,
+        # even when stratifying — useful for direct comparison to the
+        # previous training regime.
         triu = torch.triu_indices(B, B, offset=1, device=embeddings.device)
-        pred_v = pred_d[triu[0], triu[1]]
-        true_v = true_d[triu[0], triu[1]]
+        pearson_global = self._pair_pearson(
+            pred_d, true_d, triu[0], triu[1], self.eps,
+        )
 
-        # Standardize both vectors. Mean of pairwise products of z-scored
-        # vectors equals Pearson correlation.
-        pred_v = (pred_v - pred_v.mean()) / (pred_v.std() + self.eps)
-        true_v = (true_v - true_v.mean()) / (true_v.std() + self.eps)
+        if not self.class_stratified:
+            loss = 1.0 - pearson_global
+            return loss, {
+                "distance_pearson": float(pearson_global.item()),
+                "distance_loss": float(loss.item()),
+                "distance_pearson_global": float(pearson_global.item()),
+                "n_classes_used": 0,
+            }
 
-        pearson = (pred_v * true_v).mean()
-        loss = 1.0 - pearson  # in [0, 2]
+        # Class-stratified path: average Pearson within each class with
+        # enough cells. Cells with class < 0 (unknown) are excluded.
+        if cell_class is None:
+            # Fall back to global rather than silently changing behavior.
+            loss = 1.0 - pearson_global
+            return loss, {
+                "distance_pearson": float(pearson_global.item()),
+                "distance_loss": float(loss.item()),
+                "distance_pearson_global": float(pearson_global.item()),
+                "n_classes_used": 0,
+            }
 
+        cell_class = cell_class.to(embeddings.device)
+        valid_classes = torch.unique(cell_class[cell_class >= 0])
+        per_class_pearsons: list = []
+        for c in valid_classes.tolist():
+            mask = cell_class == c
+            n_c = int(mask.sum())
+            if n_c < self.min_cells_per_class:
+                continue
+            idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
+            sub_triu = torch.triu_indices(
+                n_c, n_c, offset=1, device=embeddings.device,
+            )
+            rows = idx[sub_triu[0]]
+            cols = idx[sub_triu[1]]
+            per_class_pearsons.append(
+                self._pair_pearson(pred_d, true_d, rows, cols, self.eps)
+            )
+
+        if not per_class_pearsons:
+            # Nothing usable in this batch — fall back to global.
+            loss = 1.0 - pearson_global
+            return loss, {
+                "distance_pearson": float(pearson_global.item()),
+                "distance_loss": float(loss.item()),
+                "distance_pearson_global": float(pearson_global.item()),
+                "n_classes_used": 0,
+            }
+
+        pearson_strat = torch.stack(per_class_pearsons).mean()
+        loss = 1.0 - pearson_strat
         return loss, {
-            "distance_pearson": float(pearson.item()),
+            "distance_pearson": float(pearson_strat.item()),
             "distance_loss": float(loss.item()),
+            "distance_pearson_global": float(pearson_global.item()),
+            "n_classes_used": len(per_class_pearsons),
         }
 
 

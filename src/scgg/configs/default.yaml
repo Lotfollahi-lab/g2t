@@ -121,6 +121,16 @@ training:
       enabled: true
       weight: 1.0
       use_squared: true           # squared Euclidean distances (smoother grads)
+      # When false (default), Pearson is computed on all in-batch pairs.
+      # When true, Pearson is computed *per cell class* and averaged across
+      # classes — between-class pairs no longer contribute. Use this when
+      # the inference UMAP diagnostic shows the embedding has collapsed to
+      # a cell-type classifier (i.e. global Spearman is decent but the
+      # mean of per-class median Spearmans is near zero). Requires the
+      # batch to carry `cell_class` (set automatically by the LUNA cortex
+      # and ABC loaders).
+      class_stratified: false
+      min_cells_per_class: 6      # min cells of a class in a batch to include it
 
     # Optional auxiliary classifier on the encoder cell_embed against the GT
     # cell-class labels. Adds orthogonal supervision: same-class cells tend
