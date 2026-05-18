@@ -82,17 +82,34 @@ LABEL_RENAME = {
 # ---------------------------------------------------------------------------
 
 
-def _read_scp_csv(path: Path, sep: str) -> pd.DataFrame:
+def _sniff_separator(path: Path) -> str:
+    """Look at the first line and decide between tab and comma."""
+    with open(path, "r") as f:
+        first = f.readline()
+    if first.count("\t") > first.count(","):
+        return "\t"
+    return ","
+
+
+def _read_scp_csv(path: Path, sep: Optional[str] = None) -> pd.DataFrame:
     """Read a Single Cell Portal–style CSV/TSV:
       row 0 = header
       row 1 = TYPE annotation row (group / numeric)
       rows 2+ = data
     Returns a DataFrame indexed by NAME, with numeric columns coerced.
+
+    `sep` defaults to None (auto-sniff between comma and tab) because the
+    Shi 2023 SCP release mixes both: metadata.csv is comma-separated, the
+    per-well spatial CSVs may be either depending on the export.
     """
+    if sep is None:
+        sep = _sniff_separator(path)
+
     raw = pd.read_csv(path, sep=sep, dtype=object)
     if "NAME" not in raw.columns:
         raise ValueError(
-            f"{path.name}: missing required NAME column. Got: {list(raw.columns)}"
+            f"{path.name}: missing required NAME column. Got: {list(raw.columns)}. "
+            f"Tried sep={sep!r}."
         )
 
     if str(raw.iloc[0]["NAME"]).strip().upper() == "TYPE":
@@ -115,12 +132,12 @@ def _read_scp_csv(path: Path, sep: str) -> pd.DataFrame:
 
 
 def _load_master_metadata(path: Path) -> Optional[pd.DataFrame]:
-    """Load the optional global metadata.csv (comma-separated, SCP format)."""
+    """Load the optional global metadata.csv (SCP format, separator auto-detected)."""
     if not path.exists():
         logger.info("  master metadata.csv not present; skipping")
         return None
     logger.info(f"  loading master metadata: {path}")
-    meta = _read_scp_csv(path, sep=",")
+    meta = _read_scp_csv(path)
     logger.info(
         f"    {len(meta):,} rows, columns: {list(meta.columns)[:8]}"
         f"{' ...' if len(meta.columns) > 8 else ''}"
@@ -129,8 +146,8 @@ def _load_master_metadata(path: Path) -> Optional[pd.DataFrame]:
 
 
 def _load_well_spatial(path: Path) -> pd.DataFrame:
-    """Load a per-well spatial CSV (tab-separated, SCP format)."""
-    return _read_scp_csv(path, sep="\t")
+    """Load a per-well spatial CSV (SCP format, separator auto-detected)."""
+    return _read_scp_csv(path)
 
 
 # ---------------------------------------------------------------------------
