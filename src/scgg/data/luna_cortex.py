@@ -3,10 +3,14 @@ Loader for the MERFISH mouse primary motor cortex dataset used in LUNA Figure 3.
 
 Expected directory layout (one h5ad per slice):
 
-    {root}/merfish_mouse_cortex_mouse1_slice1.h5ad
-    {root}/merfish_mouse_cortex_mouse1_slice10.h5ad
+    {root}/mmc_mouse1_slice1.h5ad
+    {root}/mmc_mouse1_slice10.h5ad
     ...
-    {root}/merfish_mouse_cortex_mouse2_slice99.h5ad
+    {root}/mmc_mouse2_slice99.h5ad
+
+The legacy `merfish_mouse_cortex_mouse{M}_slice{S}.h5ad` naming is also
+recognised for backwards compatibility — both prefixes may coexist in
+the same directory during a rename.
 
 This corresponds to the LUNA Figure 3 split:
   * Mouse 1 = TRAIN (33 slices, 158,379 cells)
@@ -20,8 +24,8 @@ Each h5ad is expected to contain:
     ("coord_X", "coord_Y") or those values copied into .obsm["spatial"].
 
 The dataset name and animal split are inferred from the filename pattern
-`merfish_mouse_cortex_mouse{M}_slice{S}.h5ad` so adding/removing slices does
-not require editing this file.
+`mmc_mouse{M}_slice{S}.h5ad` so adding/removing slices does not require
+editing this file.
 """
 
 from __future__ import annotations
@@ -47,8 +51,11 @@ except ImportError:
 
 
 # Filename pattern. Group 1 = mouse id (int); group 2 = slice id (int).
+# Accepts both naming conventions:
+#   * mmc_mouse{M}_slice{S}.h5ad                  (preferred / new)
+#   * merfish_mouse_cortex_mouse{M}_slice{S}.h5ad (legacy)
 _SLICE_RE = re.compile(
-    r"^merfish_mouse_cortex_mouse(?P<mouse>\d+)_slice(?P<slice>\d+)\.h5ad$"
+    r"^(?:mmc|merfish_mouse_cortex)_mouse(?P<mouse>\d+)_slice(?P<slice>\d+)\.h5ad$"
 )
 
 
@@ -106,7 +113,8 @@ def load_luna_cortex(
 
     Args:
         data_dir: Directory containing files like
-            ``merfish_mouse_cortex_mouse1_slice1.h5ad`` etc.
+            ``mmc_mouse1_slice1.h5ad`` (or the legacy
+            ``merfish_mouse_cortex_mouse1_slice1.h5ad``).
         mouse_ids_train: Mouse ids treated as TRAIN (default: (1,)).
         mouse_ids_test:  Mouse ids treated as TEST  (default: (2,)).
         gene_list: If given, subset to these genes (intersection with available).
@@ -137,7 +145,8 @@ def load_luna_cortex(
     if not files:
         raise FileNotFoundError(
             f"No matching slice h5ad files found in {data_dir} "
-            f"(expected names like merfish_mouse_cortex_mouse1_slice1.h5ad)"
+            f"(expected names like mmc_mouse1_slice1.h5ad or the legacy "
+            f"merfish_mouse_cortex_mouse1_slice1.h5ad)"
         )
 
     train_set, test_set = set(mouse_ids_train), set(mouse_ids_test)

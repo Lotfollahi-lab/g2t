@@ -12,7 +12,7 @@ the per-slice MEDIAN of per-cell Spearman (LUNA reports 44.8% for this).
 Usage:
 
     python -m scgg.scripts.run_luna_cortex_benchmark \\
-        --data_dir /nfs/team361/sb75/DATASETS/silver/merfish_mouse_cortex_luna \\
+        --data_dir /nfs/team361/sb75/DATASETS/silver/mmc_luna \\
         --epochs 200 \\
         --batch_size 8192 \\
         --output_dir ./results/luna_cortex_run1
@@ -154,12 +154,14 @@ def run_benchmark(
     scale: bool = True,
     skip_training: bool = False,
     load_checkpoint: Optional[str] = None,
+    class_stratified_distance: Optional[bool] = None,
 ) -> Dict[str, float]:
     """Run the full LUNA Figure 3 benchmark and return the aggregated metrics.
 
     Args:
         data_dir: Path to the per-slice h5ad directory (LUNA cortex split).
-            Files like merfish_mouse_cortex_mouse{1,2}_slice{N}.h5ad. Mouse 1
+            Files like mmc_mouse{1,2}_slice{N}.h5ad (or the legacy
+            merfish_mouse_cortex_mouse{1,2}_slice{N}.h5ad). Mouse 1
             is treated as TRAIN, Mouse 2 as TEST.
         output_dir: Where to write per-slice + aggregated CSV/JSON results.
         config_path: Optional override path to a scgg config YAML.
@@ -171,6 +173,11 @@ def run_benchmark(
         n_top_hvg: Optional HVG selection (seurat_v3 on train counts).
         skip_training: If True, only run evaluation (must provide load_checkpoint).
         load_checkpoint: Path to a saved checkpoint to evaluate (skips training).
+        class_stratified_distance: If True, switch the DistanceRegression loss
+            from all-pairs Pearson to per-cell-class Pearson averaged across
+            classes — forces the model to encode within-class spatial
+            geometry instead of just clustering by cell type. None (default)
+            leaves whatever the config specifies untouched.
 
     Returns:
         Dict of aggregated metrics; identical structure to
@@ -208,6 +215,15 @@ def run_benchmark(
     if wandb_run_name is not None:
         cfg["training"]["wandb_run_name"] = wandb_run_name
     cfg["training"]["checkpoint_dir"] = str(out_dir / "checkpoints")
+
+    if class_stratified_distance is not None:
+        cfg.setdefault("training", {}).setdefault("loss", {}).setdefault(
+            "distance_regression", {}
+        )["class_stratified"] = bool(class_stratified_distance)
+        logger.info(
+            f"distance_regression.class_stratified overridden via CLI: "
+            f"{bool(class_stratified_distance)}"
+        )
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -375,6 +391,14 @@ def main():
     p.add_argument("--no_scale", action="store_true")
     p.add_argument("--skip_training", action="store_true")
     p.add_argument("--load_checkpoint", default=None)
+    p.add_argument(
+        "--class_stratified_distance", action="store_true",
+        help="Switch the DistanceRegression loss from all-pairs Pearson to "
+             "per-cell-class Pearson averaged across classes. Use this when "
+             "the inference UMAP diagnostic shows the embedding has "
+             "collapsed to a cell-type classifier (i.e. global Spearman is "
+             "decent but the mean of per-class median Spearmans is near zero).",
+    )
     args = p.parse_args()
 
     run_benchmark(
@@ -396,6 +420,9 @@ def main():
         scale=not args.no_scale,
         skip_training=args.skip_training,
         load_checkpoint=args.load_checkpoint,
+        class_stratified_distance=(
+            True if args.class_stratified_distance else None
+        ),
     )
 
 

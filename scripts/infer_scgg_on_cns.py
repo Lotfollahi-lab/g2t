@@ -11,8 +11,8 @@ Two intended uses:
 
 2. **MERFISH cross-animal held-out test (LUNA Figure 3).** Apply a
    cortex-trained checkpoint (Mouse 1) to Mouse 2 sections from
-   `merfish_mouse_cortex_luna`. Same gene panel on both sides — direct
-   case-insensitive symbol match.
+   `mmc_luna` (legacy: `merfish_mouse_cortex_luna`). Same gene panel
+   on both sides — direct case-insensitive symbol match.
 
 Inputs
 ------
@@ -21,12 +21,13 @@ Inputs
   --silver_dir   Directory with per-section silver h5ads. The script
                  supports the silver naming conventions:
                    cns_scrna_<well>.h5ad
-                   merfish_mouse_cortex_mouse{1,2}_slice{N}.h5ad
+                   mmc_mouse{1,2}_slice{N}.h5ad  (preferred)
+                   merfish_mouse_cortex_mouse{1,2}_slice{N}.h5ad (legacy)
                    abc_zhuang_abca1_<section>.h5ad
   --sections     Section IDs, filenames, or glob patterns. Accepts the
                  special values 'all' and 'all_test' (= every mouse2_*
-                 slice for the cortex layout). Default is data-driven
-                 (see CLI help).
+                 slice for the cortex layout, both prefix schemes).
+                 Default is data-driven (see CLI help).
   --color        adata.obs column for plot coloring (default: cell_class).
   --mygene_cache JSON cache for symbol->Ensembl translations (used only
                  when the target panel is Ensembl-namespaced).
@@ -55,7 +56,7 @@ The expected gene list comes from (in order of preference):
   1. <checkpoint>/../data_summary.json  (saved by train_scgg_on_abc.py)
   2. --gene_panel_h5ad fallback
   3. Auto-discovery of a representative file in --silver_dir
-     (e.g. merfish_mouse_cortex_mouse1_slice1.h5ad for cortex models).
+     (e.g. mmc_mouse1_slice1.h5ad for cortex models).
 
 Coordinate projection
 ---------------------
@@ -324,7 +325,8 @@ def _autodiscover_gene_panel(
 
     Used when the checkpoint has no `data_summary.json` (e.g. the cortex
     benchmark script never wrote one). For cortex, the train set is
-    `merfish_mouse_cortex_mouse1_*.h5ad`; we prefer those.
+    ``mmc_mouse1_*.h5ad`` (or legacy ``merfish_mouse_cortex_mouse1_*.h5ad``);
+    we prefer those.
 
     If `expected_n_genes` is given, we accept the first file whose gene
     count matches — this guards against picking up a file with a different
@@ -335,7 +337,9 @@ def _autodiscover_gene_panel(
 
     # Prefer training-side files (mouse1 for cortex); otherwise just take
     # the first silver h5ad with a known prefix.
-    candidates = sorted(silver_dir.glob("merfish_mouse_cortex_mouse1_*.h5ad"))
+    candidates: List[Path] = []
+    for g in _CORTEX_MOUSE_GLOBS:
+        candidates.extend(sorted(silver_dir.glob(g.format(m=1))))
     if not candidates:
         candidates = _all_silver_files(silver_dir)
     for path in candidates:
@@ -1074,9 +1078,15 @@ def _plot_comparison(
 
 _KNOWN_SILVER_PREFIXES = (
     "cns_scrna_",
-    "merfish_mouse_cortex_",
+    "mmc_",                  # new name for the LUNA cortex silver
+    "merfish_mouse_cortex_", # legacy name, still supported
     "abc_zhuang_abca1_",
 )
+
+# Glob patterns that match either the new or legacy prefix for the LUNA
+# cortex dataset, parameterized by mouse id (e.g. "1" for train, "2" for
+# held-out test). Kept as a tuple so callers can iterate both schemes.
+_CORTEX_MOUSE_GLOBS = ("mmc_mouse{m}_*.h5ad", "merfish_mouse_cortex_mouse{m}_*.h5ad")
 
 
 def _strip_known_prefix(stem: str) -> str:
@@ -1121,11 +1131,17 @@ def _resolve_section_files(silver_dir: Path, sections_arg: List[str]) -> List[Pa
 
     if sections_arg == ["all_test"]:
         # LUNA cortex convention: Mouse 2 is the held-out test set.
-        files = sorted(silver_dir.glob("merfish_mouse_cortex_mouse2_*.h5ad"))
+        files: List[Path] = []
+        seen: set = set()
+        for g in _CORTEX_MOUSE_GLOBS:
+            for p in sorted(silver_dir.glob(g.format(m=2))):
+                if p not in seen:
+                    seen.add(p)
+                    files.append(p)
         if not files:
             raise FileNotFoundError(
-                f"No held-out test files (merfish_mouse_cortex_mouse2_*.h5ad) "
-                f"under {silver_dir}"
+                f"No held-out test files (mmc_mouse2_*.h5ad or legacy "
+                f"merfish_mouse_cortex_mouse2_*.h5ad) under {silver_dir}"
             )
         return files
 
@@ -1217,7 +1233,7 @@ def run_inference(
 
     silver_path = Path(silver_dir)
     # Default output_dir derived from silver_dir.name so cortex inference
-    # lands in `../scgg-reproducibility/artifacts/merfish_mouse_cortex_luna/`
+    # lands in `../scgg-reproducibility/artifacts/mmc_luna/`
     # and CNS inference in `.../cns_luna/` etc.
     if output_dir is None:
         out_dir = Path("../scgg-reproducibility/artifacts") / silver_path.name
@@ -1527,7 +1543,7 @@ def main() -> int:
             "('cns_scrna_well06.h5ad'), globs ('mouse2_*'), or the special "
             "values 'all' (every silver h5ad) and 'all_test' (mouse2_* — "
             "the LUNA cortex held-out split). Default depends on "
-            "--silver_dir: 'all_test' for merfish_mouse_cortex_*, "
+            "--silver_dir: 'all_test' for mmc_* / merfish_mouse_cortex_*, "
             "'well06' for cns_*, 'all' otherwise."
         ),
     )
@@ -1624,7 +1640,11 @@ def main() -> int:
     sections = args.sections
     if sections is None:
         silver_name = Path(args.silver_dir).name.lower()
-        if "merfish_mouse_cortex" in silver_name:
+        if (
+            "merfish_mouse_cortex" in silver_name
+            or silver_name == "mmc_luna"
+            or silver_name.startswith("mmc_")
+        ):
             sections = ["all_test"]
         elif silver_name.startswith("cns_"):
             sections = ["well06"]

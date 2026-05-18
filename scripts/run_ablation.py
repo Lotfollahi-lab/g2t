@@ -11,14 +11,14 @@ up where the last invocation left off.
 Quick smoke check with shorter training:
 
     python scripts/run_ablation.py \\
-        --data_dir /nfs/team361/sb75/DATASETS/silver/merfish_mouse_cortex_luna \\
+        --data_dir /nfs/team361/sb75/DATASETS/silver/mmc_luna \\
         --output_root ./results/ablation_quick \\
         --quick
 
 Full sweep (3 seeds × all variants ≈ 25 h on one GPU):
 
     python scripts/run_ablation.py \\
-        --data_dir /nfs/team361/sb75/DATASETS/silver/merfish_mouse_cortex_luna \\
+        --data_dir /nfs/team361/sb75/DATASETS/silver/mmc_luna \\
         --output_root ./results/ablation_v1 \\
         --seeds 42,43,44
 
