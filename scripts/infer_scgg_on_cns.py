@@ -1,41 +1,61 @@
 #!/usr/bin/env python
 """
-Run scGG inference on the Shi 2023 / STARmap-integrated CNS scRNA-seq atlas
-using a model that was trained on the ABC MERFISH atlas (Animal 1). This
-reproduces the inference half of LUNA Figure 4.
+Run scGG inference on a held-out spatial dataset.
+
+Two intended uses:
+
+1. **scRNA-seq de novo reconstruction (LUNA Figure 4).** Apply an
+   ABC-trained checkpoint to the Shi 2023 / STARmap-integrated CNS
+   scRNA-seq atlas. Bridges gene-symbol queries to Ensembl-ID targets
+   via mygene with an offline cache.
+
+2. **MERFISH cross-animal held-out test (LUNA Figure 3).** Apply a
+   cortex-trained checkpoint (Mouse 1) to Mouse 2 sections from
+   `merfish_mouse_cortex_luna`. Same gene panel on both sides — direct
+   case-insensitive symbol match.
 
 Inputs
 ------
-  --checkpoint   Path to the scGG checkpoint produced by
-                 scripts/train_scgg_on_abc.py (default:
+  --checkpoint   Path to the scGG checkpoint (default:
                  ./results/abc_animal1/checkpoints/best_model.pt).
-  --silver_dir   Per-well CNS scRNA silver h5ads from
-                 scripts/prepare_cns_silver.py
-                 (default: /nfs/team361/sb75/DATASETS/silver/cns_luna).
-  --sections     One or more well identifiers to run on, e.g.
-                 `--sections well06`. Default: `well06`. Pass `all` to
-                 run on every well in --silver_dir.
+  --silver_dir   Directory with per-section silver h5ads. The script
+                 supports the silver naming conventions:
+                   cns_scrna_<well>.h5ad
+                   merfish_mouse_cortex_mouse{1,2}_slice{N}.h5ad
+                   abc_zhuang_abca1_<section>.h5ad
+  --sections     Section IDs, filenames, or glob patterns. Accepts the
+                 special values 'all' and 'all_test' (= every mouse2_*
+                 slice for the cortex layout). Default is data-driven
+                 (see CLI help).
   --color        adata.obs column for plot coloring (default: cell_class).
+  --mygene_cache JSON cache for symbol->Ensembl translations (used only
+                 when the target panel is Ensembl-namespaced).
+  --species      mygene species name (default: mouse).
 
-Outputs (under --output_dir, default ./scgg-reproducibility/artifacts/cns_luna)
------------------------------------------------------------------------------
-  <well>_predicted.h5ad        Copy of the input h5ad with
+Outputs (under --output_dir, default ../scgg-reproducibility/artifacts/<silver_dir_name>/)
+------------------------------------------------------------------------------------------
+  <section>_predicted.h5ad     Copy of the input h5ad with
                                obsm['spatial_pred'] populated.
-  <well>_comparison.svg        Side-by-side scatter: ground truth (left)
+  <section>_comparison.svg     Side-by-side scatter: ground truth (left)
                                vs scGG prediction (right), colored by
                                `--color`. SVG fonts are kept as text
                                (editable in Illustrator / Inkscape).
-  inference_metadata.json      Per-well summary (cell counts, gene-panel
-                               coverage, runtime, etc.).
+  inference_metadata.json      Per-section summary (cell counts,
+                               gene-panel coverage, runtime, etc.).
 
 Gene-panel alignment
 --------------------
-The ABC model was trained on a specific gene panel (typically the 1,122
-MERFISH genes). The scRNA-seq atlas has ~11K genes — we subset / pad to
-match the ABC order. The expected gene list is read from
-<checkpoint>/../data_summary.json (saved by train_scgg_on_abc.py). If
-that file is missing (older training), pass --gene_panel_h5ad pointing
-at any silver h5ad from the ABC training set.
+Handles all four target/query namespace combinations:
+  target Ensembl + query Ensembl : direct match
+  target Ensembl + query Symbol  : target's symbol map + mygene fallback
+  target Symbol  + query Symbol  : case-insensitive direct match (cortex)
+  target Symbol  + query Ensembl : not supported (convert query upstream)
+
+The expected gene list comes from (in order of preference):
+  1. <checkpoint>/../data_summary.json  (saved by train_scgg_on_abc.py)
+  2. --gene_panel_h5ad fallback
+  3. Auto-discovery of a representative file in --silver_dir
+     (e.g. merfish_mouse_cortex_mouse1_slice1.h5ad for cortex models).
 
 Coordinate projection
 ---------------------
@@ -52,15 +72,168 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
 
 logger = logging.getLogger("scgg.infer_cns")
+
+
+# ---------------------------------------------------------------------------
+# mygene: offline-cached symbol -> Ensembl translation
+# ---------------------------------------------------------------------------
+
+
+class MygeneCache:
+    """JSON-backed offline cache for mygene.info symbol -> Ensembl lookups.
+
+    Translating gene symbols to Ensembl IDs via mygene is needed to recover
+    matches lost to symbol aliases (e.g. 'Marchf1' vs 'March1'). The first
+    call hits the network; the cache file persists so re-runs are offline
+    and reproducible.
+    """
+
+    def __init__(
+        self,
+        cache_path: Optional[Path] = None,
+        species: str = "mouse",
+    ) -> None:
+        self.cache_path = Path(cache_path) if cache_path is not None else None
+        self.species = species
+        # Maps lowercased query symbol -> Ensembl ID (str), or "" for
+        # negative-cached lookups (so we don't re-query missing symbols).
+        self._cache: Dict[str, str] = {}
+        self._dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        if self.cache_path is None or not self.cache_path.exists():
+            return
+        try:
+            with open(self.cache_path) as f:
+                blob = json.load(f)
+            if isinstance(blob, dict):
+                stored = blob.get(self.species, {})
+                if isinstance(stored, dict):
+                    self._cache = {str(k).lower(): str(v) for k, v in stored.items()}
+                    logger.info(
+                        f"  mygene cache: loaded {len(self._cache)} entries "
+                        f"from {self.cache_path}"
+                    )
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"  mygene cache: failed to load {self.cache_path}: {e}")
+
+    def save(self) -> None:
+        if self.cache_path is None or not self._dirty:
+            return
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        existing: Dict[str, Dict[str, str]] = {}
+        if self.cache_path.exists():
+            try:
+                with open(self.cache_path) as f:
+                    blob = json.load(f)
+                if isinstance(blob, dict):
+                    existing = {
+                        str(k): dict(v) for k, v in blob.items() if isinstance(v, dict)
+                    }
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+        existing[self.species] = dict(self._cache)
+        tmp = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, self.cache_path)
+        logger.info(
+            f"  mygene cache: saved {len(self._cache)} entries to {self.cache_path}"
+        )
+        self._dirty = False
+
+    def lookup(self, symbols: List[str]) -> Dict[str, Optional[str]]:
+        """Return {input_symbol: ensembl_or_None} for the given symbols.
+
+        Uses cache when possible; hits mygene.info for misses. Symbols that
+        the API cannot map are negatively cached as "" so subsequent runs
+        skip them.
+        """
+        out: Dict[str, Optional[str]] = {}
+        misses: List[str] = []
+        for sym in symbols:
+            key = str(sym).strip().lower()
+            if not key or key == "nan":
+                out[sym] = None
+                continue
+            if key in self._cache:
+                ens = self._cache[key] or None
+                out[sym] = ens
+            else:
+                misses.append(sym)
+        if not misses:
+            return out
+
+        try:
+            import mygene  # type: ignore
+        except ImportError:
+            logger.warning(
+                "  mygene not installed — skipping symbol-to-Ensembl fallback "
+                "for %d symbols. Install with: pip install mygene",
+                len(misses),
+            )
+            for sym in misses:
+                out[sym] = None
+            return out
+
+        logger.info(
+            f"  mygene: querying {len(misses)} uncached symbols "
+            f"(species={self.species})..."
+        )
+        mg = mygene.MyGeneInfo()
+        try:
+            results = mg.querymany(
+                misses,
+                scopes="symbol,alias",
+                fields="ensembl.gene",
+                species=self.species,
+                returnall=False,
+            )
+        except Exception as e:  # network/API failure should not abort inference
+            logger.warning(f"  mygene query failed: {e}")
+            for sym in misses:
+                out[sym] = None
+            return out
+
+        for r in results:
+            query = r.get("query")
+            if query is None:
+                continue
+            ens = None
+            if not r.get("notfound", False):
+                eg = r.get("ensembl")
+                if isinstance(eg, list):
+                    eg = eg[0] if eg else None
+                if isinstance(eg, dict):
+                    ens = eg.get("gene")
+            self._cache[str(query).lower()] = ens or ""
+            self._dirty = True
+            out[query] = ens
+
+        # Anything that came back with no entry — negative cache it.
+        for sym in misses:
+            if sym not in out:
+                self._cache[str(sym).lower()] = ""
+                self._dirty = True
+                out[sym] = None
+
+        n_hit = sum(1 for sym in misses if out.get(sym))
+        logger.info(
+            f"  mygene: resolved {n_hit}/{len(misses)} new symbols "
+            f"({n_hit / max(1, len(misses)):.1%})"
+        )
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +305,7 @@ def _load_checkpoint(checkpoint_path: Path, device: str):
 
 
 def _gene_panel_from_h5ad(path: Path) -> Tuple[List[str], List[str]]:
-    """Return (var_names, gene_symbols) from an ABC silver h5ad."""
+    """Return (var_names, gene_symbols) from a silver h5ad."""
     import anndata as ad
     a = ad.read_h5ad(path)
     names = list(a.var_names)
@@ -144,6 +317,39 @@ def _gene_panel_from_h5ad(path: Path) -> Tuple[List[str], List[str]]:
     return names, symbols
 
 
+def _autodiscover_gene_panel(
+    silver_dir: Path, expected_n_genes: Optional[int] = None,
+) -> Optional[Tuple[Path, List[str], List[str]]]:
+    """Find a representative silver h5ad in `silver_dir` and read its panel.
+
+    Used when the checkpoint has no `data_summary.json` (e.g. the cortex
+    benchmark script never wrote one). For cortex, the train set is
+    `merfish_mouse_cortex_mouse1_*.h5ad`; we prefer those.
+
+    If `expected_n_genes` is given, we accept the first file whose gene
+    count matches — this guards against picking up a file with a different
+    panel by accident.
+    """
+    if not silver_dir.exists():
+        return None
+
+    # Prefer training-side files (mouse1 for cortex); otherwise just take
+    # the first silver h5ad with a known prefix.
+    candidates = sorted(silver_dir.glob("merfish_mouse_cortex_mouse1_*.h5ad"))
+    if not candidates:
+        candidates = _all_silver_files(silver_dir)
+    for path in candidates:
+        try:
+            names, symbols = _gene_panel_from_h5ad(path)
+        except Exception as e:
+            logger.warning(f"  could not read {path.name} for gene panel: {e}")
+            continue
+        if expected_n_genes is not None and len(names) != expected_n_genes:
+            continue
+        return path, names, symbols
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Per-well: load + preprocess + align genes + run inference
 # ---------------------------------------------------------------------------
@@ -153,7 +359,9 @@ def _looks_like_ensembl(names: List[str]) -> bool:
     """Heuristic: do these strings look like mouse/human Ensembl gene IDs?"""
     if not names:
         return False
-    return sum(n.startswith(("ENSMUSG", "ENSG")) for n in names[:100]) > 50
+    head = names[:100]
+    n_hits = sum(str(n).startswith(("ENSMUSG", "ENSG")) for n in head)
+    return n_hits >= 0.5 * len(head)
 
 
 def _looks_like_integer_index(names: List[str]) -> bool:
@@ -203,84 +411,147 @@ def _resolve_query_gene_names(adata) -> Tuple[List[str], str]:
 
 def _harmonize_query_genes(
     adata_var_names: List[str],
-    target_ensembl: List[str],
-    target_symbols: List[str],
-) -> Tuple[List[Optional[str]], Dict[str, int]]:
-    """Translate adata.var_names into the target Ensembl namespace.
+    target_names: List[str],
+    target_symbols: Optional[List[str]] = None,
+    mygene_cache: Optional["MygeneCache"] = None,
+) -> Tuple[List[Optional[str]], Dict[str, object]]:
+    """Map query gene names into the target gene panel.
+
+    Handles all four combinations of {Ensembl, Symbol} on the target side
+    and the query side:
+
+      target Ensembl / query Ensembl  -> direct match
+      target Ensembl / query Symbol   -> target's symbol map, then mygene
+      target Symbol  / query Symbol   -> case-insensitive match
+      target Symbol  / query Ensembl  -> reverse mygene lookup
+                                          (rare; falls back to None)
 
     Returns:
-      mapped:     list[Optional[str]] of length = len(adata_var_names).
-                  Each entry is the matching Ensembl ID (string in
-                  target_ensembl) or None if no match.
+      mapped:      list[Optional[str]] of length = len(adata_var_names).
+                   Each entry is the matching *target* identifier or None.
       diagnostics: counters describing the matching attempt.
     """
-    target_set = set(target_ensembl)
+    target_is_ensembl = _looks_like_ensembl(target_names)
+    query_is_ensembl = _looks_like_ensembl(adata_var_names)
 
-    query_looks_ensembl = _looks_like_ensembl(adata_var_names)
-    if query_looks_ensembl:
-        # Direct match on Ensembl IDs (case-sensitive — Ensembl IDs are
-        # never lowercased in practice).
+    # Case 1: both Ensembl -> direct
+    if target_is_ensembl and query_is_ensembl:
+        target_set = set(target_names)
         mapped = [n if n in target_set else None for n in adata_var_names]
-        n_matched = sum(m is not None for m in mapped)
         return mapped, {
             "matching_mode": "ensembl_direct",
+            "target_namespace": "ensembl",
+            "query_namespace": "ensembl",
             "n_query_genes": len(adata_var_names),
-            "n_matched": n_matched,
+            "n_matched": sum(m is not None for m in mapped),
+            "n_matched_via_mygene": 0,
         }
 
-    # The query uses symbols. We need a symbol -> Ensembl lookup. Build it
-    # from the target gene panel; case-insensitive matching because the
-    # scRNA-seq atlas reports symbols in UPPERCASE while the ABC panel uses
-    # mouse capitalization (Cbln2 vs CBLN2).
-    if not target_symbols or len(target_symbols) != len(target_ensembl):
-        return [None] * len(adata_var_names), {
-            "matching_mode": "symbol_unavailable",
+    # Case 2: both Symbol -> case-insensitive match against target_names
+    if not target_is_ensembl and not query_is_ensembl:
+        target_lower_to_orig: Dict[str, str] = {}
+        for n in target_names:
+            k = str(n).strip().lower()
+            if k and k != "nan":
+                target_lower_to_orig[k] = n
+        mapped = [
+            target_lower_to_orig.get(str(n).strip().lower())
+            for n in adata_var_names
+        ]
+        return mapped, {
+            "matching_mode": "symbol_case_insensitive",
+            "target_namespace": "symbol",
+            "query_namespace": "symbol",
             "n_query_genes": len(adata_var_names),
-            "n_matched": 0,
-            "note": (
-                "Query gene namespace looks like gene symbols but the "
-                "checkpoint did not save gene_symbols. Re-train with the "
-                "updated training script, or pass --gene_panel_h5ad."
+            "n_matched": sum(m is not None for m in mapped),
+            "n_matched_via_mygene": 0,
+        }
+
+    # Case 3: target Ensembl, query Symbol.
+    # First try the target's bundled symbol->Ensembl map (fast, offline),
+    # then fall back to mygene for whatever didn't resolve.
+    if target_is_ensembl and not query_is_ensembl:
+        target_set = set(target_names)
+        sym_to_ens: Dict[str, str] = {}
+        n_dupe = 0
+        if target_symbols and len(target_symbols) == len(target_names):
+            for sym, ens in zip(target_symbols, target_names):
+                k = str(sym).strip().lower()
+                if not k or k == "nan":
+                    continue
+                if k in sym_to_ens and sym_to_ens[k] != ens:
+                    n_dupe += 1
+                sym_to_ens[k] = ens
+
+        mapped: List[Optional[str]] = []
+        unresolved_idx: List[int] = []
+        for i, name in enumerate(adata_var_names):
+            k = str(name).strip().lower()
+            ens = sym_to_ens.get(k)
+            if ens is not None and ens in target_set:
+                mapped.append(ens)
+            else:
+                mapped.append(None)
+                unresolved_idx.append(i)
+        n_after_direct = sum(m is not None for m in mapped)
+
+        # mygene fallback for unresolved symbols
+        n_via_mygene = 0
+        if mygene_cache is not None and unresolved_idx:
+            misses = [adata_var_names[i] for i in unresolved_idx]
+            sym_to_ens_mg = mygene_cache.lookup(misses)
+            for i, sym in zip(unresolved_idx, misses):
+                ens = sym_to_ens_mg.get(sym)
+                if ens is not None and ens in target_set:
+                    mapped[i] = ens
+                    n_via_mygene += 1
+
+        return mapped, {
+            "matching_mode": (
+                "symbol_to_ensembl_with_mygene"
+                if (mygene_cache is not None and unresolved_idx)
+                else "symbol_to_ensembl_case_insensitive"
             ),
+            "target_namespace": "ensembl",
+            "query_namespace": "symbol",
+            "n_query_genes": len(adata_var_names),
+            "n_matched": sum(m is not None for m in mapped),
+            "n_matched_via_direct": n_after_direct,
+            "n_matched_via_mygene": n_via_mygene,
+            "n_duplicate_symbols": n_dupe,
         }
 
-    sym_to_ens: Dict[str, str] = {}
-    n_dupe = 0
-    for sym, ens in zip(target_symbols, target_ensembl):
-        k = str(sym).strip().lower()
-        if not k or k == "nan":
-            continue
-        if k in sym_to_ens and sym_to_ens[k] != ens:
-            n_dupe += 1
-        sym_to_ens[k] = ens  # last one wins; rare collisions
-
-    mapped: List[Optional[str]] = []
-    for name in adata_var_names:
-        k = str(name).strip().lower()
-        ens = sym_to_ens.get(k)
-        mapped.append(ens if (ens is not None and ens in target_set) else None)
-    n_matched = sum(m is not None for m in mapped)
-    return mapped, {
-        "matching_mode": "symbol_to_ensembl_case_insensitive",
+    # Case 4: target Symbol, query Ensembl. Rare. mygene reverse-lookup
+    # would be needed; skip for now and return all-None with a clear note.
+    return [None] * len(adata_var_names), {
+        "matching_mode": "ensembl_to_symbol_unsupported",
+        "target_namespace": "symbol",
+        "query_namespace": "ensembl",
         "n_query_genes": len(adata_var_names),
-        "n_matched": n_matched,
-        "n_duplicate_symbols": n_dupe,
+        "n_matched": 0,
+        "n_matched_via_mygene": 0,
+        "note": (
+            "Query uses Ensembl IDs but the trained panel is in symbols; "
+            "reverse Ensembl->symbol mapping is not implemented. Convert "
+            "the query to symbols beforehand."
+        ),
     }
 
 
 def _preprocess_and_align(
     adata,
-    target_ensembl: List[str],
-    target_symbols: List[str],
+    target_names: List[str],
+    target_symbols: Optional[List[str]],
     normalize: bool,
     scale: bool,
+    mygene_cache: Optional["MygeneCache"] = None,
 ) -> Tuple[np.ndarray, dict]:
-    """Bring the query expression into the trained ABC gene-panel order.
+    """Bring the query expression into the trained gene-panel order.
 
-    Handles the case where the query (scRNA-seq) uses gene symbols while
-    the trained model uses Ensembl IDs. Also handles the case where
-    var_names is a useless integer index and the actual gene names live
-    in a `var` column. Unmapped genes are filled with zeros.
+    Handles all four combinations of {Ensembl, Symbol} on the target/query
+    side. Also handles the case where var_names is a useless integer index
+    and the actual gene names live in a `var` column. Unmapped genes are
+    filled with zeros.
     """
     import scanpy as sc
     import scipy.sparse as sp
@@ -290,13 +561,20 @@ def _preprocess_and_align(
         f"  query gene-name source: {name_source} "
         f"(e.g., {query_var_names[:3]})"
     )
-    mapped, diag = _harmonize_query_genes(query_var_names, target_ensembl, target_symbols)
+    mapped, diag = _harmonize_query_genes(
+        query_var_names, target_names, target_symbols, mygene_cache=mygene_cache,
+    )
     diag["name_source"] = name_source
-    coverage = diag["n_matched"] / max(1, len(target_ensembl))
+    coverage = diag["n_matched"] / max(1, len(target_names))
+    extra = ""
+    if diag.get("n_matched_via_mygene"):
+        extra = f" (+{diag['n_matched_via_mygene']} via mygene)"
     logger.info(
         f"  gene panel match: mode={diag['matching_mode']}, "
-        f"{diag['n_matched']}/{len(target_ensembl)} target genes mapped "
-        f"({coverage:.1%}), {diag['n_query_genes']} query genes considered"
+        f"target={diag['target_namespace']}, query={diag['query_namespace']}, "
+        f"{diag['n_matched']}/{len(target_names)} target genes mapped "
+        f"({coverage:.1%}){extra}, "
+        f"{diag['n_query_genes']} query genes considered"
     )
     if diag["n_matched"] == 0:
         msg = (
@@ -306,13 +584,13 @@ def _preprocess_and_align(
             f"  Query gene-name source: {name_source}\n"
             f"  Matching mode attempted: {diag['matching_mode']}\n"
             f"  First 5 query names: {list(query_var_names[:5])}\n"
-            f"  First 5 target Ensembl: {target_ensembl[:5]}\n"
+            f"  First 5 target names:  {target_names[:5]}\n"
             f"  First 5 target symbols: {(target_symbols or [])[:5]}\n"
             "Likely fixes:\n"
             "  1. Make sure you have the latest scripts/infer_scgg_on_cns.py\n"
             "     (pull from git and re-run).\n"
             "  2. If the checkpoint has no gene_symbols (older training), "
-            "pass --gene_panel_h5ad pointing at any ABC silver h5ad.\n"
+            "pass --gene_panel_h5ad pointing at any training-set silver h5ad.\n"
             "  3. If the query stores symbols in a non-standard var column, "
             "pass --query_gene_col <colname>."
         )
@@ -373,21 +651,24 @@ def _preprocess_and_align(
     else:
         Xsub = np.zeros((adata.n_obs, 0), dtype=np.float32)
 
-    # Scatter the matched-gene expression into the full ABC-ordered matrix.
-    target_idx = {ens: i for i, ens in enumerate(target_ensembl)}
-    out = np.zeros((adata.n_obs, len(target_ensembl)), dtype=np.float32)
+    # Scatter the matched-gene expression into the full target-ordered matrix.
+    target_idx = {n: i for i, n in enumerate(target_names)}
+    out = np.zeros((adata.n_obs, len(target_names)), dtype=np.float32)
     for sub_col, query_col in enumerate(matched_idx):
-        ens = mapped[query_col]
-        j = target_idx[ens]
+        tgt = mapped[query_col]
+        j = target_idx[tgt]
         out[:, j] = Xsub[:, sub_col]
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
     return out, {
         "n_present": diag["n_matched"],
-        "n_missing": len(target_ensembl) - diag["n_matched"],
+        "n_missing": len(target_names) - diag["n_matched"],
         "coverage": coverage,
         "matching_mode": diag["matching_mode"],
+        "target_namespace": diag.get("target_namespace"),
+        "query_namespace": diag.get("query_namespace"),
         "n_query_genes": diag["n_query_genes"],
+        "n_matched_via_mygene": diag.get("n_matched_via_mygene", 0),
     }
 
 
@@ -522,23 +803,97 @@ def _plot_comparison(
 # ---------------------------------------------------------------------------
 
 
+_KNOWN_SILVER_PREFIXES = (
+    "cns_scrna_",
+    "merfish_mouse_cortex_",
+    "abc_zhuang_abca1_",
+)
+
+
+def _strip_known_prefix(stem: str) -> str:
+    """Strip the silver-file prefix to recover a bare section id."""
+    for pref in _KNOWN_SILVER_PREFIXES:
+        if stem.startswith(pref):
+            return stem[len(pref):]
+    return stem
+
+
+def _all_silver_files(silver_dir: Path) -> List[Path]:
+    """Return every silver h5ad in `silver_dir` that matches a known prefix."""
+    out: List[Path] = []
+    for p in sorted(silver_dir.glob("*.h5ad")):
+        if any(p.name.startswith(pref) for pref in _KNOWN_SILVER_PREFIXES):
+            out.append(p)
+    return out
+
+
 def _resolve_section_files(silver_dir: Path, sections_arg: List[str]) -> List[Path]:
-    """Map --sections values (well IDs or filenames) to silver h5ad paths."""
+    """Resolve --sections values to silver h5ad paths.
+
+    Accepted forms (any combination):
+      - ``all``            -> every silver h5ad with a known prefix
+      - ``all_test``       -> for the LUNA cortex layout, every mouse2 slice
+      - a bare section id  (``well06``, ``mouse2_slice1``,
+                            ``Zhuang-ABCA-1-001``)
+      - a filename         (``cns_scrna_well06.h5ad``)
+      - a glob             (``mouse2_*`` or ``cns_scrna_well0*``)
+    """
+    if not silver_dir.exists():
+        raise FileNotFoundError(f"silver_dir does not exist: {silver_dir}")
+
     if sections_arg == ["all"]:
-        files = sorted(silver_dir.glob("cns_scrna_*.h5ad"))
+        files = _all_silver_files(silver_dir)
         if not files:
-            raise FileNotFoundError(f"No cns_scrna_*.h5ad files under {silver_dir}")
+            raise FileNotFoundError(
+                f"No silver h5ad files under {silver_dir} matching any of "
+                f"the known prefixes: {_KNOWN_SILVER_PREFIXES}"
+            )
         return files
-    out = []
+
+    if sections_arg == ["all_test"]:
+        # LUNA cortex convention: Mouse 2 is the held-out test set.
+        files = sorted(silver_dir.glob("merfish_mouse_cortex_mouse2_*.h5ad"))
+        if not files:
+            raise FileNotFoundError(
+                f"No held-out test files (merfish_mouse_cortex_mouse2_*.h5ad) "
+                f"under {silver_dir}"
+            )
+        return files
+
+    out: List[Path] = []
     for s in sections_arg:
-        # Accept either bare well-id ('well06') or filename ('cns_scrna_well06.h5ad')
-        candidates = [
-            silver_dir / f"cns_scrna_{s}.h5ad",
-            silver_dir / s,
-            silver_dir / f"{s}.h5ad",
-        ]
+        # Glob pattern: contains a wildcard somewhere.
+        if any(ch in s for ch in "*?["):
+            matched: List[Path] = []
+            # Try the pattern raw, then with each known prefix prepended.
+            patterns = [s, s + ".h5ad"]
+            for pref in _KNOWN_SILVER_PREFIXES:
+                patterns.append(f"{pref}{s}.h5ad")
+                patterns.append(f"{pref}{s}")
+            for pat in patterns:
+                matched.extend(sorted(silver_dir.glob(pat)))
+            # Deduplicate while preserving order.
+            seen = set()
+            uniq = []
+            for p in matched:
+                if p in seen:
+                    continue
+                seen.add(p)
+                if p.suffix == ".h5ad":
+                    uniq.append(p)
+            if not uniq:
+                raise FileNotFoundError(
+                    f"Glob {s!r} matched no silver h5ads under {silver_dir}"
+                )
+            out.extend(uniq)
+            continue
+
+        # Literal section spec — try the known naming conventions.
+        candidates = [silver_dir / s, silver_dir / f"{s}.h5ad"]
+        for pref in _KNOWN_SILVER_PREFIXES:
+            candidates.append(silver_dir / f"{pref}{s}.h5ad")
         for c in candidates:
-            if c.exists():
+            if c.exists() and c.suffix == ".h5ad":
                 out.append(c)
                 break
         else:
@@ -546,14 +901,23 @@ def _resolve_section_files(silver_dir: Path, sections_arg: List[str]) -> List[Pa
                 f"No silver h5ad matches section spec {s!r}. "
                 f"Tried: {[str(c) for c in candidates]}"
             )
-    return out
+
+    # Deduplicate but preserve user order.
+    seen = set()
+    uniq_out: List[Path] = []
+    for p in out:
+        if p in seen:
+            continue
+        seen.add(p)
+        uniq_out.append(p)
+    return uniq_out
 
 
 def run_inference(
     checkpoint: str,
     silver_dir: str,
     sections: List[str],
-    output_dir: str,
+    output_dir: Optional[str],
     color_col: str,
     projection: str,
     device: Optional[str],
@@ -561,6 +925,9 @@ def run_inference(
     no_normalize: bool,
     no_scale: bool,
     query_gene_col: Optional[str] = None,
+    mygene_cache_path: Optional[str] = None,
+    species: str = "mouse",
+    no_mygene: bool = False,
 ) -> None:
     import anndata as ad
     import torch
@@ -574,17 +941,41 @@ def run_inference(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
 
-    out_dir = Path(output_dir)
+    silver_path = Path(silver_dir)
+    # Default output_dir derived from silver_dir.name so cortex inference
+    # lands in `../scgg-reproducibility/artifacts/merfish_mouse_cortex_luna/`
+    # and CNS inference in `.../cns_luna/` etc.
+    if output_dir is None:
+        out_dir = Path("../scgg-reproducibility/artifacts") / silver_path.name
+    else:
+        out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Loading checkpoint: {ckpt_path}")
     logger.info(f"Device: {dev}")
+    logger.info(f"Output dir: {out_dir}")
     model, cfg, gene_names, gene_symbols, data_summary = _load_checkpoint(ckpt_path, dev)
     logger.info(
         f"Model: objective={model.objective}, "
         f"params={sum(p.numel() for p in model.parameters()):,}"
     )
+
+    expected_n_genes = None
+    if data_summary and data_summary.get("n_genes"):
+        expected_n_genes = int(data_summary["n_genes"])
+    else:
+        first_layer_key = next(
+            (k for k in model.state_dict().keys()
+             if "encoder.backbone.0.0.weight" in k),
+            None,
+        )
+        if first_layer_key is not None:
+            expected_n_genes = int(model.state_dict()[first_layer_key].shape[1])
+
+    gene_panel_source = "checkpoint.data_summary.json" if (
+        data_summary and data_summary.get("gene_names")
+    ) else None
 
     if (not gene_names or not gene_symbols) and gene_panel_h5ad:
         # Always re-load both names + symbols from the fallback h5ad so the
@@ -593,23 +984,44 @@ def run_inference(
         gn, gs = _gene_panel_from_h5ad(Path(gene_panel_h5ad))
         if not gene_names:
             gene_names = gn
+            gene_panel_source = f"--gene_panel_h5ad={gene_panel_h5ad}"
         if not gene_symbols and gs:
             gene_symbols = gs
         logger.info(
             f"  --gene_panel_h5ad supplied: {len(gn)} genes, "
             f"{len(gs)} symbols from {gene_panel_h5ad}"
         )
+
+    # Last-resort fallback: auto-discover a representative training section
+    # in silver_dir. Needed for cortex-style checkpoints that never wrote a
+    # data_summary.json.
+    if not gene_names:
+        disco = _autodiscover_gene_panel(silver_path, expected_n_genes=expected_n_genes)
+        if disco is not None:
+            disco_path, gn, gs = disco
+            gene_names = gn
+            if not gene_symbols and gs:
+                gene_symbols = gs
+            gene_panel_source = f"autodiscover:{disco_path}"
+            logger.info(
+                f"  auto-discovered gene panel from {disco_path.name}: "
+                f"{len(gn)} genes"
+                + (f", {len(gs)} symbols" if gs else " (no symbol column)")
+            )
     if not gene_names:
         raise RuntimeError(
-            "Could not recover the trained gene panel. Re-train with the "
-            "updated train_scgg_on_abc.py (saves gene_names), or pass "
-            "--gene_panel_h5ad pointing at any silver h5ad from the ABC "
-            "training set."
+            "Could not recover the trained gene panel. Either:\n"
+            "  1. Re-train with the updated train_scgg_on_abc.py (saves "
+            "gene_names in data_summary.json), or\n"
+            "  2. Pass --gene_panel_h5ad pointing at any silver h5ad from "
+            "the training set, or\n"
+            "  3. Put a representative training h5ad in --silver_dir so "
+            "the script can auto-discover the panel."
         )
     if not gene_symbols:
-        logger.warning(
-            "  no gene_symbols available — query namespace can only be "
-            "matched if it already uses the trained Ensembl IDs."
+        logger.info(
+            "  no gene_symbols available — symbol-namespace queries will "
+            "rely on direct case-insensitive matching against target names."
         )
 
     # Preprocessing flags: prefer values stored in data_summary, then config,
@@ -630,14 +1042,29 @@ def run_inference(
         scale = False
     logger.info(f"  preprocessing: normalize={normalize}, scale={scale}")
 
-    section_paths = _resolve_section_files(Path(silver_dir), sections)
+    # Set up the mygene cache only when we actually need symbol->Ensembl
+    # bridging (target is Ensembl). For symbol-symbol matching (cortex)
+    # it's not used.
+    mygene_cache: Optional[MygeneCache] = None
+    if not no_mygene and _looks_like_ensembl(gene_names):
+        cache_p = (
+            Path(mygene_cache_path)
+            if mygene_cache_path
+            else Path.home() / ".cache" / "scgg" / f"mygene_{species}.json"
+        )
+        mygene_cache = MygeneCache(cache_path=cache_p, species=species)
+        logger.info(
+            f"  mygene cache: enabled (path={cache_p}, species={species})"
+        )
+
+    section_paths = _resolve_section_files(silver_path, sections)
     logger.info(f"Inference on {len(section_paths)} sections: "
                  f"{[p.name for p in section_paths]}")
 
     summary = []
     for path in section_paths:
-        well_id = path.stem.replace("cns_scrna_", "")
-        logger.info(f"[{well_id}] {path}")
+        section_id = _strip_known_prefix(path.stem)
+        logger.info(f"[{section_id}] {path}")
         adata = ad.read_h5ad(path)
         logger.info(f"  shape: {adata.shape}")
 
@@ -672,6 +1099,7 @@ def run_inference(
         X_aligned, panel_stats = _preprocess_and_align(
             adata, gene_names, gene_symbols,
             normalize=normalize, scale=scale,
+            mygene_cache=mygene_cache,
         )
         # Defensive: catch all-zero inputs early.
         in_max = float(np.abs(X_aligned).max()) if X_aligned.size else 0.0
@@ -711,18 +1139,18 @@ def run_inference(
             )
 
         adata.obsm["spatial_pred"] = coords_pred.astype(np.float32)
-        out_h5ad = out_dir / f"{well_id}_predicted.h5ad"
+        out_h5ad = out_dir / f"{section_id}_predicted.h5ad"
         adata.write(out_h5ad)
         logger.info(f"  wrote h5ad with spatial_pred: {out_h5ad}")
 
         if color_col_eff is not None:
-            out_svg = out_dir / f"{well_id}_comparison.svg"
-            _plot_comparison(adata, color_col_eff, out_svg, title_prefix=f"[{well_id}] ")
+            out_svg = out_dir / f"{section_id}_comparison.svg"
+            _plot_comparison(adata, color_col_eff, out_svg, title_prefix=f"[{section_id}] ")
         else:
             logger.warning("  no usable color column; skipping plot")
 
         summary.append({
-            "well_id": well_id,
+            "section_id": section_id,
             "input_path": str(path),
             "output_h5ad": str(out_h5ad),
             "n_cells": int(adata.n_obs),
@@ -732,16 +1160,21 @@ def run_inference(
             "projection": projection,
         })
 
+    # Persist any new mygene resolutions for offline reproducibility.
+    if mygene_cache is not None:
+        mygene_cache.save()
+
     with open(out_dir / "inference_metadata.json", "w") as f:
         json.dump(
             {
                 "checkpoint": str(ckpt_path),
-                "gene_panel_source": (
-                    "checkpoint.data_summary.json"
-                    if data_summary and data_summary.get("gene_names")
-                    else (gene_panel_h5ad or "unknown")
-                ),
+                "silver_dir": str(silver_path),
+                "gene_panel_source": gene_panel_source or "unknown",
                 "n_gene_panel": len(gene_names),
+                "target_namespace": (
+                    "ensembl" if _looks_like_ensembl(gene_names) else "symbol"
+                ),
+                "species": species,
                 "sections": summary,
             },
             f, indent=2, default=str,
@@ -762,15 +1195,23 @@ def main() -> int:
         default="/nfs/team361/sb75/DATASETS/silver/cns_luna",
     )
     p.add_argument(
-        "--sections", nargs="+", default=["well06"],
-        help="Well IDs to run on. Pass 'all' to run on every well "
-             "in --silver_dir. Default: well06.",
+        "--sections", nargs="+", default=None,
+        help=(
+            "Section ids / filenames / glob patterns to run on. Accepts: "
+            "bare ids ('well06', 'mouse2_slice1'), filenames "
+            "('cns_scrna_well06.h5ad'), globs ('mouse2_*'), or the special "
+            "values 'all' (every silver h5ad) and 'all_test' (mouse2_* — "
+            "the LUNA cortex held-out split). Default depends on "
+            "--silver_dir: 'all_test' for merfish_mouse_cortex_*, "
+            "'well06' for cns_*, 'all' otherwise."
+        ),
     )
     p.add_argument(
         "--output_dir",
-        default="../scgg-reproducibility/artifacts/cns_luna",
+        default=None,
         help="Where to write predicted h5ads and comparison SVGs. Default "
-             "points at the sibling scgg-reproducibility repository.",
+             "derives from --silver_dir's basename and points at "
+             "../scgg-reproducibility/artifacts/<silver_dir_name>/.",
     )
     p.add_argument("--color", default="cell_class",
                    help="adata.obs column to color plots by (default: cell_class).")
@@ -798,12 +1239,40 @@ def main() -> int:
              "Use when var_names is a useless integer index. The script "
              "auto-detects this case, but the flag lets you force it.",
     )
+    p.add_argument(
+        "--mygene_cache", default=None,
+        help="JSON file for offline-cached symbol->Ensembl translations. "
+             "Default: ~/.cache/scgg/mygene_<species>.json. Only used when "
+             "the trained panel is in Ensembl IDs and the query is in "
+             "symbols (gene-alias recovery).",
+    )
+    p.add_argument(
+        "--species", default="mouse",
+        help="mygene species name when bridging symbols -> Ensembl "
+             "(default: mouse).",
+    )
+    p.add_argument(
+        "--no_mygene", action="store_true",
+        help="Disable the mygene fallback. Only direct (target-panel) "
+             "symbol matching will be attempted.",
+    )
     args = p.parse_args()
+
+    # Pick a sensible default for --sections depending on the dataset.
+    sections = args.sections
+    if sections is None:
+        silver_name = Path(args.silver_dir).name.lower()
+        if "merfish_mouse_cortex" in silver_name:
+            sections = ["all_test"]
+        elif silver_name.startswith("cns_"):
+            sections = ["well06"]
+        else:
+            sections = ["all"]
 
     run_inference(
         checkpoint=args.checkpoint,
         silver_dir=args.silver_dir,
-        sections=args.sections,
+        sections=sections,
         output_dir=args.output_dir,
         color_col=args.color,
         projection=args.projection,
@@ -812,6 +1281,9 @@ def main() -> int:
         no_normalize=args.no_normalize,
         no_scale=args.no_scale,
         query_gene_col=args.query_gene_col,
+        mygene_cache_path=args.mygene_cache,
+        species=args.species,
+        no_mygene=args.no_mygene,
     )
     return 0
 
