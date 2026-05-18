@@ -443,6 +443,155 @@ class DistanceRegressionLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Direct 2-D coordinate regression with Procrustes-aligned MSE
+# ---------------------------------------------------------------------------
+
+
+class CoordRegressionLoss(nn.Module):
+    """Direct (x, y) regression head with Procrustes-aligned MSE.
+
+    Adds a learned Linear(metric_dim, 2) head on top of the metric
+    embedding. Each batch:
+      1. Project embedding -> 2-D predicted coords.
+      2. Solve for the best similarity transform (scale + rotation +
+         optional reflection + translation) that maps the prediction
+         onto GT coords (Kabsch-Umeyama). The transform parameters are
+         computed under torch.no_grad — gradients only flow through the
+         predicted coords, not through the alignment.
+      3. Apply the alignment and compute MSE between the aligned
+         prediction and GT, normalized by GT coord variance so the loss
+         is comparable across slices with different physical scales.
+
+    Why a separate, head-based loss when we already have pairwise-distance
+    regression?
+
+      The pairwise-distance Pearson loss is dominated by whichever spatial
+      axis carries the most variance — in laminar tissue, that's the depth
+      axis. The model can score Pearson ~0.8 while leaving the tangential
+      axis essentially unconstrained, and *any* 2-D readout of the
+      resulting embedding ends up scrambled in the tangential direction.
+
+      This loss directly punishes that failure mode: there is no rotation
+      or projection of the prediction that lets it ignore one of the two
+      output dimensions. Both must be encoded as linear directions of the
+      metric embedding for the loss to be small.
+
+    The Kabsch alignment makes the loss invariant to rotation / scale /
+    reflection of the embedding frame, so the model isn't penalized for
+    learning coords in an arbitrary orientation. Stop-gradding R means
+    the model can't "trick" the loss by exploiting how the alignment
+    would compensate for its own errors — it has to produce intrinsically
+    well-shaped coords.
+
+    Args:
+        embed_dim: dimensionality of the metric embedding fed to the head.
+            Should match `model.metric_head.embed_dim`.
+        allow_reflection: if True, the Kabsch transform may flip chirality;
+            useful when the embedding can come out mirrored relative to GT
+            without that being a real model error. Default False (rotations
+            only) — cortex has a definite handedness.
+        normalize_by_var: divide the MSE by mean GT coord variance so the
+            loss sits in roughly [0, 1] like the other losses. Default True.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        allow_reflection: bool = False,
+        normalize_by_var: bool = True,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.head = nn.Linear(embed_dim, 2)
+        self.allow_reflection = bool(allow_reflection)
+        self.normalize_by_var = bool(normalize_by_var)
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        coords: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            embeddings: (B, embed_dim) metric embeddings.
+            coords: (B, 2) GT 2-D coordinates.
+
+        Returns:
+            loss (scalar) + metrics dict.
+        """
+        B = embeddings.shape[0]
+        zero_out = (
+            embeddings.sum() * 0.0,
+            {
+                "coord_loss": 0.0,
+                "coord_mse": 0.0,
+                "coord_normalized_mse": 0.0,
+                "coord_scale": 0.0,
+            },
+        )
+        if B < 3 or coords.shape[0] != B:
+            return zero_out
+
+        pred = self.head(embeddings)  # (B, 2)
+
+        # Procrustes / Kabsch-Umeyama similarity transform. Computed under
+        # no_grad so gradients flow through pred only — the model can't
+        # exploit the alignment to lower the loss without producing
+        # intrinsically well-shaped predictions.
+        with torch.no_grad():
+            mu_p = pred.mean(dim=0)
+            mu_c = coords.mean(dim=0)
+            pc = pred - mu_p
+            cc = coords - mu_c
+            var_p = (pc ** 2).sum() / B  # mean squared norm of centered pred
+            if float(var_p.item()) < self.eps:
+                # Predictions collapsed to a point; fall back to plain MSE
+                # so gradients can still escape this regime.
+                s = torch.ones((), device=pred.device, dtype=pred.dtype)
+                R = torch.eye(2, device=pred.device, dtype=pred.dtype)
+                t = mu_c - mu_p
+                degenerate = True
+            else:
+                cov = (cc.T @ pc) / B  # (2, 2) target.T @ source
+                U, S_vals, Vt = torch.linalg.svd(cov)
+                if self.allow_reflection:
+                    d_diag = torch.ones(2, device=pred.device, dtype=pred.dtype)
+                else:
+                    det_uv = torch.linalg.det(U @ Vt)
+                    d_diag = torch.stack(
+                        [torch.ones_like(det_uv), det_uv.sign()]
+                    ).to(pred.dtype)
+                R = U @ torch.diag(d_diag) @ Vt
+                s = (S_vals * d_diag).sum() / (var_p + self.eps)
+                t = mu_c - s * (R @ mu_p)
+                degenerate = False
+
+        # Apply alignment WITH grad on pred.
+        aligned = s * (pred @ R.T) + t
+        mse = ((aligned - coords) ** 2).mean()
+
+        if self.normalize_by_var:
+            with torch.no_grad():
+                coord_var = ((coords - coords.mean(dim=0)) ** 2).mean()
+                coord_var = coord_var + self.eps
+            normalized = mse / coord_var
+            loss = normalized
+            normalized_val = float(normalized.item())
+        else:
+            loss = mse
+            normalized_val = float("nan")
+
+        return loss, {
+            "coord_loss": float(loss.item()),
+            "coord_mse": float(mse.item()),
+            "coord_normalized_mse": normalized_val,
+            "coord_scale": float(s.item()),
+            "coord_degenerate": float(degenerate),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Optional cell-class auxiliary classification head
 # ---------------------------------------------------------------------------
 

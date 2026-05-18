@@ -38,6 +38,7 @@ from .losses import (
     ContrastiveRankingLoss,
     FlowMatchingLoss,
     CellClassAuxLoss,
+    CoordRegressionLoss,
     DistanceRegressionLoss,
 )
 from .ood_losses import (
@@ -127,6 +128,30 @@ class Trainer:
                 )
             else:
                 self.distance_criterion = None
+
+            # Optional direct coordinate-regression head (Procrustes-aligned MSE).
+            # Adds a learned Linear(metric_dim, 2) on top of the metric
+            # embedding. Forces both spatial axes to be encoded as linear
+            # directions of the embedding — addresses the tangential
+            # collapse the pairwise-distance Pearson loss misses.
+            cr_cfg = loss_cfg.get("coord_regression", {}) or {}
+            self.use_coord_loss = bool(cr_cfg.get("enabled", True))
+            self.coord_loss_weight = float(cr_cfg.get("weight", 1.0))
+            if self.use_coord_loss:
+                metric_dim = config["model"]["metric_head"]["embed_dim"]
+                self.coord_criterion = CoordRegressionLoss(
+                    embed_dim=metric_dim,
+                    allow_reflection=bool(cr_cfg.get("allow_reflection", False)),
+                    normalize_by_var=bool(cr_cfg.get("normalize_by_var", True)),
+                ).to(self.device)
+                logger.info(
+                    "Coord regression head ENABLED "
+                    f"(weight={self.coord_loss_weight}, metric_dim={metric_dim}, "
+                    f"allow_reflection="
+                    f"{bool(cr_cfg.get('allow_reflection', False))})"
+                )
+            else:
+                self.coord_criterion = None
 
             # Optional cell-class auxiliary classifier on the encoder output.
             cc_cfg = loss_cfg.get("cell_class_aux", {}) or {}
@@ -233,6 +258,7 @@ class Trainer:
             "contrastive_loss", "n_anchors_used", "mean_positives_per_anchor",
             "distance_loss", "distance_pearson", "distance_pearson_global",
             "distance_n_classes_used",
+            "coord_loss", "coord_mse", "coord_scale",
             "cellclass_aux_loss", "cellclass_aux_acc",
         ]
 
@@ -304,6 +330,8 @@ class Trainer:
         params = list(self.model.parameters())
         if getattr(self, "cellclass_aux_criterion", None) is not None:
             params += list(self.cellclass_aux_criterion.parameters())
+        if getattr(self, "coord_criterion", None) is not None:
+            params += list(self.coord_criterion.parameters())
         for c in self.ood_components.values():
             if isinstance(c, nn.Module):
                 params += list(c.parameters())
@@ -502,6 +530,7 @@ class Trainer:
 
             # Optional: pairwise-distance regression (Spearman-aligned).
             loss = self.contrastive_weight * c_loss
+            coords = None
             if self.use_distance_loss and self.distance_criterion is not None:
                 coords = batch["coords"].to(self.device)
                 cls_for_dist = batch.get("cell_class", None)
@@ -519,6 +548,17 @@ class Trainer:
                 metrics["distance_n_classes_used"] = d_metrics.get(
                     "n_classes_used", 0
                 )
+
+            # Optional: direct coord regression via a learned 2-D head with
+            # Procrustes-aligned MSE. Forces both spatial axes to be encoded.
+            if self.use_coord_loss and self.coord_criterion is not None:
+                if coords is None:
+                    coords = batch["coords"].to(self.device)
+                cr_loss, cr_metrics = self.coord_criterion(emb, coords)
+                loss = loss + self.coord_loss_weight * cr_loss
+                metrics["coord_loss"] = cr_metrics["coord_loss"]
+                metrics["coord_mse"] = cr_metrics["coord_mse"]
+                metrics["coord_scale"] = cr_metrics["coord_scale"]
 
             # Optional: cell-class auxiliary classifier on cell_embed.
             if self.use_cellclass_aux and self.cellclass_aux_criterion is not None:
@@ -628,13 +668,14 @@ class Trainer:
                     )
                     total_loss_val = self.contrastive_weight * c_loss
                     val_entry = {"contrastive_loss": c_m["contrastive_loss"]}
+                    coords_val = None
                     if self.use_distance_loss and self.distance_criterion is not None:
-                        coords = batch["coords"].to(self.device)
+                        coords_val = batch["coords"].to(self.device)
                         cls_for_dist = batch.get("cell_class", None)
                         if cls_for_dist is not None:
                             cls_for_dist = cls_for_dist.to(self.device)
                         d_loss, d_m = self.distance_criterion(
-                            emb, coords, cell_class=cls_for_dist,
+                            emb, coords_val, cell_class=cls_for_dist,
                         )
                         total_loss_val = (
                             total_loss_val + self.distance_loss_weight * d_loss
@@ -647,6 +688,17 @@ class Trainer:
                         val_entry["distance_n_classes_used"] = d_m.get(
                             "n_classes_used", 0
                         )
+
+                    if self.use_coord_loss and self.coord_criterion is not None:
+                        if coords_val is None:
+                            coords_val = batch["coords"].to(self.device)
+                        cr_loss, cr_m = self.coord_criterion(emb, coords_val)
+                        total_loss_val = (
+                            total_loss_val + self.coord_loss_weight * cr_loss
+                        )
+                        val_entry["coord_loss"] = cr_m["coord_loss"]
+                        val_entry["coord_mse"] = cr_m["coord_mse"]
+                        val_entry["coord_scale"] = cr_m["coord_scale"]
                     if (
                         self.use_cellclass_aux
                         and self.cellclass_aux_criterion is not None
@@ -716,6 +768,11 @@ class Trainer:
                 if getattr(self, "cellclass_aux_criterion", None) is not None
                 else None
             ),
+            "coord_aux_state_dict": (
+                self.coord_criterion.state_dict()
+                if getattr(self, "coord_criterion", None) is not None
+                else None
+            ),
             "ood_state_dicts": {
                 name: c.state_dict()
                 for name, c in self.ood_components.items()
@@ -753,6 +810,9 @@ class Trainer:
         cc_state = state.get("cellclass_aux_state_dict", None)
         if cc_state is not None and getattr(self, "cellclass_aux_criterion", None) is not None:
             self.cellclass_aux_criterion.load_state_dict(cc_state)
+        cr_state = state.get("coord_aux_state_dict", None)
+        if cr_state is not None and getattr(self, "coord_criterion", None) is not None:
+            self.coord_criterion.load_state_dict(cr_state)
         for name, sd in state.get("ood_state_dicts", {}).items():
             if name in self.ood_components and isinstance(
                 self.ood_components[name], nn.Module

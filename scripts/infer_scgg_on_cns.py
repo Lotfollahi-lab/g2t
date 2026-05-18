@@ -1223,16 +1223,13 @@ def _pick_representative_cortex_slice(
     Used by --include_train_section: lets us add a training-side slice to
     the inference run as a sanity check (model fit vs generalization).
     Strategy: prefer slice99 when present (matches LUNA's Fig 3c reference
-    section); otherwise the largest available slice on disk for the
-    requested mouse, which gives the most stable visual comparison.
+    section); otherwise the first sorted slice on disk for the requested
+    mouse, which gives the most stable visual comparison.
     """
-    # Prefer the slice that LUNA happens to feature, if it exists.
+    # Prefer the slice that LUNA features in Fig 3c, if it exists.
     preferred = []
     for pref in ("mmc", "merfish_mouse_cortex"):
-        preferred.extend([
-            silver_dir / f"{pref}_mouse{mouse_id}_slice99.h5ad",
-            silver_dir / f"{pref}_mouse{mouse_id}_slice119.h5ad",
-        ])
+        preferred.append(silver_dir / f"{pref}_mouse{mouse_id}_slice99.h5ad")
     for p in preferred:
         if p.exists():
             return p
@@ -1301,12 +1298,17 @@ def _resolve_section_files(silver_dir: Path, sections_arg: List[str]) -> List[Pa
         return files
 
     if sections_arg == ["paper"]:
-        # The exact slices LUNA visualizes in Figure 3 of the paper
-        # (mouse2_slice99 = Fig. 3c ~5,235 cells; mouse2_slice119 = Fig. 3g
-        # ~5,021 cells). Use these for direct visual comparison to LUNA.
-        return _resolve_section_files(
-            silver_dir, ["mouse2_slice99", "mouse2_slice119"],
-        )
+        # LUNA paper Figure 3c is mouse2_slice99 (5,235 cells in the paper;
+        # 5,216 in our processed silver — small QC drift, but the slice
+        # identity is confirmed by matching our reproducibility figures).
+        #
+        # Figure 3g is described as "one example slice (5,024 cells)" in
+        # the caption but the identity is NOT confirmed. The closest
+        # candidates in our data are mouse2_slice169 (5,018 cells),
+        # mouse2_slice229 (5,004), and mouse2_slice119 (5,001) — pick by
+        # tissue shape, not by cell count. Until that's resolved we only
+        # include slice99 in the preset to avoid a misleading comparison.
+        return _resolve_section_files(silver_dir, ["mouse2_slice99"])
 
     out: List[Path] = []
     for s in sections_arg:
@@ -1753,8 +1755,9 @@ def main() -> int:
             "bare ids ('well06', 'mouse2_slice1'), filenames "
             "('cns_scrna_well06.h5ad'), globs ('mouse2_*'), or the special "
             "values: 'all' (every silver h5ad), 'all_test' (mouse2_* — the "
-            "LUNA cortex held-out split), 'paper' (mouse2_slice99 + "
-            "mouse2_slice119, the slices LUNA shows in Fig 3c and 3g). "
+            "LUNA cortex held-out split), 'paper' (mouse2_slice99 — the "
+            "slice LUNA shows in Fig 3c; Fig 3g's identity is not "
+            "confirmed in our data, so it's omitted from the preset). "
             "Default depends on --silver_dir: 'all_test' for mmc_* / "
             "merfish_mouse_cortex_*, 'well06' for cns_*, 'all' otherwise."
         ),

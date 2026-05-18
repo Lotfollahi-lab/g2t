@@ -160,6 +160,8 @@ def run_benchmark(
     load_checkpoint: Optional[str] = None,
     class_stratified_distance: Optional[bool] = None,
     k_default: Optional[int] = None,
+    coord_regression: Optional[bool] = None,
+    metric_embed_dim: Optional[int] = None,
 ) -> Dict[str, float]:
     """Run the full LUNA Figure 3 benchmark and return the aggregated metrics.
 
@@ -197,6 +199,12 @@ def run_benchmark(
             model can satisfy SupCon without learning tangential structure.
             k=30–50 makes positives extend across tangential extents and
             forces the model to encode them.
+        coord_regression: Toggle the direct (x, y) regression head with
+            Procrustes-aligned MSE on top of the metric embedding. None
+            leaves config alone (default ON). Pass False to ablate.
+        metric_embed_dim: Output dimension of the metric head. None leaves
+            the config default (8). Pass 64 to recover the pre-coord-loss
+            regime; useful for direct ablation against the larger embedding.
 
     Returns:
         Dict of aggregated metrics; identical structure to
@@ -256,6 +264,24 @@ def run_benchmark(
     if k_default is not None:
         cfg.setdefault("graph", {})["k_default"] = int(k_default)
         logger.info(f"graph.k_default overridden via CLI: {int(k_default)}")
+
+    if coord_regression is not None:
+        cfg.setdefault("training", {}).setdefault("loss", {}).setdefault(
+            "coord_regression", {}
+        )["enabled"] = bool(coord_regression)
+        logger.info(
+            f"loss.coord_regression.enabled overridden via CLI: "
+            f"{bool(coord_regression)}"
+        )
+
+    if metric_embed_dim is not None:
+        cfg.setdefault("model", {}).setdefault("metric_head", {})[
+            "embed_dim"
+        ] = int(metric_embed_dim)
+        logger.info(
+            f"model.metric_head.embed_dim overridden via CLI: "
+            f"{int(metric_embed_dim)}"
+        )
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -441,6 +467,19 @@ def main():
              "force the model to encode tangential position instead of just "
              "depth-band membership.",
     )
+    p.add_argument(
+        "--no_coord_regression", action="store_true",
+        help="Disable the direct 2-D coordinate-regression head (Procrustes-"
+             "aligned MSE on top of the metric embedding). On by default — "
+             "use this flag to ablate.",
+    )
+    p.add_argument(
+        "--metric_embed_dim", type=int, default=None,
+        help="Override model.metric_head.embed_dim. Default (from config) "
+             "is 8 — small dimensionality forces 2-D spatial signal into "
+             "axes a linear readout can find. Pass 64 to recover the "
+             "pre-change regime for ablation.",
+    )
     args = p.parse_args()
 
     run_benchmark(
@@ -466,6 +505,8 @@ def main():
             True if args.class_stratified_distance else None
         ),
         k_default=args.k_default,
+        coord_regression=(False if args.no_coord_regression else None),
+        metric_embed_dim=args.metric_embed_dim,
     )
 
 

@@ -31,7 +31,13 @@ model:
   #       fundamentally limited (no cell-to-cell info flow).
   metric_head:
     type: "cross_attention"   # mlp | cross_attention
-    embed_dim: 64             # output dimension of the metric space
+    # Output dimension of the metric space. Reduced from 64 to 8 so any
+    # 2-D spatial signal must live in axes that 2-D readouts can find —
+    # a 64-d unit-sphere embedding can hide spatial structure in
+    # lower-variance directions that PCA / linear readouts drop. 8 keeps
+    # plenty of capacity for cell-type structure while making the
+    # CoordRegressionLoss head's Linear(8, 2) projection effective.
+    embed_dim: 8
     normalize: true           # L2-normalize so FAISS L2 == cosine ranking
     dropout: 0.1
     # cross_attention-specific
@@ -131,6 +137,27 @@ training:
       # and ABC loaders).
       class_stratified: false
       min_cells_per_class: 6      # min cells of a class in a batch to include it
+
+    # Direct 2-D coordinate regression with a learned Linear(metric_dim, 2)
+    # head and Procrustes-aligned MSE. Forces *both* spatial axes to be
+    # encoded as linear directions of the metric embedding — the
+    # pairwise-distance Pearson loss is dominated by the high-variance
+    # axis (depth in cortex) and can be satisfied while leaving the
+    # tangential axis essentially unconstrained. The Kabsch alignment
+    # is stop-grad'd so the model has to produce intrinsically
+    # well-shaped coords, not predictions that game the transform.
+    # On by default; disable for ablations.
+    coord_regression:
+      enabled: true
+      weight: 1.0
+      # If false (default), the alignment is rotation-only (det(R) = +1)
+      # so the model can't satisfy the loss by mirroring its output.
+      # True allows reflection — useful only for datasets without a
+      # definite handedness.
+      allow_reflection: false
+      # Divide MSE by mean GT coord variance so the loss is in [0, ~1]
+      # and comparable across slices with different physical scales.
+      normalize_by_var: true
 
     # Optional auxiliary classifier on the encoder cell_embed against the GT
     # cell-class labels. Adds orthogonal supervision: same-class cells tend
