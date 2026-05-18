@@ -672,19 +672,14 @@ def _preprocess_and_align(
     }
 
 
-def _predict_2d(
+def _predict_embedding(
     model,
     gene_expr_np: np.ndarray,
-    projection: str,
     device: str,
 ) -> np.ndarray:
-    """Run scGG and project the result down to 2-D for plotting.
-
-    For flow_matching mode the model already returns 2-D coords; for
-    contrastive mode we apply PCA (or MDS) on the metric embedding.
-    """
+    """Run scGG and return the raw d-dim metric embedding (or 2-D coords
+    for flow_matching mode). Caller decides whether to project to 2-D."""
     import torch
-    from scgg.evaluation.luna_metrics import embedding_to_2d
 
     ge = torch.from_numpy(gene_expr_np).float().to(device)
     with torch.no_grad():
@@ -692,10 +687,220 @@ def _predict_2d(
             emb = model.embed_batched(ge)
         else:
             emb = model.generate_embeddings(ge)
-    emb_np = emb.detach().cpu().numpy()
+    return emb.detach().cpu().numpy()
+
+
+def _project_2d(emb_np: np.ndarray, method: str) -> np.ndarray:
+    """Project a (N, d) embedding to (N, 2) for plotting / RSSD."""
+    from scgg.evaluation.luna_metrics import embedding_to_2d
     if emb_np.shape[1] == 2:
         return emb_np
-    return embedding_to_2d(emb_np, method=projection)
+    return embedding_to_2d(emb_np, method=method)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: per-class Spearman, UMAP on the raw embedding
+# ---------------------------------------------------------------------------
+
+
+def _per_class_spearman(
+    coords_true: np.ndarray,
+    coords_pred: np.ndarray,
+    cell_class: Optional[np.ndarray],
+    min_cells_per_class: int = 50,
+) -> Dict[str, object]:
+    """Median per-cell Spearman, restricted to within-class pairwise distances.
+
+    Confirms whether good global Spearman is being carried by between-class
+    structure (cells of different types are far apart) while within-class
+    spatial geometry is missing. If `per_class_median` ≪ `global_median`,
+    the embedding has collapsed to a cell-type classifier.
+    """
+    from scgg.evaluation.luna_metrics import compute_spearman_correlation
+
+    global_res = compute_spearman_correlation(coords_true, coords_pred)
+    out: Dict[str, object] = {
+        "global_median": global_res["median"],
+        "global_mean": global_res["mean"],
+        "n_cells": int(coords_true.shape[0]),
+        "min_cells_per_class": int(min_cells_per_class),
+        "per_class": {},
+    }
+    if cell_class is None:
+        out["note"] = "no cell_class provided; only global Spearman computed"
+        return out
+
+    cell_class = np.asarray(cell_class)
+    per_class: Dict[str, Dict[str, float]] = {}
+    medians: List[float] = []
+    for cls in sorted({str(c) for c in cell_class}):
+        mask = cell_class == cls
+        n = int(mask.sum())
+        if n < min_cells_per_class:
+            continue
+        res = compute_spearman_correlation(coords_true[mask], coords_pred[mask])
+        per_class[cls] = {
+            "median": res["median"],
+            "mean": res["mean"],
+            "n_cells": n,
+        }
+        if not np.isnan(res["median"]):
+            medians.append(res["median"])
+
+    out["per_class"] = per_class
+    out["mean_of_per_class_medians"] = (
+        float(np.mean(medians)) if medians else float("nan")
+    )
+    out["median_of_per_class_medians"] = (
+        float(np.median(medians)) if medians else float("nan")
+    )
+    return out
+
+
+def _log_per_class_spearman(
+    diag: Dict[str, object], section_id: str, top_n: int = 10,
+) -> None:
+    """Pretty-log the per-class Spearman summary."""
+    g = diag["global_median"]
+    pcm = diag.get("mean_of_per_class_medians", float("nan"))
+    logger.info(
+        f"  [{section_id}] Spearman diagnostic: "
+        f"global_median={g:.4f}, mean(per_class_medians)={pcm:.4f}"
+    )
+    if (
+        not np.isnan(g)
+        and not np.isnan(pcm)
+        and (g - pcm) > 0.10
+    ):
+        logger.warning(
+            f"  [{section_id}] GLOBAL Spearman is {g - pcm:+.3f} higher than "
+            f"the mean of per-class medians ({g:.3f} vs {pcm:.3f}). "
+            "This is the signature of a cell-type-collapsed embedding: "
+            "between-class structure is what drives the headline metric, "
+            "but within-class spatial geometry is weak."
+        )
+    pc = diag.get("per_class", {}) or {}
+    if pc:
+        sorted_items = sorted(
+            pc.items(), key=lambda kv: -kv[1]["n_cells"]
+        )[:top_n]
+        logger.info(f"  [{section_id}] per-class medians (top {len(sorted_items)} by cell count):")
+        for cls, stats in sorted_items:
+            logger.info(
+                f"    {cls:>20s}  n={stats['n_cells']:>6d}  "
+                f"median={stats['median']:+.4f}  mean={stats['mean']:+.4f}"
+            )
+
+
+def _plot_umap_diagnostic(
+    embedding: np.ndarray,
+    cell_class: Optional[np.ndarray],
+    coords_true: Optional[np.ndarray],
+    out_svg: Path,
+    title_prefix: str = "",
+    spot_size: Optional[float] = None,
+    n_neighbors: int = 30,
+    min_dist: float = 0.1,
+    random_state: int = 42,
+) -> None:
+    """UMAP the raw embedding; show it colored by cell class and by GT y-axis.
+
+    If the model is a cell-type classifier in disguise, the by-class panel
+    shows tight, well-separated clusters and the by-GT-y panel shows no
+    smooth gradient — same-color cells (=close in y) are spread across the
+    UMAP, while within-class cells (=same UMAP cluster) span the full y
+    range.
+    """
+    try:
+        import umap  # type: ignore
+    except ImportError:
+        logger.warning(
+            "  umap-learn not installed; skipping UMAP diagnostic. "
+            "Install with: pip install umap-learn"
+        )
+        return
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    matplotlib.rcParams["svg.fonttype"] = "none"
+    matplotlib.rcParams["pdf.fonttype"] = 42
+
+    n = embedding.shape[0]
+    if n < n_neighbors + 1:
+        logger.warning(
+            f"  UMAP needs at least n_neighbors+1={n_neighbors + 1} cells; "
+            f"got {n}. Skipping."
+        )
+        return
+
+    logger.info(
+        f"  UMAP: fitting on (N={n}, d={embedding.shape[1]}) embedding..."
+    )
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        random_state=random_state,
+    )
+    emb_2d = reducer.fit_transform(embedding)
+
+    if spot_size is None:
+        spot_size = max(8.0, min(40.0, 1800.0 / np.sqrt(max(n, 1))))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+
+    # Panel 1: colored by cell class (discrete)
+    ax = axes[0]
+    if cell_class is not None:
+        cell_class = np.asarray(cell_class)
+        cats = sorted({str(c) for c in cell_class})
+        cmap = plt.get_cmap("tab20", max(len(cats), 1))
+        cat_to_color = {c: cmap(i) for i, c in enumerate(cats)}
+        colors = [cat_to_color[str(c)] for c in cell_class]
+        ax.scatter(emb_2d[:, 0], emb_2d[:, 1], c=colors, s=spot_size, linewidths=0)
+        ax.set_title(f"{title_prefix}UMAP of raw embedding\n(colored by cell class)")
+        patches = [Patch(facecolor=cat_to_color[c], label=c) for c in cats]
+        ncol = min(max(1, (len(cats) + 3) // 4), 6)
+        ax.legend(
+            handles=patches, labels=cats, loc="center left",
+            bbox_to_anchor=(1.0, 0.5), ncol=1, fontsize="xx-small",
+            frameon=False,
+        )
+    else:
+        ax.scatter(emb_2d[:, 0], emb_2d[:, 1], s=spot_size, linewidths=0)
+        ax.set_title(f"{title_prefix}UMAP of raw embedding")
+    ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+
+    # Panel 2: colored by GT y-coordinate (continuous gradient).
+    # The signal we're looking for: if the embedding encodes spatial
+    # position, the color should vary smoothly across each UMAP cluster.
+    # If clusters are uniformly colored / spatially scrambled, the
+    # embedding has lost within-class spatial structure.
+    ax = axes[1]
+    if coords_true is not None and coords_true.shape[1] >= 2:
+        c_vals = coords_true[:, 1].astype(np.float32)
+        sc = ax.scatter(
+            emb_2d[:, 0], emb_2d[:, 1], c=c_vals,
+            s=spot_size, linewidths=0, cmap="viridis",
+        )
+        fig.colorbar(sc, ax=ax, label="GT y-coordinate")
+        ax.set_title(
+            f"{title_prefix}UMAP of raw embedding\n"
+            "(colored by GT y; smooth gradient → spatial signal preserved)"
+        )
+    else:
+        ax.scatter(emb_2d[:, 0], emb_2d[:, 1], s=spot_size, linewidths=0)
+        ax.set_title(f"{title_prefix}UMAP of raw embedding (no GT)")
+    ax.set_xlabel("UMAP1"); ax.set_ylabel("UMAP2")
+
+    fig.tight_layout()
+    out_svg.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_svg, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  saved UMAP diagnostic: {out_svg}")
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1199,9 @@ def run_inference(
     no_mygene: bool = False,
     spot_size: Optional[float] = None,
     no_align_plot: bool = False,
+    per_class_spearman: bool = False,
+    umap_diagnostic: bool = False,
+    diagnostic_class_col: Optional[str] = None,
 ) -> None:
     import anndata as ad
     import torch
@@ -1180,10 +1388,12 @@ def run_inference(
                 "Check the gene-panel matching log above."
             )
 
-        coords_pred = _predict_2d(model, X_aligned, projection, dev)
+        embedding = _predict_embedding(model, X_aligned, dev)
+        coords_pred = _project_2d(embedding, projection)
         elapsed = time.time() - t0
         logger.info(
-            f"  inference done in {elapsed:.1f}s; pred shape={coords_pred.shape}"
+            f"  inference done in {elapsed:.1f}s; "
+            f"emb shape={embedding.shape}, pred 2D shape={coords_pred.shape}"
         )
         # Detect a fully-collapsed prediction (every cell at the same point)
         # and warn loudly — usually means OOD shift was too large or the
@@ -1205,6 +1415,36 @@ def run_inference(
             )
 
         adata.obsm["spatial_pred"] = coords_pred.astype(np.float32)
+
+        # Diagnostics: per-class Spearman + UMAP of the raw embedding.
+        # Confirm whether good headline Spearman is being carried by
+        # between-class structure while within-class spatial geometry is
+        # weak (i.e. cell-type-collapsed embedding).
+        diag_class_col = diagnostic_class_col or color_col_eff
+        cell_class_arr = None
+        if diag_class_col and diag_class_col in adata.obs.columns:
+            cell_class_arr = adata.obs[diag_class_col].astype(str).to_numpy()
+
+        spearman_diag: Optional[Dict[str, object]] = None
+        coords_true_2d = (
+            adata.obsm["spatial"][:, :2]
+            if "spatial" in adata.obsm and adata.obsm["spatial"].shape[1] >= 2
+            else None
+        )
+        if per_class_spearman and coords_true_2d is not None:
+            # Use the raw embedding (Spearman is dimension-agnostic — it
+            # operates on ranked pairwise distances, so passing the full
+            # d-dim embedding is exactly what LUNA does).
+            spearman_diag = _per_class_spearman(
+                coords_true_2d, embedding, cell_class_arr,
+            )
+            _log_per_class_spearman(spearman_diag, section_id)
+        elif per_class_spearman and coords_true_2d is None:
+            logger.warning(
+                "  --per_class_spearman requested but no obsm['spatial'] "
+                "ground truth in this h5ad; skipping diagnostic."
+            )
+
         out_h5ad = out_dir / f"{section_id}_predicted.h5ad"
         adata.write(out_h5ad)
         logger.info(f"  wrote h5ad with spatial_pred: {out_h5ad}")
@@ -1220,7 +1460,18 @@ def run_inference(
         else:
             logger.warning("  no usable color column; skipping plot")
 
-        summary.append({
+        if umap_diagnostic:
+            out_umap_svg = out_dir / f"{section_id}_umap_diagnostic.svg"
+            _plot_umap_diagnostic(
+                embedding=embedding,
+                cell_class=cell_class_arr,
+                coords_true=coords_true_2d,
+                out_svg=out_umap_svg,
+                title_prefix=f"[{section_id}] ",
+                spot_size=spot_size,
+            )
+
+        section_record = {
             "section_id": section_id,
             "input_path": str(path),
             "output_h5ad": str(out_h5ad),
@@ -1229,7 +1480,10 @@ def run_inference(
             "inference_seconds": elapsed,
             "color_col": color_col_eff,
             "projection": projection,
-        })
+        }
+        if spearman_diag is not None:
+            section_record["spearman_diagnostic"] = spearman_diag
+        summary.append(section_record)
 
     # Persist any new mygene resolutions for offline reproducibility.
     if mygene_cache is not None:
@@ -1341,6 +1595,29 @@ def main() -> int:
              "a Umeyama alignment for visualization only — the raw "
              "obsm['spatial_pred'] is always preserved unchanged.",
     )
+    p.add_argument(
+        "--per_class_spearman", action="store_true",
+        help="Compute median per-cell Spearman restricted to within-class "
+             "pairs (and the global value). If global ≫ mean(per_class), "
+             "the embedding is acting as a cell-type classifier and the "
+             "headline metric is being carried by between-class structure "
+             "rather than within-class spatial geometry. Logs per-class "
+             "values and saves them to inference_metadata.json.",
+    )
+    p.add_argument(
+        "--umap_diagnostic", action="store_true",
+        help="Generate <section>_umap_diagnostic.svg: UMAP of the raw "
+             "d-dim embedding, colored (left) by cell class and (right) "
+             "by GT y-coordinate. A tightly clustered by-class panel + a "
+             "scrambled by-GT-y panel is the visual signature of a "
+             "cell-type-collapsed embedding. Requires umap-learn.",
+    )
+    p.add_argument(
+        "--diagnostic_class_col", default=None,
+        help="Override which obs column is used for per-class Spearman "
+             "and UMAP coloring (default: --color value, falling back to "
+             "the first categorical column).",
+    )
     args = p.parse_args()
 
     # Pick a sensible default for --sections depending on the dataset.
@@ -1371,6 +1648,9 @@ def main() -> int:
         no_mygene=args.no_mygene,
         spot_size=args.spot_size,
         no_align_plot=args.no_align_plot,
+        per_class_spearman=args.per_class_spearman,
+        umap_diagnostic=args.umap_diagnostic,
+        diagnostic_class_col=args.diagnostic_class_col,
     )
     return 0
 
