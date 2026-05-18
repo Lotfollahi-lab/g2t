@@ -156,6 +156,51 @@ def _looks_like_ensembl(names: List[str]) -> bool:
     return sum(n.startswith(("ENSMUSG", "ENSG")) for n in names[:100]) > 50
 
 
+def _looks_like_integer_index(names: List[str]) -> bool:
+    """Are these strings actually integer position indices, not gene names?
+
+    Some h5ad files store gene names in a `var` column ('Gene', 'Symbol',
+    etc.) and leave `var.index` as a default integer index. In that case
+    `var_names` is ['0', '1', '2', ...] which is useless for gene matching.
+    """
+    if not names:
+        return False
+    n_int = 0
+    for n in names[:50]:
+        s = str(n).strip()
+        if s and (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            n_int += 1
+    return n_int > 40
+
+
+def _resolve_query_gene_names(adata) -> Tuple[List[str], str]:
+    """Get the *real* gene names from a query AnnData.
+
+    Prefers adata.var_names, but falls back to a column in adata.var when
+    var_names is just an integer index. Returns (gene_names, source) where
+    source is either 'var_names' or 'var.{column_name}'.
+    """
+    var_names = list(adata.var_names)
+    if not _looks_like_integer_index(var_names):
+        return var_names, "var_names"
+
+    # var_names is bogus — look for a column carrying the real gene symbols.
+    candidate_cols = (
+        "Gene", "gene", "gene_symbol", "gene_name",
+        "Symbol", "symbol", "feature_name", "gene_id",
+    )
+    for col in candidate_cols:
+        if col in adata.var.columns:
+            vals = adata.var[col].astype(str).tolist()
+            # Reject if the column is mostly NaN/empty
+            n_valid = sum(1 for v in vals if v and v.lower() != "nan")
+            if n_valid > 0.5 * len(vals):
+                return vals, f"var.{col}"
+    # No usable column — return the (useless) integer-index names and let
+    # the caller surface a clear error.
+    return var_names, "var_names_integer_no_fallback"
+
+
 def _harmonize_query_genes(
     adata_var_names: List[str],
     target_ensembl: List[str],
@@ -233,14 +278,20 @@ def _preprocess_and_align(
     """Bring the query expression into the trained ABC gene-panel order.
 
     Handles the case where the query (scRNA-seq) uses gene symbols while
-    the trained model uses Ensembl IDs. Genes that don't map are filled
-    with zeros.
+    the trained model uses Ensembl IDs. Also handles the case where
+    var_names is a useless integer index and the actual gene names live
+    in a `var` column. Unmapped genes are filled with zeros.
     """
     import scanpy as sc
     import scipy.sparse as sp
 
-    query_var_names = list(adata.var_names)
+    query_var_names, name_source = _resolve_query_gene_names(adata)
+    logger.info(
+        f"  query gene-name source: {name_source} "
+        f"(e.g., {query_var_names[:3]})"
+    )
     mapped, diag = _harmonize_query_genes(query_var_names, target_ensembl, target_symbols)
+    diag["name_source"] = name_source
     coverage = diag["n_matched"] / max(1, len(target_ensembl))
     logger.info(
         f"  gene panel match: mode={diag['matching_mode']}, "
@@ -250,9 +301,14 @@ def _preprocess_and_align(
     if diag["n_matched"] == 0:
         logger.error(
             "  no genes matched between the query and the trained panel. "
-            "Inference will use a zero matrix and is meaningless. Check "
-            "the gene namespace of your scRNA-seq h5ad."
+            "Inference will use a zero matrix and is meaningless."
         )
+        if name_source.startswith("var_names_integer"):
+            logger.error(
+                "    the query var.index looks like integer positions, not "
+                "gene names. Set the gene-name column explicitly with "
+                "--query_gene_col, e.g. `--query_gene_col Gene`."
+            )
 
     # Build a subset AnnData of the matched query genes, in the order they
     # appear in the query (so scanpy preprocessing operates on real data).
@@ -460,6 +516,7 @@ def run_inference(
     gene_panel_h5ad: Optional[str],
     no_normalize: bool,
     no_scale: bool,
+    query_gene_col: Optional[str] = None,
 ) -> None:
     import anndata as ad
     import torch
@@ -549,6 +606,23 @@ def run_inference(
             color_col_eff = cat_cols[0] if cat_cols else None
         else:
             color_col_eff = color_col
+
+        # Manual override for the gene-name column (e.g. --query_gene_col Gene
+        # when the scRNA h5ad stores symbols in a var column and has a useless
+        # integer index in var_names).
+        if query_gene_col is not None:
+            if query_gene_col not in adata.var.columns:
+                raise ValueError(
+                    f"--query_gene_col {query_gene_col!r} not found in "
+                    f"adata.var.columns ({list(adata.var.columns)})"
+                )
+            override_names = adata.var[query_gene_col].astype(str).tolist()
+            adata.var_names = override_names
+            adata.var_names_make_unique()
+            logger.info(
+                f"  applied --query_gene_col override: var_names <- "
+                f"adata.var['{query_gene_col}'] ({override_names[:3]}...)"
+            )
 
         t0 = time.time()
         X_aligned, panel_stats = _preprocess_and_align(
@@ -642,6 +716,13 @@ def main() -> int:
                         "h5ads are already log-normalized).")
     p.add_argument("--no_scale", action="store_true",
                    help="Skip per-gene z-score scaling.")
+    p.add_argument(
+        "--query_gene_col", default=None,
+        help="Manually override which column of the query h5ad's `var` "
+             "contains the real gene names (e.g. --query_gene_col Gene). "
+             "Use when var_names is a useless integer index. The script "
+             "auto-detects this case, but the flag lets you force it.",
+    )
     args = p.parse_args()
 
     run_inference(
@@ -655,6 +736,7 @@ def main() -> int:
         gene_panel_h5ad=args.gene_panel_h5ad,
         no_normalize=args.no_normalize,
         no_scale=args.no_scale,
+        query_gene_col=args.query_gene_col,
     )
     return 0
 
