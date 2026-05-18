@@ -122,6 +122,32 @@ class Trainer:
                 )
             else:
                 self.distance_criterion = None
+
+            # Optional cell-class auxiliary classifier on the encoder output.
+            cc_cfg = loss_cfg.get("cell_class_aux", {}) or {}
+            n_classes = getattr(train_dataset, "n_classes", 0)
+            self.use_cellclass_aux = (
+                bool(cc_cfg.get("enabled", False)) and n_classes > 0
+            )
+            self.cellclass_aux_weight = float(cc_cfg.get("weight", 1.0))
+            if self.use_cellclass_aux:
+                self.cellclass_aux_criterion = CellClassAuxLoss(
+                    cell_embed_dim=config["model"]["encoder"]["embed_dim"],
+                    n_classes=n_classes,
+                    hidden_dim=cc_cfg.get("hidden_dim", 128),
+                    dropout=cc_cfg.get("dropout", 0.1),
+                ).to(self.device)
+                logger.info(
+                    "Cell-class auxiliary loss ENABLED "
+                    f"(n_classes={n_classes}, weight={self.cellclass_aux_weight})"
+                )
+            else:
+                self.cellclass_aux_criterion = None
+                if cc_cfg.get("enabled", False) and n_classes == 0:
+                    logger.warning(
+                        "cell_class_aux enabled in config but train dataset has "
+                        "no cell_class labels (n_classes=0); skipping."
+                    )
         elif self.objective == "flow_matching":
             self.criterion = FlowMatchingLoss(
                 lambda_contrastive=loss_cfg.get("contrastive_spatial", 0.1),
@@ -255,8 +281,10 @@ class Trainer:
             logger.info("No OOD components enabled (default).")
 
     def _all_params(self):
-        """Iterate parameters from the main model + any OOD components."""
+        """Iterate parameters from the main model + auxiliary heads + OOD."""
         params = list(self.model.parameters())
+        if getattr(self, "cellclass_aux_criterion", None) is not None:
+            params += list(self.cellclass_aux_criterion.parameters())
         for c in self.ood_components.values():
             if isinstance(c, nn.Module):
                 params += list(c.parameters())
@@ -403,7 +431,10 @@ class Trainer:
         batch_indices = batch.get("batch_indices_in_section", None)
 
         if self.objective == "contrastive":
-            emb = self.model.embed(gene_expr, section_expr)
+            # Split the forward so we can also feed cell_embed to the
+            # optional cell-class auxiliary classifier.
+            cell_embed, section_embed = self.model.encode(gene_expr, section_expr)
+            emb = self.model.metric_head(cell_embed, section_embed)
 
             # Primary: SupCon contrastive (top-k retrieval).
             c_loss, c_metrics = self.criterion(
@@ -425,6 +456,20 @@ class Trainer:
                 loss = loss + self.distance_loss_weight * d_loss
                 metrics["distance_loss"] = d_metrics["distance_loss"]
                 metrics["distance_pearson"] = d_metrics["distance_pearson"]
+
+            # Optional: cell-class auxiliary classifier on cell_embed.
+            if self.use_cellclass_aux and self.cellclass_aux_criterion is not None:
+                cls = batch.get("cell_class", None)
+                if cls is not None:
+                    cls = cls.to(self.device)
+                    valid = cls >= 0
+                    if valid.any():
+                        cc_loss, cc_metrics = self.cellclass_aux_criterion(
+                            cell_embed[valid], cls[valid]
+                        )
+                        loss = loss + self.cellclass_aux_weight * cc_loss
+                        metrics["cellclass_aux_loss"] = cc_metrics["cellclass_aux_loss"]
+                        metrics["cellclass_aux_acc"] = cc_metrics["cellclass_aux_acc"]
 
         else:  # flow_matching
             coords = batch["coords"].to(self.device)
@@ -509,22 +554,47 @@ class Trainer:
                 batch_indices = batch.get("batch_indices_in_section", None)
 
                 if self.objective == "contrastive":
-                    emb = self.model.embed(gene_expr, section_expr)
+                    cell_embed, section_embed = self.model.encode(
+                        gene_expr, section_expr
+                    )
+                    emb = self.model.metric_head(cell_embed, section_embed)
                     c_loss, c_m = self.criterion(
                         embeddings=emb,
                         spatial_adj=gt_graph,
                         batch_indices=batch_indices,
                     )
                     total_loss_val = self.contrastive_weight * c_loss
-                    val_entry = {
-                        "contrastive_loss": c_m["contrastive_loss"],
-                    }
+                    val_entry = {"contrastive_loss": c_m["contrastive_loss"]}
                     if self.use_distance_loss and self.distance_criterion is not None:
                         coords = batch["coords"].to(self.device)
                         d_loss, d_m = self.distance_criterion(emb, coords)
-                        total_loss_val = total_loss_val + self.distance_loss_weight * d_loss
+                        total_loss_val = (
+                            total_loss_val + self.distance_loss_weight * d_loss
+                        )
                         val_entry["distance_loss"] = d_m["distance_loss"]
                         val_entry["distance_pearson"] = d_m["distance_pearson"]
+                    if (
+                        self.use_cellclass_aux
+                        and self.cellclass_aux_criterion is not None
+                    ):
+                        cls = batch.get("cell_class", None)
+                        if cls is not None:
+                            cls = cls.to(self.device)
+                            valid = cls >= 0
+                            if valid.any():
+                                cc_loss, cc_m = self.cellclass_aux_criterion(
+                                    cell_embed[valid], cls[valid]
+                                )
+                                total_loss_val = (
+                                    total_loss_val
+                                    + self.cellclass_aux_weight * cc_loss
+                                )
+                                val_entry["cellclass_aux_loss"] = cc_m[
+                                    "cellclass_aux_loss"
+                                ]
+                                val_entry["cellclass_aux_acc"] = cc_m[
+                                    "cellclass_aux_acc"
+                                ]
                     val_entry["total_loss"] = total_loss_val.item()
                     val_metrics.append(val_entry)
                 else:
@@ -567,6 +637,11 @@ class Trainer:
             ),
             "best_val_loss": self.best_val_loss,
             "config": self.config,
+            "cellclass_aux_state_dict": (
+                self.cellclass_aux_criterion.state_dict()
+                if getattr(self, "cellclass_aux_criterion", None) is not None
+                else None
+            ),
             "ood_state_dicts": {
                 name: c.state_dict()
                 for name, c in self.ood_components.items()
@@ -601,6 +676,9 @@ class Trainer:
                 "will restart from step 0. Resuming a long run can produce a "
                 "different LR trajectory than the original."
             )
+        cc_state = state.get("cellclass_aux_state_dict", None)
+        if cc_state is not None and getattr(self, "cellclass_aux_criterion", None) is not None:
+            self.cellclass_aux_criterion.load_state_dict(cc_state)
         for name, sd in state.get("ood_state_dicts", {}).items():
             if name in self.ood_components and isinstance(
                 self.ood_components[name], nn.Module

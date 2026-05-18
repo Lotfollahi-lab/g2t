@@ -240,6 +240,7 @@ def run_benchmark(
     )
 
     k_default = int(cfg["graph"]["k_default"])
+    cc_train = data.get("cell_class_id_train")
     train_ds = SpatialTranscriptomicsDataset(
         gene_expr=data["gene_expr_train"][train_mask],
         coords=data["coords_train"][train_mask],
@@ -247,6 +248,7 @@ def run_benchmark(
         config=cfg["data"],
         k_values=[k_default],
         is_train=True,
+        cell_class=(cc_train[train_mask] if cc_train is not None else None),
     )
     val_ds = None
     if val_mask.any():
@@ -257,6 +259,12 @@ def run_benchmark(
             config=cfg["data"],
             k_values=[k_default],
             is_train=False,
+            cell_class=(cc_train[val_mask] if cc_train is not None else None),
+        )
+    if data.get("class_names"):
+        logger.info(
+            f"Cell-class labels available: {len(data['class_names'])} classes "
+            f"({data['class_names'][:5]}{' ...' if len(data['class_names']) > 5 else ''})"
         )
 
     # ---- Build model + trainer -----------------------------------------

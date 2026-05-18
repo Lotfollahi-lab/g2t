@@ -167,20 +167,25 @@ def load_luna_cortex(
         min_cells_per_section=min_cells_per_section,
         split_name="test",
         gene_subset=train["gene_names"],
+        class_names=train.get("class_names"),
     )
 
     return {
         "gene_expr_train": train["gene_expr"],
         "coords_train": train["coords"],
         "section_ids_train": train["section_ids"],
-        "cell_class_train": train["cell_class"],
+        "cell_class_train": train["cell_class"],          # str array
+        "cell_class_id_train": train["cell_class_id"],    # int array (or None)
         "section_map_train": train["section_map"],
         "gene_expr_test": test["gene_expr"],
         "coords_test": test["coords"],
         "section_ids_test": test["section_ids"],
         "cell_class_test": test["cell_class"],
+        "cell_class_id_test": test["cell_class_id"],
         "section_map_test": test["section_map"],
         "gene_names": train["gene_names"],
+        "class_names": train.get("class_names"),
+        "n_classes": len(train["class_names"]) if train.get("class_names") else 0,
     }
 
 
@@ -193,6 +198,7 @@ def _load_split(
     min_cells_per_section: int,
     split_name: str,
     gene_subset: Optional[List[str]] = None,
+    class_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Load one split (train or test), concatenate sections, harmonize genes."""
     import scipy.sparse as sp
@@ -261,8 +267,25 @@ def _load_split(
     else:
         coords = _extract_coords(big)
 
-    # Cell class
+    # Cell class — strings + integer encoding with consistent vocabulary
+    # across train and test (test maps unseen classes to -1).
     cell_class = _extract_cell_class(big)
+    if cell_class is not None:
+        if class_names is None:
+            class_names = sorted(np.unique(cell_class).tolist())
+        cls_to_id = {c: i for i, c in enumerate(class_names)}
+        cell_class_id = np.array(
+            [cls_to_id.get(c, -1) for c in cell_class], dtype=np.int64
+        )
+        n_unknown = int((cell_class_id < 0).sum())
+        if n_unknown > 0:
+            logger.info(
+                f"  [{split_name}] {n_unknown} cells have a class not present in "
+                f"train vocabulary; marked as -1 (aux loss will skip them)."
+            )
+    else:
+        cell_class_id = None
+        class_names = None
 
     # Dense gene expression
     if sp.issparse(big.X):
@@ -287,7 +310,9 @@ def _load_split(
         "gene_expr": X,
         "coords": coords,
         "section_ids": section_ids,
-        "cell_class": cell_class,
+        "cell_class": cell_class,         # str array (or None)
+        "cell_class_id": cell_class_id,   # int array (or None)
+        "class_names": class_names,
         "section_map": section_map,
         "gene_names": list(big.var_names),
     }

@@ -45,12 +45,24 @@ class SpatialTranscriptomicsDataset(Dataset):
         config: dict,
         k_values: List[int] = [10],
         is_train: bool = True,
+        cell_class: Optional[np.ndarray] = None,
     ):
         self.gene_expr = gene_expr
         self.raw_coords = coords.copy()
         self.section_ids = section_ids
         self.config = config
         self.is_train = is_train
+        # Optional per-cell integer class label (e.g., cortex cell type).
+        # -1 = unknown / out-of-vocabulary; downstream aux loss masks these out.
+        self.cell_class = (
+            np.asarray(cell_class, dtype=np.int64) if cell_class is not None else None
+        )
+        if self.cell_class is not None:
+            # Number of classes = max id + 1 (ignoring -1 unknowns).
+            valid = self.cell_class[self.cell_class >= 0]
+            self.n_classes = int(valid.max()) + 1 if valid.size else 0
+        else:
+            self.n_classes = 0
 
         # Build section index
         self.sections = np.unique(section_ids)
@@ -131,7 +143,13 @@ class SpatialTranscriptomicsDataset(Dataset):
         k = np.random.choice(self.k_values)
         gt_graph_key = (section_id, k)
 
-        return {
+        section_class = (
+            torch.tensor(self.cell_class[cell_indices], dtype=torch.long)
+            if self.cell_class is not None
+            else None
+        )
+
+        out = {
             "gene_expr": torch.tensor(expr, dtype=torch.float32),
             "coords": torch.tensor(coords, dtype=torch.float32),
             "section_id": section_id,
@@ -139,6 +157,9 @@ class SpatialTranscriptomicsDataset(Dataset):
             "k_target": k,
             "gt_graph_key": gt_graph_key,
         }
+        if section_class is not None:
+            out["cell_class"] = section_class
+        return out
 
 
 def collate_section_batch(batch: List[Dict]) -> Dict:
@@ -182,14 +203,16 @@ def create_cell_batches(
     for start in range(0, n_cells, batch_size):
         end = min(start + batch_size, n_cells)
         idx = perm[start:end]
-
-        batches.append({
+        entry = {
             "gene_expr": section_data["gene_expr"][idx],
             "coords": section_data["coords"][idx],
             "batch_indices_in_section": idx,
             "k_target": section_data["k_target"],
             "section_id": section_data["section_id"],
             "gt_graph_key": section_data["gt_graph_key"],
-        })
+        }
+        if "cell_class" in section_data:
+            entry["cell_class"] = section_data["cell_class"][idx]
+        batches.append(entry)
 
     return batches

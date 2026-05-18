@@ -122,6 +122,19 @@ training:
       weight: 1.0
       use_squared: true           # squared Euclidean distances (smoother grads)
 
+    # Optional auxiliary classifier on the encoder cell_embed against the GT
+    # cell-class labels. Adds orthogonal supervision: same-class cells tend
+    # to co-localize spatially (cortical layers etc.), so a class-aware
+    # encoder is a useful inductive bias for spatial-graph prediction.
+    # Off by default; enable when running on data with cell-class annotation
+    # (the LUNA cortex split has 23 classes — automatically wired by the
+    # luna_cortex loader).
+    cell_class_aux:
+      enabled: false
+      weight: 0.5
+      hidden_dim: 128
+      dropout: 0.1
+
     # Legacy settings for the flow-matching objective. Only used when
     # objective == "flow_matching"; ignored in contrastive mode.
     flow_matching: 1.0           # weight of the FM term in the legacy loss
