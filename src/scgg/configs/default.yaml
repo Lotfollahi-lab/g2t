@@ -90,9 +90,23 @@ data:
 # --- Training ---
 training:
   # ===== Objective =====
-  # "contrastive" (default): primary InfoNCE on the metric-head output.
-  # "flow_matching" (ablation): legacy flow matching on 2D coords.
-  objective: "contrastive"
+  # "flow_matching" (default): LUNA-style conditional flow matching. The
+  #     velocity network is trained to denoise Gaussian samples into 2-D
+  #     spatial coordinates conditioned on gene expression + section
+  #     context. At inference an ODE solver generates 2-D coords directly,
+  #     so there's no embed-then-project step that can hide spatial signal
+  #     in low-variance directions.
+  #     Caveat: our VelocityNetwork is a per-cell MLP (cell-cell info
+  #     enters only through the scalar section_embed). LUNA's DiT has
+  #     cross-attention between cells during denoising — if our results
+  #     plateau short of LUNA-quality, upgrading VelocityNetwork to
+  #     cross-attention is the natural next step.
+  # "contrastive" (ablation): SupCon on the metric embedding + optional
+  #     pairwise-distance Pearson + Procrustes-aligned coord head. The
+  #     visualization quality is bounded by what a 2-D linear readout of
+  #     the embedding can recover; in practice the tangential axis
+  #     collapsed even after the coord head was added.
+  objective: "flow_matching"
 
   seed: 42
   epochs: 200
@@ -199,10 +213,13 @@ training:
       hidden_dim: 128
       dropout: 0.1
 
-    # Legacy settings for the flow-matching objective. Only used when
+    # Settings for the flow-matching objective. Only used when
     # objective == "flow_matching"; ignored in contrastive mode.
-    flow_matching: 1.0           # weight of the FM term in the legacy loss
-    contrastive_spatial: 0.1     # legacy aux contrastive on encoder outputs
+    flow_matching: 1.0           # weight of the FM (velocity MSE) term
+    # Auxiliary InfoNCE on the encoder cell embeddings — LUNA doesn't use
+    # this, and our previous experiments with it muddied the ablation. Off
+    # by default; bump to 0.1 if you want the legacy two-term loss.
+    contrastive_spatial: 0.0
     contrastive_temperature: 0.1
     contrastive_n_negatives: 64
 

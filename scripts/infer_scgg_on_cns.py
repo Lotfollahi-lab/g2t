@@ -928,6 +928,16 @@ def _plot_umap_diagnostic(
             f"got {n}. Skipping."
         )
         return
+    if embedding.shape[1] <= 2:
+        # Embedding is already 2-D (flow_matching output) — UMAP would
+        # just reshuffle it without surfacing anything new. The
+        # comparison plot is the meaningful diagnostic in this case.
+        logger.info(
+            f"  UMAP diagnostic skipped: input is already {embedding.shape[1]}-D "
+            "(flow_matching outputs 2-D coords directly; the comparison "
+            "plot is the right diagnostic)."
+        )
+        return
 
     logger.info(
         f"  UMAP: fitting on (N={n}, d={embedding.shape[1]}) embedding..."

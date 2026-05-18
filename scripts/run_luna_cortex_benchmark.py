@@ -162,6 +162,7 @@ def run_benchmark(
     k_default: Optional[int] = None,
     coord_regression: Optional[bool] = None,
     metric_embed_dim: Optional[int] = None,
+    objective: Optional[str] = None,
 ) -> Dict[str, float]:
     """Run the full LUNA Figure 3 benchmark and return the aggregated metrics.
 
@@ -205,6 +206,8 @@ def run_benchmark(
         metric_embed_dim: Output dimension of the metric head. None leaves
             the config default (8). Pass 64 to recover the pre-coord-loss
             regime; useful for direct ablation against the larger embedding.
+        objective: Override training.objective. None leaves the config
+            default ("flow_matching"). Pass "contrastive" to ablate.
 
     Returns:
         Dict of aggregated metrics; identical structure to
@@ -283,6 +286,15 @@ def run_benchmark(
             f"{int(metric_embed_dim)}"
         )
 
+    if objective is not None:
+        if objective not in ("flow_matching", "contrastive"):
+            raise ValueError(
+                f"objective must be 'flow_matching' or 'contrastive'; "
+                f"got {objective!r}"
+            )
+        cfg.setdefault("training", {})["objective"] = objective
+        logger.info(f"training.objective overridden via CLI: {objective}")
+
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -313,14 +325,32 @@ def run_benchmark(
         data["section_ids_train"], val_fraction, rng
     )
 
+    # In flow-matching mode the velocity network is conditioned on a
+    # target k (graph density), so training over a range of k values lets
+    # the model handle multiple inference scales. In contrastive mode we
+    # only need the one k that defines SupCon positives.
+    objective = cfg["training"]["objective"]
     k_default = int(cfg["graph"]["k_default"])
+    if objective == "flow_matching":
+        k_range = cfg["graph"].get("k_train_range", [5, 30])
+        k_values = list(range(int(k_range[0]), int(k_range[1]) + 1))
+        logger.info(
+            f"flow_matching objective: training over k ∈ "
+            f"[{k_values[0]}, {k_values[-1]}] ({len(k_values)} values)"
+        )
+    else:
+        k_values = [k_default]
+        logger.info(
+            f"{objective} objective: training with single k={k_default}"
+        )
+
     cc_train = data.get("cell_class_id_train")
     train_ds = SpatialTranscriptomicsDataset(
         gene_expr=data["gene_expr_train"][train_mask],
         coords=data["coords_train"][train_mask],
         section_ids=data["section_ids_train"][train_mask],
         config=cfg["data"],
-        k_values=[k_default],
+        k_values=k_values,
         is_train=True,
         cell_class=(cc_train[train_mask] if cc_train is not None else None),
     )
@@ -331,7 +361,7 @@ def run_benchmark(
             coords=data["coords_train"][val_mask],
             section_ids=data["section_ids_train"][val_mask],
             config=cfg["data"],
-            k_values=[k_default],
+            k_values=k_values,
             is_train=False,
             cell_class=(cc_train[val_mask] if cc_train is not None else None),
         )
@@ -476,9 +506,15 @@ def main():
     p.add_argument(
         "--metric_embed_dim", type=int, default=None,
         help="Override model.metric_head.embed_dim. Default (from config) "
-             "is 8 — small dimensionality forces 2-D spatial signal into "
-             "axes a linear readout can find. Pass 64 to recover the "
-             "pre-change regime for ablation.",
+             "is 32. Only used when --objective contrastive.",
+    )
+    p.add_argument(
+        "--objective", default=None, choices=("flow_matching", "contrastive"),
+        help="Override training.objective. Default (from config): "
+             "'flow_matching' — LUNA-style ODE generative model that "
+             "denoises Gaussian samples directly into 2-D coords. "
+             "Pass 'contrastive' to ablate against the SupCon + coord-head "
+             "approach. Inference automatically dispatches on objective.",
     )
     args = p.parse_args()
 
@@ -507,6 +543,7 @@ def main():
         k_default=args.k_default,
         coord_regression=(False if args.no_coord_regression else None),
         metric_embed_dim=args.metric_embed_dim,
+        objective=args.objective,
     )
 
 
