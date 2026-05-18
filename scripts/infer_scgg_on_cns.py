@@ -333,8 +333,37 @@ def _preprocess_and_align(
         if "counts" not in sub.layers:
             sub.layers["counts"] = sub.X.copy()
         if normalize:
+            # Count cells with zero total counts in the matched panel — these
+            # will become NaN after normalize_total. Track them so we can
+            # report and zero-pad them safely.
+            sums = sub.X.sum(axis=1)
+            if sp.issparse(sub.X):
+                sums = np.asarray(sums).ravel()
+            n_zero = int((sums == 0).sum())
+            if n_zero > 0:
+                logger.warning(
+                    f"  {n_zero:,} / {sub.n_obs:,} cells have zero counts in "
+                    "the matched gene panel (they don't express any of the "
+                    "trained genes). These cells will be zero-padded."
+                )
             sc.pp.normalize_total(sub, target_sum=1e4)
             sc.pp.log1p(sub)
+            # CRITICAL: replace NaN / Inf from zero-count cells BEFORE
+            # scaling. Otherwise sc.pp.scale uses np.mean / np.std which
+            # propagate NaN, and a single zero-count cell ends up turning
+            # the entire matrix into zeros after the downstream nan_to_num.
+            cleaned = sub.X
+            if sp.issparse(cleaned):
+                cleaned = cleaned.toarray()
+            n_nan_before = int(np.isnan(cleaned).sum()) + int(np.isinf(cleaned).sum())
+            cleaned = np.nan_to_num(cleaned, nan=0.0, posinf=0.0, neginf=0.0)
+            if n_nan_before > 0:
+                logger.info(
+                    f"  cleaned {n_nan_before:,} non-finite values after "
+                    "normalize_total + log1p (these came from the "
+                    f"{n_zero:,} zero-count cells)."
+                )
+            sub.X = cleaned
         if scale:
             sc.pp.scale(sub, max_value=10)
         Xsub = sub.X
