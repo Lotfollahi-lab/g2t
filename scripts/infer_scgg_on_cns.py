@@ -1215,6 +1215,35 @@ _KNOWN_SILVER_PREFIXES = (
 _CORTEX_MOUSE_GLOBS = ("mmc_mouse{m}_*.h5ad", "merfish_mouse_cortex_mouse{m}_*.h5ad")
 
 
+def _pick_representative_cortex_slice(
+    silver_dir: Path, mouse_id: int,
+) -> Optional[Path]:
+    """Pick one Mouse-{mouse_id} slice from the cortex silver dir.
+
+    Used by --include_train_section: lets us add a training-side slice to
+    the inference run as a sanity check (model fit vs generalization).
+    Strategy: prefer slice99 when present (matches LUNA's Fig 3c reference
+    section); otherwise the largest available slice on disk for the
+    requested mouse, which gives the most stable visual comparison.
+    """
+    # Prefer the slice that LUNA happens to feature, if it exists.
+    preferred = []
+    for pref in ("mmc", "merfish_mouse_cortex"):
+        preferred.extend([
+            silver_dir / f"{pref}_mouse{mouse_id}_slice99.h5ad",
+            silver_dir / f"{pref}_mouse{mouse_id}_slice119.h5ad",
+        ])
+    for p in preferred:
+        if p.exists():
+            return p
+    # Otherwise grab whatever Mouse-{mouse_id} file is on disk, sorted so
+    # the choice is deterministic across runs.
+    candidates: List[Path] = []
+    for g in _CORTEX_MOUSE_GLOBS:
+        candidates.extend(sorted(silver_dir.glob(g.format(m=mouse_id))))
+    return candidates[0] if candidates else None
+
+
 def _strip_known_prefix(stem: str) -> str:
     """Strip the silver-file prefix to recover a bare section id."""
     for pref in _KNOWN_SILVER_PREFIXES:
@@ -1353,6 +1382,7 @@ def run_inference(
     umap_diagnostic: bool = False,
     diagnostic_class_col: Optional[str] = None,
     palette: str = "luna",
+    include_train_section: bool = False,
 ) -> None:
     import anndata as ad
     import torch
@@ -1494,6 +1524,32 @@ def run_inference(
         )
 
     section_paths = _resolve_section_files(silver_path, sections)
+
+    # Optionally prepend a representative Mouse-1 (train-side) slice so
+    # the same inference run produces a clean "model fit vs generalization"
+    # comparison. Useful diagnostic: if Mouse 1 looks great but Mouse 2
+    # looks scrambled, the problem is generalization across animals; if
+    # Mouse 1 is also scrambled, the model didn't fit even the training
+    # data and the next fix belongs on the loss / capacity side.
+    if include_train_section:
+        train_pick = _pick_representative_cortex_slice(silver_path, mouse_id=1)
+        if train_pick is None:
+            logger.warning(
+                "  --include_train_section requested but no Mouse-1 silver "
+                "h5ad found under %s; skipping.", silver_path,
+            )
+        elif train_pick in section_paths:
+            logger.info(
+                f"  --include_train_section: {train_pick.name} already in "
+                "the requested set; not duplicating."
+            )
+        else:
+            section_paths = [train_pick] + section_paths
+            logger.info(
+                f"  --include_train_section: prepended {train_pick.name} "
+                "as a train-side sanity check."
+            )
+
     logger.info(f"Inference on {len(section_paths)} sections: "
                  f"{[p.name for p in section_paths]}")
 
@@ -1778,6 +1834,17 @@ def main() -> int:
              "not installed. 'tab20' forces matplotlib's tab20 directly.",
     )
     p.add_argument(
+        "--include_train_section", action="store_true",
+        help="Also run inference on one representative Mouse-1 (train-side) "
+             "slice from --silver_dir, alongside whatever --sections asks "
+             "for. Useful sanity check: if Mouse-1 looks clean but Mouse-2 "
+             "is scrambled, the problem is cross-animal generalization; "
+             "if Mouse-1 is also scrambled, the model didn't fit the "
+             "training data and the next fix belongs on the loss / "
+             "capacity side. Prefers slice99 / slice119 (LUNA-paper "
+             "references), falls back to whatever Mouse-1 file is on disk.",
+    )
+    p.add_argument(
         "--no_align_plot", action="store_true",
         help="Don't similarity-align predicted coords to GT before plotting. "
              "The model's metric embedding lives in an arbitrary frame "
@@ -1846,6 +1913,7 @@ def main() -> int:
         umap_diagnostic=args.umap_diagnostic,
         diagnostic_class_col=args.diagnostic_class_col,
         palette=args.palette,
+        include_train_section=args.include_train_section,
     )
     return 0
 
