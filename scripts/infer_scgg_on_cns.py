@@ -299,16 +299,31 @@ def _preprocess_and_align(
         f"({coverage:.1%}), {diag['n_query_genes']} query genes considered"
     )
     if diag["n_matched"] == 0:
-        logger.error(
-            "  no genes matched between the query and the trained panel. "
-            "Inference will use a zero matrix and is meaningless."
+        msg = (
+            "No genes matched between the query and the trained panel "
+            "(coverage 0%). Inference cannot proceed — the model would "
+            "produce a single constant output for every cell.\n"
+            f"  Query gene-name source: {name_source}\n"
+            f"  Matching mode attempted: {diag['matching_mode']}\n"
+            f"  First 5 query names: {list(query_var_names[:5])}\n"
+            f"  First 5 target Ensembl: {target_ensembl[:5]}\n"
+            f"  First 5 target symbols: {(target_symbols or [])[:5]}\n"
+            "Likely fixes:\n"
+            "  1. Make sure you have the latest scripts/infer_scgg_on_cns.py\n"
+            "     (pull from git and re-run).\n"
+            "  2. If the checkpoint has no gene_symbols (older training), "
+            "pass --gene_panel_h5ad pointing at any ABC silver h5ad.\n"
+            "  3. If the query stores symbols in a non-standard var column, "
+            "pass --query_gene_col <colname>."
         )
-        if name_source.startswith("var_names_integer"):
-            logger.error(
-                "    the query var.index looks like integer positions, not "
-                "gene names. Set the gene-name column explicitly with "
-                "--query_gene_col, e.g. `--query_gene_col Gene`."
-            )
+        raise RuntimeError(msg)
+    if coverage < 0.10:
+        logger.warning(
+            f"  VERY LOW coverage ({coverage:.1%}). Predictions will be "
+            "dominated by the zero-padded missing genes; expect degraded "
+            "results. Investigate the gene-name mismatch before trusting "
+            "this run."
+        )
 
     # Build a subset AnnData of the matched query genes, in the order they
     # appear in the query (so scanpy preprocessing operates on real data).
@@ -629,11 +644,42 @@ def run_inference(
             adata, gene_names, gene_symbols,
             normalize=normalize, scale=scale,
         )
+        # Defensive: catch all-zero inputs early.
+        in_max = float(np.abs(X_aligned).max()) if X_aligned.size else 0.0
+        in_std = float(X_aligned.std()) if X_aligned.size else 0.0
+        logger.info(
+            f"  aligned input stats: shape={X_aligned.shape}, "
+            f"max|x|={in_max:.4f}, std={in_std:.4f}"
+        )
+        if in_max == 0.0:
+            raise RuntimeError(
+                "Aligned input matrix is all zeros — inference cannot run. "
+                "Check the gene-panel matching log above."
+            )
+
         coords_pred = _predict_2d(model, X_aligned, projection, dev)
         elapsed = time.time() - t0
         logger.info(
             f"  inference done in {elapsed:.1f}s; pred shape={coords_pred.shape}"
         )
+        # Detect a fully-collapsed prediction (every cell at the same point)
+        # and warn loudly — usually means OOD shift was too large or the
+        # model didn't converge well.
+        coord_std = coords_pred.std(axis=0)
+        coord_range = coords_pred.max(axis=0) - coords_pred.min(axis=0)
+        logger.info(
+            f"  pred stats: std={coord_std.tolist()}  range={coord_range.tolist()}"
+        )
+        if float(coord_std.max()) < 1e-3:
+            logger.warning(
+                "  PREDICTED COORDS ARE ESSENTIALLY CONSTANT across cells. "
+                "The model has collapsed to a single point in metric space. "
+                "Common causes: (a) the input matrix is mostly zero-padded "
+                "(check coverage above), (b) the checkpoint did not converge, "
+                "(c) the ABC model never saw input distributions like this. "
+                "If coverage is high but you still see this, the model needs "
+                "more training or a domain-adaptation step (e.g. Harmony)."
+            )
 
         adata.obsm["spatial_pred"] = coords_pred.astype(np.float32)
         out_h5ad = out_dir / f"{well_id}_predicted.h5ad"
