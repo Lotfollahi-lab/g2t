@@ -703,11 +703,50 @@ def _predict_2d(
 # ---------------------------------------------------------------------------
 
 
+def _umeyama_align(
+    src: np.ndarray, dst: np.ndarray, allow_reflection: bool = True,
+) -> np.ndarray:
+    """Best similarity transform (rotate + scale + translate, optional
+    reflection) mapping `src` onto `dst`. Returns the transformed src.
+
+    Implements Umeyama 1991. NaN/Inf rows are filtered out by a joint mask
+    to preserve row correspondence, then the same transform is applied to
+    every row of the original `src` (NaN rows pass through unchanged).
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    finite = np.isfinite(src).all(axis=1) & np.isfinite(dst).all(axis=1)
+    if finite.sum() < 3:
+        return src.astype(np.float32)
+
+    a = src[finite]
+    b = dst[finite]
+    mu_a, mu_b = a.mean(axis=0), b.mean(axis=0)
+    ac, bc = a - mu_a, b - mu_b
+    var_a = (ac ** 2).sum() / a.shape[0]
+    if var_a < 1e-12:
+        return src.astype(np.float32)
+
+    cov = (bc.T @ ac) / a.shape[0]
+    U, S, Vt = np.linalg.svd(cov)
+    d = np.eye(cov.shape[0])
+    if not allow_reflection and np.linalg.det(U @ Vt) < 0:
+        d[-1, -1] = -1
+    R = U @ d @ Vt
+    s = (S * np.diag(d)).sum() / var_a
+    t = mu_b - s * R @ mu_a
+
+    out = (s * (src @ R.T)) + t
+    return out.astype(np.float32)
+
+
 def _plot_comparison(
     adata,
     color_col: str,
     out_svg: Path,
     title_prefix: str = "",
+    spot_size: Optional[float] = None,
+    align_for_plot: bool = True,
 ) -> None:
     """Side-by-side scatter: GT (obsm['spatial']) vs predicted (obsm['spatial_pred']).
 
@@ -727,7 +766,27 @@ def _plot_comparison(
 
     has_gt = "spatial" in adata.obsm and adata.obsm["spatial"].shape[1] >= 2
     has_pred = "spatial_pred" in adata.obsm
-    spot_size = max(5.0, min(20.0, 600.0 / np.sqrt(max(adata.n_obs, 1))))
+
+    # Similarity-align predicted coords to GT for visualization. The
+    # contrastive embedding lives in an arbitrary frame (PCA picks max-
+    # variance axes), so without this the plot is rotated / flipped /
+    # rescaled relative to GT, even when the per-cell metric is correct.
+    # We only modify the plot view, not the saved obsm['spatial_pred'].
+    pred_plot_key = "spatial_pred"
+    if align_for_plot and has_gt and has_pred:
+        aligned = _umeyama_align(
+            adata.obsm["spatial_pred"][:, :2],
+            adata.obsm["spatial"][:, :2],
+            allow_reflection=True,
+        )
+        adata.obsm["spatial_pred_aligned"] = aligned
+        pred_plot_key = "spatial_pred_aligned"
+
+    # Default spot size: scale ~ figure_area / sqrt(n_cells), with a higher
+    # floor / ceiling than before so individual cells are still visible at
+    # 5k+ cells per slice.
+    if spot_size is None:
+        spot_size = max(10.0, min(60.0, 2400.0 / np.sqrt(max(adata.n_obs, 1))))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
 
@@ -747,9 +806,14 @@ def _plot_comparison(
         axes[0].set_axis_off()
 
     if has_pred:
+        pred_title = (
+            f"{title_prefix}scGG prediction (aligned)"
+            if pred_plot_key == "spatial_pred_aligned"
+            else f"{title_prefix}scGG prediction"
+        )
         sc.pl.embedding(
-            adata, basis="spatial_pred", ax=axes[1],
-            title=f"{title_prefix}scGG prediction", **common_kw,
+            adata, basis=pred_plot_key, ax=axes[1],
+            title=pred_title, **common_kw,
         )
     else:
         axes[1].set_title(f"{title_prefix}scGG prediction (none)")
@@ -928,6 +992,8 @@ def run_inference(
     mygene_cache_path: Optional[str] = None,
     species: str = "mouse",
     no_mygene: bool = False,
+    spot_size: Optional[float] = None,
+    no_align_plot: bool = False,
 ) -> None:
     import anndata as ad
     import torch
@@ -1145,7 +1211,12 @@ def run_inference(
 
         if color_col_eff is not None:
             out_svg = out_dir / f"{section_id}_comparison.svg"
-            _plot_comparison(adata, color_col_eff, out_svg, title_prefix=f"[{section_id}] ")
+            _plot_comparison(
+                adata, color_col_eff, out_svg,
+                title_prefix=f"[{section_id}] ",
+                spot_size=spot_size,
+                align_for_plot=not no_align_plot,
+            )
         else:
             logger.warning("  no usable color column; skipping plot")
 
@@ -1256,6 +1327,20 @@ def main() -> int:
         help="Disable the mygene fallback. Only direct (target-panel) "
              "symbol matching will be attempted.",
     )
+    p.add_argument(
+        "--spot_size", type=float, default=None,
+        help="Marker size in the comparison plot. Default auto-scales with "
+             "cell count (~10-60). Try 30-100 for sparser slices, 5-15 for "
+             "very dense slices.",
+    )
+    p.add_argument(
+        "--no_align_plot", action="store_true",
+        help="Don't similarity-align predicted coords to GT before plotting. "
+             "The model's metric embedding lives in an arbitrary frame "
+             "(rotation/scale/reflection are free), so by default we run "
+             "a Umeyama alignment for visualization only — the raw "
+             "obsm['spatial_pred'] is always preserved unchanged.",
+    )
     args = p.parse_args()
 
     # Pick a sensible default for --sections depending on the dataset.
@@ -1284,6 +1369,8 @@ def main() -> int:
         mygene_cache_path=args.mygene_cache,
         species=args.species,
         no_mygene=args.no_mygene,
+        spot_size=args.spot_size,
+        no_align_plot=args.no_align_plot,
     )
     return 0
 
