@@ -239,6 +239,17 @@ def _load_concat(
         f"  final: cells={X.shape[0]:,} genes={X.shape[1]:,} sections={len(label_to_id)}"
     )
 
+    # ABC AnnData uses Ensembl IDs as var_names and stores gene symbols in
+    # var['gene_symbol']. We surface both so the downstream inference script
+    # can harmonize a scRNA-seq query that uses gene symbols.
+    gene_symbol_col = next(
+        (c for c in ("gene_symbol", "gene_name", "symbol") if c in big.var.columns),
+        None,
+    )
+    gene_symbols = (
+        big.var[gene_symbol_col].astype(str).tolist() if gene_symbol_col else None
+    )
+
     return {
         "gene_expr": X,
         "coords": coords,
@@ -247,6 +258,7 @@ def _load_concat(
         "cell_class_id": class_id,
         "section_map": section_map,
         "gene_names": list(big.var_names),
+        "gene_symbols": gene_symbols,
         "class_names": class_names,
         "n_classes": len(class_names) if class_names else 0,
     }

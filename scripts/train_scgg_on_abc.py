@@ -246,8 +246,12 @@ def run_training(
             # The exact gene order the model was trained on. Critical for
             # downstream inference on data with a different gene panel
             # (e.g. scRNA-seq): the inference script must reorder/pad the
-            # query expression matrix to match this order.
+            # query expression matrix to match this order. ABC uses Ensembl
+            # gene IDs in var_names; gene_symbols are the human-readable
+            # aliases, persisted so inference can map symbol -> Ensembl
+            # when a scRNA-seq h5ad uses the symbol namespace.
             "gene_names": list(data.get("gene_names", [])),
+            "gene_symbols": list(data.get("gene_symbols") or []),
         }, f, indent=2, default=str)
 
     t_start = time.time()

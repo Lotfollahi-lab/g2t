@@ -69,7 +69,7 @@ logger = logging.getLogger("scgg.infer_cns")
 
 
 def _load_checkpoint(checkpoint_path: Path, device: str):
-    """Returns (model, cfg, gene_names, data_summary)."""
+    """Returns (model, cfg, gene_names, gene_symbols, data_summary)."""
     import torch
     from scgg.model.scgg import ScGG
 
@@ -80,12 +80,18 @@ def _load_checkpoint(checkpoint_path: Path, device: str):
     summary_path = checkpoint_path.parent.parent / "data_summary.json"
     data_summary = None
     gene_names: List[str] = []
+    gene_symbols: List[str] = []
     if summary_path.exists():
         with open(summary_path) as f:
             data_summary = json.load(f)
         gene_names = list(data_summary.get("gene_names") or [])
+        gene_symbols = list(data_summary.get("gene_symbols") or [])
         if gene_names:
-            logger.info(f"  loaded gene panel from {summary_path}: {len(gene_names)} genes")
+            logger.info(
+                f"  loaded gene panel from {summary_path}: "
+                f"{len(gene_names)} Ensembl IDs"
+                + (f" + {len(gene_symbols)} symbols" if gene_symbols else " (no symbols)")
+            )
         else:
             logger.warning(
                 f"  {summary_path} exists but does not contain gene_names; "
@@ -122,13 +128,20 @@ def _load_checkpoint(checkpoint_path: Path, device: str):
     model = model.to(device)
     model.eval()
 
-    return model, cfg, gene_names, data_summary
+    return model, cfg, gene_names, gene_symbols, data_summary
 
 
-def _gene_panel_from_h5ad(path: Path) -> List[str]:
+def _gene_panel_from_h5ad(path: Path) -> Tuple[List[str], List[str]]:
+    """Return (var_names, gene_symbols) from an ABC silver h5ad."""
     import anndata as ad
     a = ad.read_h5ad(path)
-    return list(a.var_names)
+    names = list(a.var_names)
+    symbols = []
+    for col in ("gene_symbol", "gene_name", "symbol"):
+        if col in a.var.columns:
+            symbols = a.var[col].astype(str).tolist()
+            break
+    return names, symbols
 
 
 # ---------------------------------------------------------------------------
@@ -136,66 +149,145 @@ def _gene_panel_from_h5ad(path: Path) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _looks_like_ensembl(names: List[str]) -> bool:
+    """Heuristic: do these strings look like mouse/human Ensembl gene IDs?"""
+    if not names:
+        return False
+    return sum(n.startswith(("ENSMUSG", "ENSG")) for n in names[:100]) > 50
+
+
+def _harmonize_query_genes(
+    adata_var_names: List[str],
+    target_ensembl: List[str],
+    target_symbols: List[str],
+) -> Tuple[List[Optional[str]], Dict[str, int]]:
+    """Translate adata.var_names into the target Ensembl namespace.
+
+    Returns:
+      mapped:     list[Optional[str]] of length = len(adata_var_names).
+                  Each entry is the matching Ensembl ID (string in
+                  target_ensembl) or None if no match.
+      diagnostics: counters describing the matching attempt.
+    """
+    target_set = set(target_ensembl)
+
+    query_looks_ensembl = _looks_like_ensembl(adata_var_names)
+    if query_looks_ensembl:
+        # Direct match on Ensembl IDs (case-sensitive — Ensembl IDs are
+        # never lowercased in practice).
+        mapped = [n if n in target_set else None for n in adata_var_names]
+        n_matched = sum(m is not None for m in mapped)
+        return mapped, {
+            "matching_mode": "ensembl_direct",
+            "n_query_genes": len(adata_var_names),
+            "n_matched": n_matched,
+        }
+
+    # The query uses symbols. We need a symbol -> Ensembl lookup. Build it
+    # from the target gene panel; case-insensitive matching because the
+    # scRNA-seq atlas reports symbols in UPPERCASE while the ABC panel uses
+    # mouse capitalization (Cbln2 vs CBLN2).
+    if not target_symbols or len(target_symbols) != len(target_ensembl):
+        return [None] * len(adata_var_names), {
+            "matching_mode": "symbol_unavailable",
+            "n_query_genes": len(adata_var_names),
+            "n_matched": 0,
+            "note": (
+                "Query gene namespace looks like gene symbols but the "
+                "checkpoint did not save gene_symbols. Re-train with the "
+                "updated training script, or pass --gene_panel_h5ad."
+            ),
+        }
+
+    sym_to_ens: Dict[str, str] = {}
+    n_dupe = 0
+    for sym, ens in zip(target_symbols, target_ensembl):
+        k = str(sym).strip().lower()
+        if not k or k == "nan":
+            continue
+        if k in sym_to_ens and sym_to_ens[k] != ens:
+            n_dupe += 1
+        sym_to_ens[k] = ens  # last one wins; rare collisions
+
+    mapped: List[Optional[str]] = []
+    for name in adata_var_names:
+        k = str(name).strip().lower()
+        ens = sym_to_ens.get(k)
+        mapped.append(ens if (ens is not None and ens in target_set) else None)
+    n_matched = sum(m is not None for m in mapped)
+    return mapped, {
+        "matching_mode": "symbol_to_ensembl_case_insensitive",
+        "n_query_genes": len(adata_var_names),
+        "n_matched": n_matched,
+        "n_duplicate_symbols": n_dupe,
+    }
+
+
 def _preprocess_and_align(
     adata,
-    target_gene_names: List[str],
+    target_ensembl: List[str],
+    target_symbols: List[str],
     normalize: bool,
     scale: bool,
 ) -> Tuple[np.ndarray, dict]:
-    """Bring the query scRNA expression into the trained ABC gene-panel order.
+    """Bring the query expression into the trained ABC gene-panel order.
 
-    1. Compute the intersection of ABC genes with adata.var_names.
-    2. Build an (n_cells, len(target_gene_names)) float32 matrix: cols for
-       intersected genes copy from adata; cols for missing genes stay 0.
-    3. Apply the same scanpy preprocessing the trainer used
-       (normalize_total + log1p + scale, configurable).
+    Handles the case where the query (scRNA-seq) uses gene symbols while
+    the trained model uses Ensembl IDs. Genes that don't map are filled
+    with zeros.
     """
-    import anndata as ad
     import scanpy as sc
     import scipy.sparse as sp
 
-    # ---- 1. gene-set alignment ----------------------------------------
-    target_set = set(target_gene_names)
-    present_mask = adata.var_names.isin(target_set)
-    n_present = int(present_mask.sum())
-    n_missing = len(target_gene_names) - n_present
-    coverage = n_present / max(1, len(target_gene_names))
+    query_var_names = list(adata.var_names)
+    mapped, diag = _harmonize_query_genes(query_var_names, target_ensembl, target_symbols)
+    coverage = diag["n_matched"] / max(1, len(target_ensembl))
     logger.info(
-        f"  gene panel coverage: {n_present}/{len(target_gene_names)} "
-        f"({coverage:.1%})  {n_missing} ABC genes missing from this scRNA dataset"
+        f"  gene panel match: mode={diag['matching_mode']}, "
+        f"{diag['n_matched']}/{len(target_ensembl)} target genes mapped "
+        f"({coverage:.1%}), {diag['n_query_genes']} query genes considered"
     )
+    if diag["n_matched"] == 0:
+        logger.error(
+            "  no genes matched between the query and the trained panel. "
+            "Inference will use a zero matrix and is meaningless. Check "
+            "the gene namespace of your scRNA-seq h5ad."
+        )
 
-    # Subset adata to the intersection (preserves preprocessing-friendly shape).
-    common = [g for g in target_gene_names if g in adata.var_names]
-    sub = adata[:, common].copy() if common else adata.copy()
-
-    # Counts layer needed for HVG / future-proofing; here we just preserve X.
-    if "counts" not in sub.layers:
-        sub.layers["counts"] = sub.X.copy()
-
-    if normalize:
-        sc.pp.normalize_total(sub, target_sum=1e4)
-        sc.pp.log1p(sub)
-    if scale:
-        sc.pp.scale(sub, max_value=10)
-
-    # ---- 2. Reorder + pad into the full ABC order ---------------------
-    n_cells = sub.n_obs
-    out = np.zeros((n_cells, len(target_gene_names)), dtype=np.float32)
-    if common:
-        # Map gene -> column index in 'out'
-        target_idx = {g: i for i, g in enumerate(target_gene_names)}
+    # Build a subset AnnData of the matched query genes, in the order they
+    # appear in the query (so scanpy preprocessing operates on real data).
+    matched_idx = [i for i, m in enumerate(mapped) if m is not None]
+    if matched_idx:
+        sub = adata[:, matched_idx].copy()
+        if "counts" not in sub.layers:
+            sub.layers["counts"] = sub.X.copy()
+        if normalize:
+            sc.pp.normalize_total(sub, target_sum=1e4)
+            sc.pp.log1p(sub)
+        if scale:
+            sc.pp.scale(sub, max_value=10)
         Xsub = sub.X
         if sp.issparse(Xsub):
             Xsub = Xsub.toarray()
-        for col_in_sub, gene in enumerate(sub.var_names):
-            j = target_idx[gene]
-            out[:, j] = np.asarray(Xsub[:, col_in_sub], dtype=np.float32)
+        Xsub = np.asarray(Xsub, dtype=np.float32)
+    else:
+        Xsub = np.zeros((adata.n_obs, 0), dtype=np.float32)
+
+    # Scatter the matched-gene expression into the full ABC-ordered matrix.
+    target_idx = {ens: i for i, ens in enumerate(target_ensembl)}
+    out = np.zeros((adata.n_obs, len(target_ensembl)), dtype=np.float32)
+    for sub_col, query_col in enumerate(matched_idx):
+        ens = mapped[query_col]
+        j = target_idx[ens]
+        out[:, j] = Xsub[:, sub_col]
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
     return out, {
-        "n_present": n_present,
-        "n_missing": n_missing,
+        "n_present": diag["n_matched"],
+        "n_missing": len(target_ensembl) - diag["n_matched"],
         "coverage": coverage,
+        "matching_mode": diag["matching_mode"],
+        "n_query_genes": diag["n_query_genes"],
     }
 
 
@@ -238,48 +330,87 @@ def _plot_comparison(
 ) -> None:
     """Side-by-side scatter: GT (obsm['spatial']) vs predicted (obsm['spatial_pred']).
 
-    Uses sc.pl.embedding which is what sc.pl.spatial dispatches to for
-    non-image spatial scatter. SVG fonts are kept as <text> elements so
-    they're editable in Illustrator / Inkscape.
+    Both panels share a single legend placed below the figure, so each
+    panel gets the full plotting width. SVG fonts are kept as <text>
+    elements (editable in Illustrator / Inkscape).
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
     import scanpy as sc
 
-    # Keep SVG text editable (not converted to paths).
     matplotlib.rcParams["svg.fonttype"] = "none"
     matplotlib.rcParams["pdf.fonttype"] = 42
     matplotlib.rcParams["ps.fonttype"] = 42
 
-    # Both panels must use the same color palette / category ordering. The
-    # easiest way is to call sc.pl on both with the same color arg; scanpy
-    # caches the palette in adata.uns[f"{color}_colors"] after the first
-    # call.
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     has_gt = "spatial" in adata.obsm and adata.obsm["spatial"].shape[1] >= 2
     has_pred = "spatial_pred" in adata.obsm
-
-    # Common kwargs
     spot_size = max(5.0, min(20.0, 600.0 / np.sqrt(max(adata.n_obs, 1))))
-    common_kw = dict(
-        color=color_col, show=False, size=spot_size, legend_loc="right margin",
-        frameon=True,
-    )
 
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+
+    # Plot WITHOUT scanpy's per-panel legend so we can attach one shared
+    # legend below the figure.
+    common_kw = dict(
+        color=color_col, show=False, size=spot_size,
+        legend_loc=None, frameon=True,
+    )
     if has_gt:
-        sc.pl.embedding(adata, basis="spatial", ax=axes[0], title=f"{title_prefix}Ground truth", **common_kw)
+        sc.pl.embedding(
+            adata, basis="spatial", ax=axes[0],
+            title=f"{title_prefix}Ground truth", **common_kw,
+        )
     else:
         axes[0].set_title(f"{title_prefix}Ground truth (none)")
         axes[0].set_axis_off()
 
     if has_pred:
-        sc.pl.embedding(adata, basis="spatial_pred", ax=axes[1], title=f"{title_prefix}scGG prediction", **common_kw)
+        sc.pl.embedding(
+            adata, basis="spatial_pred", ax=axes[1],
+            title=f"{title_prefix}scGG prediction", **common_kw,
+        )
     else:
         axes[1].set_title(f"{title_prefix}scGG prediction (none)")
         axes[1].set_axis_off()
 
-    fig.tight_layout()
+    # Build a shared legend at the bottom. scanpy will have populated
+    # adata.uns[f"{color}_colors"] during the first sc.pl call; if the
+    # column is non-categorical (numeric), skip the legend.
+    color_series = adata.obs[color_col]
+    is_categorical = (
+        color_series.dtype.name == "category"
+        or color_series.dtype == object
+    )
+    if is_categorical:
+        cats = color_series.astype("category").cat.categories.tolist()
+        colors_key = f"{color_col}_colors"
+        palette = adata.uns.get(colors_key)
+        # Fall back to a tab20 cycle if scanpy didn't set the palette.
+        if palette is None or len(palette) < len(cats):
+            cmap = plt.get_cmap("tab20", max(len(cats), 1))
+            palette = [cmap(i) for i in range(len(cats))]
+        patches = [Patch(facecolor=c, label=str(cat)) for c, cat in zip(palette, cats)]
+        # Pick a column count that keeps the legend readable.
+        # Aim for ~4 rows max.
+        n_cats = len(cats)
+        ncol = min(max(1, (n_cats + 3) // 4), 6)
+        fig.legend(
+            handles=patches,
+            labels=[str(c) for c in cats],
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.0),
+            ncol=ncol,
+            frameon=False,
+            fontsize="small",
+        )
+        # Leave room at the bottom for the legend (number of rows-dependent).
+        n_rows = (n_cats + ncol - 1) // ncol
+        bottom = min(0.30, 0.05 + 0.04 * n_rows)
+        fig.tight_layout(rect=(0, bottom, 1, 1))
+    else:
+        fig.tight_layout()
+
     out_svg.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_svg, format="svg", bbox_inches="tight")
     plt.close(fig)
@@ -348,17 +479,24 @@ def run_inference(
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Loading checkpoint: {ckpt_path}")
     logger.info(f"Device: {dev}")
-    model, cfg, gene_names, data_summary = _load_checkpoint(ckpt_path, dev)
+    model, cfg, gene_names, gene_symbols, data_summary = _load_checkpoint(ckpt_path, dev)
     logger.info(
         f"Model: objective={model.objective}, "
         f"params={sum(p.numel() for p in model.parameters()):,}"
     )
 
-    if not gene_names and gene_panel_h5ad:
-        gene_names = _gene_panel_from_h5ad(Path(gene_panel_h5ad))
+    if (not gene_names or not gene_symbols) and gene_panel_h5ad:
+        # Always re-load both names + symbols from the fallback h5ad so the
+        # inference script has them even if the older training run only
+        # saved gene_names.
+        gn, gs = _gene_panel_from_h5ad(Path(gene_panel_h5ad))
+        if not gene_names:
+            gene_names = gn
+        if not gene_symbols and gs:
+            gene_symbols = gs
         logger.info(
-            f"  loaded gene panel from --gene_panel_h5ad: "
-            f"{len(gene_names)} genes from {gene_panel_h5ad}"
+            f"  --gene_panel_h5ad supplied: {len(gn)} genes, "
+            f"{len(gs)} symbols from {gene_panel_h5ad}"
         )
     if not gene_names:
         raise RuntimeError(
@@ -366,6 +504,11 @@ def run_inference(
             "updated train_scgg_on_abc.py (saves gene_names), or pass "
             "--gene_panel_h5ad pointing at any silver h5ad from the ABC "
             "training set."
+        )
+    if not gene_symbols:
+        logger.warning(
+            "  no gene_symbols available — query namespace can only be "
+            "matched if it already uses the trained Ensembl IDs."
         )
 
     # Preprocessing flags: prefer values stored in data_summary, then config,
@@ -409,7 +552,8 @@ def run_inference(
 
         t0 = time.time()
         X_aligned, panel_stats = _preprocess_and_align(
-            adata, gene_names, normalize=normalize, scale=scale,
+            adata, gene_names, gene_symbols,
+            normalize=normalize, scale=scale,
         )
         coords_pred = _predict_2d(model, X_aligned, projection, dev)
         elapsed = time.time() - t0
@@ -475,7 +619,9 @@ def main() -> int:
     )
     p.add_argument(
         "--output_dir",
-        default="./scgg-reproducibility/artifacts/cns_luna",
+        default="../scgg-reproducibility/artifacts/cns_luna",
+        help="Where to write predicted h5ads and comparison SVGs. Default "
+             "points at the sibling scgg-reproducibility repository.",
     )
     p.add_argument("--color", default="cell_class",
                    help="adata.obs column to color plots by (default: cell_class).")
