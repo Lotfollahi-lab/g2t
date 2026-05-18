@@ -33,8 +33,14 @@ Inputs
                  when the target panel is Ensembl-namespaced).
   --species      mygene species name (default: mouse).
 
-Outputs (under --output_dir, default /nfs/team361/sb75/scgg-reproducibility/artifacts/<silver_dir_name>/inference/)
------------------------------------------------------------------------------------------------------------------
+Outputs (under --output_dir, default /nfs/team361/sb75/scgg-reproducibility/artifacts/<silver_dir_name>/inference/<model_timestamp>/)
+-----------------------------------------------------------------------------------------------------------------------------------
+
+`<model_timestamp>` is extracted from the checkpoint path (the YYYYMMDD_HHMMSS
+directory under .../model/), so inference results stay pinned to the
+training run that produced them. If the checkpoint isn't under that
+canonical layout, a fresh inference timestamp is used and a warning
+is logged.
   <section>_predicted.h5ad     Copy of the input h5ad with
                                obsm['spatial_pred'] populated.
   <section>_comparison.svg     Side-by-side scatter: ground truth (left)
@@ -74,8 +80,10 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -86,10 +94,29 @@ logger = logging.getLogger("scgg.infer_cns")
 
 
 # Default root for inference + model artifacts on the cluster (sb75 area).
-# Inference outputs land in {ARTIFACTS_ROOT}/{silver_dir.name}/inference/;
-# training outputs in {ARTIFACTS_ROOT}/{silver_dir.name}/model/ (see
-# scripts/run_luna_cortex_benchmark.py).
+# Training writes to {ARTIFACTS_ROOT}/{dataset}/model/{YYYYMMDD_HHMMSS}/...;
+# inference mirrors that layout under
+# {ARTIFACTS_ROOT}/{dataset}/inference/{model_timestamp}/... so plots and
+# predictions stay pinned to the model that produced them.
 _ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
+
+# Matches a YYYYMMDD_HHMMSS run-timestamp directory anywhere in a path.
+_RUN_TS_RE = re.compile(r"^\d{8}_\d{6}$")
+
+
+def _model_timestamp_from_checkpoint(ckpt_path: Path) -> Optional[str]:
+    """Extract the training-run timestamp from a checkpoint path.
+
+    Recognises the canonical layout:
+      .../model/<YYYYMMDD_HHMMSS>/checkpoints/best_model.pt
+    by walking up parents and returning the first segment that matches
+    the timestamp pattern. Returns None for checkpoints saved under a
+    legacy layout without a timestamp directory.
+    """
+    for parent in ckpt_path.resolve().parents:
+        if _RUN_TS_RE.match(parent.name):
+            return parent.name
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -914,7 +941,7 @@ def _plot_umap_diagnostic(
     emb_2d = reducer.fit_transform(embedding)
 
     if spot_size is None:
-        spot_size = max(8.0, min(40.0, 1800.0 / np.sqrt(max(n, 1))))
+        spot_size = max(16.0, min(80.0, 4000.0 / np.sqrt(max(n, 1))))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
 
@@ -923,8 +950,8 @@ def _plot_umap_diagnostic(
     if cell_class is not None:
         cell_class = np.asarray(cell_class)
         cats = sorted({str(c) for c in cell_class})
-        cmap = plt.get_cmap("tab20", max(len(cats), 1))
-        cat_to_color = {c: cmap(i) for i, c in enumerate(cats)}
+        palette_colors = _palette_for(cats, scheme="luna")
+        cat_to_color = {c: palette_colors[i] for i, c in enumerate(cats)}
         colors = [cat_to_color[str(c)] for c in cell_class]
         ax.scatter(emb_2d[:, 0], emb_2d[:, 1], c=colors, s=spot_size, linewidths=0)
         ax.set_title(f"{title_prefix}UMAP of raw embedding\n(colored by cell class)")
@@ -1011,6 +1038,33 @@ def _umeyama_align(
     return out.astype(np.float32)
 
 
+def _palette_for(cats: List[str], scheme: str = "luna") -> List:
+    """Return a list of RGBA colors for the given categories.
+
+    Schemes:
+      * 'luna'   : colorcet.glasbey (the saturated palette LUNA uses in
+                   their Figure 3 legend). Falls back to tab20 if
+                   colorcet is not installed.
+      * 'tab20'  : matplotlib tab20.
+    """
+    import matplotlib.pyplot as plt
+    n = max(len(cats), 1)
+    if scheme == "luna":
+        try:
+            import colorcet as cc  # type: ignore
+            # cc.glasbey is a 256-color list of hex strings, designed for
+            # categorical labels — matches LUNA's notebook usage.
+            base = cc.glasbey[:n]
+            return list(base)
+        except ImportError:
+            logger.info(
+                "  colorcet not installed; falling back to tab20 palette. "
+                "Install with: pip install colorcet"
+            )
+    cmap = plt.get_cmap("tab20", n)
+    return [cmap(i) for i in range(n)]
+
+
 def _plot_comparison(
     adata,
     color_col: str,
@@ -1018,6 +1072,7 @@ def _plot_comparison(
     title_prefix: str = "",
     spot_size: Optional[float] = None,
     align_for_plot: bool = True,
+    palette: str = "luna",
 ) -> None:
     """Side-by-side scatter: GT (obsm['spatial']) vs predicted (obsm['spatial_pred']).
 
@@ -1053,11 +1108,28 @@ def _plot_comparison(
         adata.obsm["spatial_pred_aligned"] = aligned
         pred_plot_key = "spatial_pred_aligned"
 
-    # Default spot size: scale ~ figure_area / sqrt(n_cells), with a higher
-    # floor / ceiling than before so individual cells are still visible at
-    # 5k+ cells per slice.
+    # Default spot size: scale ~ figure_area / sqrt(n_cells). Higher floor
+    # and ceiling than before so cells are clearly visible at 5k+ per slice
+    # (LUNA Figure 3 spots are tiny because the figure itself is huge; we
+    # want similarly readable spots at notebook / paper sizes).
     if spot_size is None:
-        spot_size = max(10.0, min(60.0, 2400.0 / np.sqrt(max(adata.n_obs, 1))))
+        spot_size = max(20.0, min(120.0, 5000.0 / np.sqrt(max(adata.n_obs, 1))))
+
+    # Apply the chosen palette BEFORE plotting so scanpy uses it. We set
+    # adata.uns[f"{color_col}_colors"] explicitly — scanpy honors that
+    # over its tab20 default.
+    palette_scheme = palette
+    is_categorical = (
+        adata.obs[color_col].dtype.name == "category"
+        or adata.obs[color_col].dtype == object
+    )
+    palette_colors: Optional[List] = None
+    if is_categorical:
+        # Force category dtype so scanpy / matplotlib see consistent order.
+        adata.obs[color_col] = adata.obs[color_col].astype("category")
+        cats_pre = adata.obs[color_col].cat.categories.tolist()
+        palette_colors = _palette_for(cats_pre, scheme=palette_scheme)
+        adata.uns[f"{color_col}_colors"] = list(palette_colors)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
 
@@ -1090,23 +1162,15 @@ def _plot_comparison(
         axes[1].set_title(f"{title_prefix}scGG prediction (none)")
         axes[1].set_axis_off()
 
-    # Build a shared legend at the bottom. scanpy will have populated
-    # adata.uns[f"{color}_colors"] during the first sc.pl call; if the
-    # column is non-categorical (numeric), skip the legend.
-    color_series = adata.obs[color_col]
-    is_categorical = (
-        color_series.dtype.name == "category"
-        or color_series.dtype == object
-    )
+    # Build a shared legend at the bottom from the palette we just set.
     if is_categorical:
-        cats = color_series.astype("category").cat.categories.tolist()
-        colors_key = f"{color_col}_colors"
-        palette = adata.uns.get(colors_key)
-        # Fall back to a tab20 cycle if scanpy didn't set the palette.
-        if palette is None or len(palette) < len(cats):
-            cmap = plt.get_cmap("tab20", max(len(cats), 1))
-            palette = [cmap(i) for i in range(len(cats))]
-        patches = [Patch(facecolor=c, label=str(cat)) for c, cat in zip(palette, cats)]
+        cats = adata.obs[color_col].cat.categories.tolist()
+        if palette_colors is None or len(palette_colors) < len(cats):
+            palette_colors = _palette_for(cats, scheme=palette_scheme)
+        patches = [
+            Patch(facecolor=c, label=str(cat))
+            for c, cat in zip(palette_colors, cats)
+        ]
         # Pick a column count that keeps the legend readable.
         # Aim for ~4 rows max.
         n_cats = len(cats)
@@ -1207,6 +1271,14 @@ def _resolve_section_files(silver_dir: Path, sections_arg: List[str]) -> List[Pa
             )
         return files
 
+    if sections_arg == ["paper"]:
+        # The exact slices LUNA visualizes in Figure 3 of the paper
+        # (mouse2_slice99 = Fig. 3c ~5,235 cells; mouse2_slice119 = Fig. 3g
+        # ~5,021 cells). Use these for direct visual comparison to LUNA.
+        return _resolve_section_files(
+            silver_dir, ["mouse2_slice99", "mouse2_slice119"],
+        )
+
     out: List[Path] = []
     for s in sections_arg:
         # Glob pattern: contains a wildcard somewhere.
@@ -1280,6 +1352,7 @@ def run_inference(
     per_class_spearman: bool = False,
     umap_diagnostic: bool = False,
     diagnostic_class_col: Optional[str] = None,
+    palette: str = "luna",
 ) -> None:
     import anndata as ad
     import torch
@@ -1294,11 +1367,22 @@ def run_inference(
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
 
     silver_path = Path(silver_dir)
-    # Default output_dir derived from silver_dir.name so cortex inference
-    # lands in {ARTIFACTS_ROOT}/mmc_luna/inference/ and CNS inference in
-    # {ARTIFACTS_ROOT}/cns_luna/inference/ etc.
+    # Default output_dir derived from silver_dir.name + the model's run
+    # timestamp (extracted from the checkpoint path) so inference results
+    # stay pinned to the training run that produced them. Falls back to a
+    # fresh timestamp if the checkpoint isn't under the canonical
+    # model/<YYYYMMDD_HHMMSS>/ layout.
     if output_dir is None:
-        out_dir = _ARTIFACTS_ROOT / silver_path.name / "inference"
+        model_ts = _model_timestamp_from_checkpoint(ckpt_path)
+        if model_ts is None:
+            model_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            logger.warning(
+                f"  checkpoint path has no model/<timestamp>/ ancestor; "
+                f"using fresh inference timestamp {model_ts}"
+            )
+        else:
+            logger.info(f"  inference pinned to model timestamp {model_ts}")
+        out_dir = _ARTIFACTS_ROOT / silver_path.name / "inference" / model_ts
     else:
         out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1542,6 +1626,7 @@ def run_inference(
                 title_prefix=f"[{section_id}] ",
                 spot_size=spot_size,
                 align_for_plot=not no_align_plot,
+                palette=palette,
             )
         else:
             logger.warning("  no usable color column; skipping plot")
@@ -1611,19 +1696,22 @@ def main() -> int:
             "Section ids / filenames / glob patterns to run on. Accepts: "
             "bare ids ('well06', 'mouse2_slice1'), filenames "
             "('cns_scrna_well06.h5ad'), globs ('mouse2_*'), or the special "
-            "values 'all' (every silver h5ad) and 'all_test' (mouse2_* — "
-            "the LUNA cortex held-out split). Default depends on "
-            "--silver_dir: 'all_test' for mmc_* / merfish_mouse_cortex_*, "
-            "'well06' for cns_*, 'all' otherwise."
+            "values: 'all' (every silver h5ad), 'all_test' (mouse2_* — the "
+            "LUNA cortex held-out split), 'paper' (mouse2_slice99 + "
+            "mouse2_slice119, the slices LUNA shows in Fig 3c and 3g). "
+            "Default depends on --silver_dir: 'all_test' for mmc_* / "
+            "merfish_mouse_cortex_*, 'well06' for cns_*, 'all' otherwise."
         ),
     )
     p.add_argument(
         "--output_dir",
         default=None,
-        help="Where to write predicted h5ads and comparison SVGs. Default "
-             "derives from --silver_dir's basename and points at "
+        help="Where to write predicted h5ads and comparison SVGs. Default: "
              "/nfs/team361/sb75/scgg-reproducibility/artifacts/"
-             "<silver_dir_name>/inference/.",
+             "<silver_dir_name>/inference/<model_timestamp>/, where "
+             "<model_timestamp> is the YYYYMMDD_HHMMSS directory under "
+             ".../model/ in --checkpoint's path. Falls back to a fresh "
+             "timestamp if the checkpoint isn't under that layout.",
     )
     p.add_argument("--color", default="cell_class",
                    help="adata.obs column to color plots by (default: cell_class).")
@@ -1679,8 +1767,15 @@ def main() -> int:
     p.add_argument(
         "--spot_size", type=float, default=None,
         help="Marker size in the comparison plot. Default auto-scales with "
-             "cell count (~10-60). Try 30-100 for sparser slices, 5-15 for "
-             "very dense slices.",
+             "cell count (~20-120). Try 60-150 for sparser slices, 10-25 "
+             "for very dense slices.",
+    )
+    p.add_argument(
+        "--palette", default="luna", choices=("luna", "tab20"),
+        help="Color palette for the categorical cell-class plots. 'luna' "
+             "(default) uses colorcet.glasbey — the saturated palette LUNA "
+             "uses in Figure 3 — and falls back to tab20 if colorcet is "
+             "not installed. 'tab20' forces matplotlib's tab20 directly.",
     )
     p.add_argument(
         "--no_align_plot", action="store_true",
@@ -1750,6 +1845,7 @@ def main() -> int:
         per_class_spearman=args.per_class_spearman,
         umap_diagnostic=args.umap_diagnostic,
         diagnostic_class_col=args.diagnostic_class_col,
+        palette=args.palette,
     )
     return 0
 

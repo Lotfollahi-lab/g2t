@@ -27,6 +27,7 @@ import csv
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -158,6 +159,7 @@ def run_benchmark(
     skip_training: bool = False,
     load_checkpoint: Optional[str] = None,
     class_stratified_distance: Optional[bool] = None,
+    k_default: Optional[int] = None,
 ) -> Dict[str, float]:
     """Run the full LUNA Figure 3 benchmark and return the aggregated metrics.
 
@@ -168,8 +170,12 @@ def run_benchmark(
             is treated as TRAIN, Mouse 2 as TEST.
         output_dir: Where to write the trained checkpoint + per-slice and
             aggregated metrics. None (default) derives the path from
-            data_dir's basename: {ARTIFACTS_ROOT}/{data_dir.name}/model/
-            (e.g. /nfs/team361/sb75/scgg-reproducibility/artifacts/mmc_luna/model).
+            data_dir's basename plus a per-run timestamp:
+            {ARTIFACTS_ROOT}/{data_dir.name}/model/{YYYYMMDD_HHMMSS}/
+            (e.g. /nfs/team361/sb75/scgg-reproducibility/artifacts/mmc_luna/
+            model/20260518_213045/). The timestamp lets multiple training
+            runs coexist; the matching inference outputs live under
+            inference/{YYYYMMDD_HHMMSS}/.
         config_path: Optional override path to a scgg config YAML.
         epochs / batch_size / lr / wandb / wandb_run_name: CLI overrides.
         val_fraction: Fraction of TRAIN slices held out for validation.
@@ -184,6 +190,13 @@ def run_benchmark(
             classes — forces the model to encode within-class spatial
             geometry instead of just clustering by cell type. None (default)
             leaves whatever the config specifies untouched.
+        k_default: k for the GT spatial kNN graph that defines SupCon
+            positives. None leaves the config default (10) alone. In laminar
+            tissues like cortex, small k means a cell's positives are almost
+            all in the same layer with similar tangential positions, so the
+            model can satisfy SupCon without learning tangential structure.
+            k=30–50 makes positives extend across tangential extents and
+            forces the model to encode them.
 
     Returns:
         Dict of aggregated metrics; identical structure to
@@ -196,8 +209,11 @@ def run_benchmark(
     from scgg.evaluation.luna_metrics import aggregate_slices
 
     data_path = Path(data_dir)
+    # Stamp the run so multiple training attempts don't overwrite each
+    # other and so inference can pin to a specific model version.
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_dir is None:
-        out_dir = _ARTIFACTS_ROOT / data_path.name / "model"
+        out_dir = _ARTIFACTS_ROOT / data_path.name / "model" / run_timestamp
     else:
         out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +226,8 @@ def run_benchmark(
         ],
         force=True,
     )
+    logger.info(f"Run timestamp: {run_timestamp}")
+    logger.info(f"Output dir:    {out_dir}")
 
     cfg = _load_config(Path(config_path) if config_path else None)
 
@@ -234,6 +252,10 @@ def run_benchmark(
             f"distance_regression.class_stratified overridden via CLI: "
             f"{bool(class_stratified_distance)}"
         )
+
+    if k_default is not None:
+        cfg.setdefault("graph", {})["k_default"] = int(k_default)
+        logger.info(f"graph.k_default overridden via CLI: {int(k_default)}")
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -383,9 +405,9 @@ def main():
     p.add_argument(
         "--output_dir", default=None,
         help="Where to write the trained checkpoint + per-slice / aggregate "
-             "metrics. Default derives from --data_dir's basename: "
-             "/nfs/team361/sb75/scgg-reproducibility/artifacts/"
-             "<data_dir_name>/model/.",
+             "metrics. Default derives from --data_dir's basename and adds "
+             "a timestamp: /nfs/team361/sb75/scgg-reproducibility/artifacts/"
+             "<data_dir_name>/model/<YYYYMMDD_HHMMSS>/.",
     )
     p.add_argument("--config", default=None, help="Optional config YAML override.")
     p.add_argument("--epochs", type=int, default=None)
@@ -412,6 +434,13 @@ def main():
              "collapsed to a cell-type classifier (i.e. global Spearman is "
              "decent but the mean of per-class median Spearmans is near zero).",
     )
+    p.add_argument(
+        "--k_default", type=int, default=None,
+        help="k for the GT spatial kNN graph (SupCon positives). Defaults "
+             "to the config value (10). Try 30 or 50 in laminar tissues to "
+             "force the model to encode tangential position instead of just "
+             "depth-band membership.",
+    )
     args = p.parse_args()
 
     run_benchmark(
@@ -436,6 +465,7 @@ def main():
         class_stratified_distance=(
             True if args.class_stratified_distance else None
         ),
+        k_default=args.k_default,
     )
 
 
