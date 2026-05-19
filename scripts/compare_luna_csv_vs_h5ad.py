@@ -340,31 +340,164 @@ def compare_section(
     headline["csv_row_sum_median"] = float(np.median(csv_row_sums))
     headline["h5ad_row_sum_median"] = float(np.median(h5_row_sums))
 
-    # --- Per-gene first-cell direct compare (helps catch ordering bugs) ---
-    if same_set and adata.n_obs == len(csv_df):
-        # Need to align cells too; try by index match if CSV index is
-        # integer (LUNA preserves a per-section integer index) → assume
-        # CSV row i corresponds to h5ad row i if cell counts match.
-        # Otherwise we just compare the SORTED gene-expression vectors
-        # per gene as a distribution sanity check.
+    # --- Cell-by-cell matching ----------------------------------------
+    # CSV index is per-section integer (e.g. 13, 342, 418); h5ad
+    # obs_names are "<int>_<section_label>". We align by stripping the
+    # suffix from obs_names. This gives a true cell-by-cell pairing
+    # for the subset of cells present in both.
+    #
+    # For the 2 known renamed gene pairs (`1-Mar`↔`March1`,
+    # `Fam19a2`↔`Tafa2`) we rename the CSV columns to the modern symbols
+    # before aligning, so the gene panels become identical.
+    rename_csv_to_h5ad = {"1-Mar": "March1", "Fam19a2": "Tafa2"}
+    csv_df_for_align = csv_df.rename(columns=rename_csv_to_h5ad)
+    csv_genes_renamed = [
+        rename_csv_to_h5ad.get(g, g) for g in csv_genes
+    ]
+
+    # Build obs_name → row-index map for h5ad (strip the section suffix)
+    h5ad_obs_to_row: Dict[int, int] = {}
+    for i, name in enumerate(adata.obs_names):
+        # "13_mouse1_slice1" → 13
         try:
-            csv_row0 = csv_df.loc[:, h5ad_genes].iloc[0].to_numpy(
-                dtype=np.float32
+            prefix = name.split("_", 1)[0]
+            h5ad_obs_to_row[int(prefix)] = i
+        except (ValueError, IndexError):
+            pass
+
+    csv_idx_in_h5ad: List[int] = []
+    h5_idx_for_csv: List[int] = []
+    for csv_i, csv_idx in enumerate(csv_df_for_align.index):
+        try:
+            i_int = int(csv_idx)
+        except (ValueError, TypeError):
+            continue
+        if i_int in h5ad_obs_to_row:
+            csv_idx_in_h5ad.append(csv_i)
+            h5_idx_for_csv.append(h5ad_obs_to_row[i_int])
+
+    n_matched = len(csv_idx_in_h5ad)
+    n_csv_only = len(csv_df) - n_matched
+    n_h5ad_only = adata.n_obs - n_matched
+    print(f"\nCell-by-cell matching:")
+    print(f"  matched cells (CSV ∩ h5ad)  = {n_matched}")
+    print(f"  in CSV only                 = {n_csv_only}")
+    print(f"  in h5ad only                = {n_h5ad_only}")
+    headline["n_matched_cells"] = int(n_matched)
+    headline["n_csv_only"] = int(n_csv_only)
+    headline["n_h5ad_only"] = int(n_h5ad_only)
+
+    # --- Per-row absolute diff against each h5ad normalization --------
+    # On the matched subset only, using the gene panel renamed to match.
+    if n_matched > 0 and set(csv_genes_renamed) == set(h5ad_genes):
+        csv_X_match = csv_df_for_align.loc[:, h5ad_genes].iloc[
+            csv_idx_in_h5ad
+        ].to_numpy(dtype=np.float32)
+        raw_match = X[h5_idx_for_csv]
+
+        match_norms: Dict[str, np.ndarray] = {
+            "h5ad raw .X": raw_match,
+            "h5ad log2(x+1)": np.log2(raw_match + 1.0),
+        }
+        try:
+            import scanpy as sc
+            tmp = adata.copy()
+            if sp.issparse(tmp.X):
+                tmp.X = tmp.X.toarray()
+            sc.pp.normalize_total(tmp, target_sum=1e4)
+            sc.pp.log1p(tmp)
+            match_norms["h5ad normalize_total+log1p"] = (
+                np.asarray(tmp.X, dtype=np.float32)[h5_idx_for_csv]
             )
-            h5_row0 = X[0]
-            # find nearest match (log2 transform?)
-            cand: List[Tuple[str, float]] = []
-            for name, arr in norms.items():
-                if name.startswith("h5ad"):
-                    diff = float(np.mean(np.abs(arr[0] - csv_row0)))
-                    cand.append((name, diff))
-            cand.sort(key=lambda kv: kv[1])
-            print("\nFirst-row absolute diff (CSV row 0 vs h5ad row 0):")
-            for name, d in cand:
-                print(f"  CSV vs {name:35s}  mean |diff| = {d:.6f}")
-            headline["closest_norm_match"] = cand[0][0]
-        except Exception as e:
-            print(f"  (first-row direct compare skipped: {e})")
+        except Exception:
+            pass
+
+        print("\nMatched-pairs mean |CSV - h5ad_norm|:")
+        cand: List[Tuple[str, float]] = []
+        for name, arr in match_norms.items():
+            diff = float(np.mean(np.abs(arr - csv_X_match)))
+            cand.append((name, diff))
+            print(f"  CSV vs {name:35s}  mean |diff| = {diff:.6f}")
+        cand.sort(key=lambda kv: kv[1])
+        headline["closest_norm_match"] = cand[0][0]
+        headline["closest_norm_match_mean_abs_diff"] = cand[0][1]
+
+        # --- Volume-normalization test -------------------------------
+        # Hypothesis: CSV[i, g] = raw[i, g] * s_i for some per-cell
+        # scale factor s_i. If true, then on the matched subset and
+        # restricted to entries where raw[i, g] > 0, the ratio
+        # CSV[i, g] / raw[i, g] should be approximately constant
+        # within a row i.
+        #
+        # Diagnostic:
+        #   * Compute per-cell scale s_i_libsum = sum_g CSV[i,g] /
+        #     sum_g raw[i, g] (a robust library-size ratio estimate).
+        #   * Apply s_i_libsum to raw → CSV_pred = raw * s_i_libsum[:, None]
+        #   * Report mean |CSV - CSV_pred|. If it's near zero,
+        #     volume-normalization is confirmed.
+        #   * Also report the within-row std of per-element ratios
+        #     (normalized by row mean). Low CV → per-cell scaling.
+        csv_row_sums_m = csv_X_match.sum(axis=1)
+        raw_row_sums_m = raw_match.sum(axis=1)
+        valid_libsum = raw_row_sums_m > 0
+        per_cell_libratio = np.zeros_like(csv_row_sums_m, dtype=np.float64)
+        per_cell_libratio[valid_libsum] = (
+            csv_row_sums_m[valid_libsum] / raw_row_sums_m[valid_libsum]
+        )
+
+        csv_pred = raw_match * per_cell_libratio[:, None].astype(np.float32)
+        per_cell_libratio_diff = float(
+            np.mean(np.abs(csv_X_match - csv_pred))
+        )
+
+        # Per-cell CV of element-wise ratios on nonzero raw entries
+        cvs: List[float] = []
+        for i in range(min(n_matched, 500)):  # sample first 500 cells
+            mask = raw_match[i] > 0
+            if mask.sum() < 3:
+                continue
+            ratios = csv_X_match[i, mask] / raw_match[i, mask]
+            m = ratios.mean()
+            if m > 0:
+                cvs.append(float(ratios.std() / m))
+        median_cv = float(np.median(cvs)) if cvs else float("nan")
+        mean_cv = float(np.mean(cvs)) if cvs else float("nan")
+
+        print("\nVolume-normalization hypothesis: CSV[i,g] ≈ raw[i,g] · s_i")
+        print(f"  per-cell scale (CSV_row_sum / raw_row_sum):")
+        print(f"    n={int(valid_libsum.sum())}, "
+              f"median={np.median(per_cell_libratio[valid_libsum]):.6f}, "
+              f"min={per_cell_libratio[valid_libsum].min():.6f}, "
+              f"max={per_cell_libratio[valid_libsum].max():.6f}")
+        print(f"    std of per-cell scale: "
+              f"{per_cell_libratio[valid_libsum].std():.6f}")
+        print(f"  reconstruction CSV - raw·s_i (mean |diff|): "
+              f"{per_cell_libratio_diff:.6f}")
+        print(f"    → if this is ≪ {cand[0][1]:.4f} (the best plain-norm "
+              f"diff above), per-cell rescaling explains the CSV.")
+        print(f"  within-row CV(CSV/raw) on nonzero entries "
+              f"(median over {len(cvs)} cells): {median_cv:.6f} "
+              f"(mean: {mean_cv:.6f})")
+        print(f"    → CV near 0 = the ratio is constant within a cell "
+              f"(true per-cell scaling). CV >> 0 = each gene is "
+              f"transformed differently.")
+
+        headline["per_cell_scale_median"] = float(
+            np.median(per_cell_libratio[valid_libsum])
+        )
+        headline["per_cell_scale_min"] = float(
+            per_cell_libratio[valid_libsum].min()
+        )
+        headline["per_cell_scale_max"] = float(
+            per_cell_libratio[valid_libsum].max()
+        )
+        headline["volume_norm_recon_mean_abs_diff"] = per_cell_libratio_diff
+        headline["volume_norm_within_row_cv_median"] = median_cv
+        headline["volume_norm_within_row_cv_mean"] = mean_cv
+    else:
+        print("\nCell-by-cell matching: no matched pairs available "
+              "(integer index ↔ h5ad obs_name prefix didn't pair up). "
+              "Skipping volume-normalization test.")
 
     # --- cell_class label set ---
     csv_classes = (

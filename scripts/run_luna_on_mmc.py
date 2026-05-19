@@ -10,11 +10,18 @@ environment* (Python 3.9, torch 2.0.1, etc. — the one that
 and that LUNA itself runs in).
 
 Input is the **same silver h5ad directory** that scGG reads from
-(``--data_dir``). We apply LUNA's expected ``log2(x + 1)`` normalization
-when building its input CSVs (scGG applies its own
-``normalize_total + log1p + scale`` separately). The silver layer itself
-is identical for both methods — same h5ads, same coords, same
-``cell_class`` labels.
+(``--data_dir``). The h5ad's ``.X`` is written to the CSV **as-is**
+(raw integer counts, no transformation by default), because LUNA's
+published CSVs are themselves non-integer per-cell-normalized counts
+in the [0, ~250] range — *not* log-transformed. Empirically, training
+LUNA on log2(x+1) of raw integer counts reproduces ~0% of the paper
+Spearman (the input distribution sits in [0, 8] while the model
+expects [0, ~250]). The silver layer itself is identical for scGG and
+LUNA — same h5ads, same coords, same ``cell_class`` labels.
+
+Optional: pass ``--log2_normalize`` to re-enable the old behavior
+(only useful for ablation or if you know your silver h5ads are
+already volume-normalized and you want to compress dynamic range).
 
 Pipeline
 --------
@@ -116,7 +123,7 @@ def _split_by_mouse(
 def _build_luna_csv(
     files: List[Tuple[int, int, Path]],
     out_csv: Path,
-    log2_normalize: bool = True,
+    log2_normalize: bool = False,
 ) -> Dict[str, object]:
     """Concatenate per-slice h5ads into one CSV in LUNA's input format.
 
@@ -124,6 +131,13 @@ def _build_luna_csv(
       * gene columns first (positions ``0..n_genes-1``)
       * then ``coord_X``, ``coord_Y``, ``cell_section``, ``cell_class``
       * index = original cell barcode
+
+    Expression normalization: the default is **no transformation** because
+    LUNA's published CSVs are non-integer per-cell-normalized counts in
+    the same magnitude range as raw counts (max ~250). Applying log2(x+1)
+    on top compresses the input to [0, 8] and the model fails to learn —
+    we verified this with ``compare_luna_csv_vs_h5ad.py``. Set
+    ``log2_normalize=True`` only for ablations.
     """
     import anndata as ad
     import scipy.sparse as sp
@@ -348,7 +362,7 @@ def run_benchmark(
     seed: int = 0,
     luna_repo: str = str(_DEFAULT_LUNA_REPO),
     run_name: str = "MERFISH_mouse_cortex",
-    log2_normalize: bool = True,
+    log2_normalize: bool = False,
     wandb_mode: str = "disabled",
     extra_overrides: Optional[List[str]] = None,
     train_csv: Optional[str] = None,
@@ -745,10 +759,16 @@ def main() -> int:
         "--run_name", default="MERFISH_mouse_cortex",
         help="Sets general.name in LUNA's Hydra config.",
     )
+    # By default we write raw counts (LUNA's published CSVs are
+    # non-integer per-cell-normalized values in the same magnitude
+    # range as raw counts, NOT log-transformed — verified with
+    # `compare_luna_csv_vs_h5ad.py`). `--log2_normalize` opts in to the
+    # old behavior for ablation.
     p.add_argument(
-        "--no_log2_normalize", action="store_true",
-        help="Skip log2(x+1) when writing the LUNA CSVs (only if your "
-             "silver h5ads are already log2-normalized).",
+        "--log2_normalize", action="store_true",
+        help="Apply log2(x+1) when writing the LUNA CSVs. OFF by default "
+             "since LUNA's published CSVs are not log-transformed; "
+             "training on log-compressed inputs collapses to ~0 Spearman.",
     )
     p.add_argument(
         "--luna_override", action="append", default=[],
@@ -767,7 +787,7 @@ def main() -> int:
             seed=args.seed,
             luna_repo=args.luna_repo,
             run_name=args.run_name,
-            log2_normalize=not args.no_log2_normalize,
+            log2_normalize=args.log2_normalize,
             wandb_mode=args.wandb_mode,
             extra_overrides=args.luna_override,
             train_csv=args.train_csv,

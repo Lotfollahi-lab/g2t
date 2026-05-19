@@ -8,17 +8,19 @@ package. Meant to be run *in the LUNA Python environment* — same env as
 ``run_luna_on_mmc.py``.
 
 Input is the **same silver h5ad directory** that the scGG pipeline reads
-from (``--silver_dir``). The two methods apply their own
-method-specific normalization on top:
+from (``--silver_dir``). The two methods differ in downstream
+normalization:
 
   * scGG: ``normalize_total(1e4) + log1p + scale`` (via scanpy in
     ``scgg.data.luna_cortex``).
-  * LUNA: ``log2(x + 1)`` (this script, when ``--no_log2_normalize`` is
-    off — the default).
+  * LUNA: **raw counts as-is** (default). LUNA's published CSVs are
+    non-integer per-cell-normalized values in the [0, ~250] range, NOT
+    log-transformed (verified empirically with
+    ``compare_luna_csv_vs_h5ad.py``). Pass ``--log2_normalize`` to
+    opt into log2(x+1) for ablation only.
 
 So the silver layer is exactly identical for both; only the normalization
-applied downstream differs, which is intentional and matches each
-method's published expectations.
+applied downstream differs.
 
 Pipeline
 --------
@@ -401,9 +403,13 @@ def _adata_from_luna_outputs(pred_df: pd.DataFrame, true_df: pd.DataFrame):
 def _build_luna_csv(
     files: List[Tuple[int, int, Path]],
     out_csv: Path,
-    log2_normalize: bool = True,
+    log2_normalize: bool = False,
 ) -> Dict[str, object]:
-    """Concatenate per-slice h5ads into a LUNA-format CSV."""
+    """Concatenate per-slice h5ads into a LUNA-format CSV.
+
+    Default is no transformation — LUNA's CSVs are not log-transformed
+    (see top-of-file docstring).
+    """
     import anndata as ad
     import scipy.sparse as sp
 
@@ -862,7 +868,7 @@ def run_inference(
     color_col: str = "cell_class",
     luna_repo: str = str(_DEFAULT_LUNA_REPO),
     run_name: str = "MERFISH_mouse_cortex_infer",
-    log2_normalize: bool = True,
+    log2_normalize: bool = False,
     spot_size: Optional[float] = None,
     no_align_plot: bool = False,
     per_class_spearman: bool = False,
@@ -1367,8 +1373,13 @@ def main() -> int:
         help="general.name in LUNA's Hydra config.",
     )
     p.add_argument(
-        "--no_log2_normalize", action="store_true",
-        help="Skip log2(x+1) on the test CSV.",
+        "--log2_normalize", action="store_true",
+        help="Apply log2(x+1) when building the test CSV. OFF by default "
+             "to match LUNA's published CSVs, which carry non-integer "
+             "per-cell-normalized counts in the [0, ~250] range — NOT "
+             "log-transformed values. Only use this for ablation or when "
+             "you know your checkpoint was trained on log2-transformed "
+             "input.",
     )
     p.add_argument(
         "--spot_size", type=float, default=None,
@@ -1429,7 +1440,7 @@ def main() -> int:
             color_col=args.color,
             luna_repo=args.luna_repo,
             run_name=args.run_name,
-            log2_normalize=not args.no_log2_normalize,
+            log2_normalize=args.log2_normalize,
             spot_size=args.spot_size,
             no_align_plot=args.no_align_plot,
             per_class_spearman=args.per_class_spearman,
