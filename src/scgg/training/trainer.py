@@ -277,6 +277,19 @@ class Trainer:
             "distance_n_classes_used",
             "coord_loss", "coord_mse", "coord_scale",
             "cellclass_aux_loss", "cellclass_aux_acc",
+            # Flow-matching diagnostics: fm_loss is the velocity MSE
+            # (== total_loss when no aux contrastive). v_norm / u_norm
+            # are the mean L2 norms of predicted vs target velocity
+            # vectors — if v_norm stays ≪ u_norm, the velocity field
+            # is too small to actually denoise to GT scale and the
+            # ODE output will look like noise even with a low fm_loss.
+            "fm_loss", "v_norm", "u_norm",
+            # Sample-Spearman during flow_matching training: per-cell
+            # Spearman of pairwise distances between ODE-sampled coords
+            # and GT on one held-out val section. The metric we
+            # actually care about; fm_loss is a noisy proxy.
+            "fm_sample_spearman_median", "fm_sample_spearman_mean",
+            "fm_sample_n_cells",
         ]
 
         # ---- wandb ---------------------------------------------------------
@@ -387,6 +400,91 @@ class Trainer:
         payload["lr"] = self.optimizer.param_groups[0]["lr"]
         self.wandb.log(payload, step=self.global_step)
 
+    @torch.no_grad()
+    def _fm_sample_spearman_eval(
+        self,
+        n_steps: Optional[int] = None,
+        max_cells: int = 2000,
+        solver: str = "euler",
+    ) -> Dict[str, float]:
+        """Diagnostic for flow_matching: sample coords for one val section
+        via the ODE and compute per-cell Spearman of pairwise distances
+        against GT.
+
+        fm_loss tracks velocity MSE — but a low fm_loss does NOT guarantee
+        the sampled trajectory recovers the spatial layout (see e.g.
+        per-cell MLP velocity net producing noise even at loss ~0.5).
+        This sample-Spearman is the metric the LUNA paper headlines; we
+        compute it every eval cycle on ONE held-out val section so the
+        wandb / CSV log reflects actual reconstruction quality, not just
+        the proxy.
+
+        For speed, we subsample to ``max_cells`` cells if a slice is
+        bigger. Sampling cost: ~1-2 s per call.
+        """
+        if self.objective != "flow_matching" or self.model.flow is None:
+            return {}
+        if self.val_dataset is None or len(self.val_dataset) == 0:
+            return {}
+        from scipy.spatial.distance import cdist
+        from scipy.stats import spearmanr
+
+        self.model.eval()
+        # Pick the FIRST val section (deterministic across runs).
+        section_data = self.val_dataset[0]
+        gene_expr = section_data["gene_expr"].to(self.device)
+        coords_true = section_data["coords"].to(self.device)
+        k_target_val = int(section_data.get("k_target", 10))
+
+        n = gene_expr.shape[0]
+        if n > max_cells:
+            idx = torch.randperm(n, device=self.device)[:max_cells]
+            gene_expr = gene_expr[idx]
+            coords_true = coords_true[idx]
+            n = max_cells
+
+        # Build cell + section embeddings (no train_dataset section_expr
+        # needed; section embed re-derived from the val section's cells).
+        cell_embed, section_embed = self.model.encode(gene_expr)
+
+        # Use a modest n_steps for speed (default 50, half the inference
+        # default of 100). The Spearman trend over training is what
+        # matters; absolute number can be refined at inference time.
+        if n_steps is None:
+            n_steps = max(
+                25,
+                self.config["model"]["flow"].get("n_steps", 100) // 2,
+            )
+        k_target = torch.full(
+            (n,), k_target_val, dtype=torch.long, device=self.device
+        )
+        coords_pred = self.model.flow.sample(
+            cell_embed=cell_embed,
+            section_embed=section_embed,
+            k_target=k_target,
+            n_steps=n_steps,
+            solver=solver,
+        )
+
+        # Per-cell Spearman of pairwise-distance rows
+        gt_np = coords_true.detach().cpu().numpy().astype("float32")
+        pr_np = coords_pred.detach().cpu().numpy().astype("float32")
+        dt = cdist(gt_np, gt_np)
+        dp = cdist(pr_np, pr_np)
+        rhos = []
+        for i in range(n):
+            r, _ = spearmanr(dt[i], dp[i])
+            if r is not None and not (r != r):  # not NaN
+                rhos.append(float(r))
+        if not rhos:
+            return {"fm_sample_n_cells": int(n)}
+        import numpy as _np
+        return {
+            "fm_sample_spearman_median": float(_np.median(rhos)),
+            "fm_sample_spearman_mean": float(_np.mean(rhos)),
+            "fm_sample_n_cells": int(n),
+        }
+
     def _log_metrics_csv(self, metrics: Dict[str, float], phase: str) -> None:
         """Append one row to metrics.csv with the well-known metric columns.
 
@@ -462,6 +560,23 @@ class Trainer:
             ):
                 val_metrics = self._validate(batch_size)
                 val_metrics["epoch"] = epoch + 1
+
+                # Sample-Spearman: only meaningful for flow_matching.
+                # Reports the actual reconstruction quality on one held-
+                # out val section, complementing the velocity-MSE proxy.
+                if self.objective == "flow_matching":
+                    fm_eval = self._fm_sample_spearman_eval()
+                    if fm_eval:
+                        val_metrics.update(fm_eval)
+                        logger.info(
+                            f"  FM sample-Spearman (val sec 0, "
+                            f"n={fm_eval.get('fm_sample_n_cells', '?')}): "
+                            f"median="
+                            f"{fm_eval.get('fm_sample_spearman_median', float('nan')):.4f}  "
+                            f"mean="
+                            f"{fm_eval.get('fm_sample_spearman_mean', float('nan')):.4f}"
+                        )
+
                 logger.info(
                     f"  Val Total: {val_metrics.get('total_loss', float('nan')):.4f}"
                 )
@@ -620,7 +735,11 @@ class Trainer:
             k_target = torch.full(
                 (B,), k_target_val, dtype=torch.long, device=self.device
             )
-            fm_loss, _ = self.model.flow.compute_loss(
+            # Capture flow's inner metrics (fm_loss, v_norm, u_norm)
+            # alongside its scalar loss; we used to discard them via `_`,
+            # which made diagnosing "loss goes down but predictions are
+            # noise" much harder.
+            fm_loss, fm_inner_metrics = self.model.flow.compute_loss(
                 z_1=coords,
                 cell_embed=cell_embed,
                 section_embed=section_embed,
@@ -633,6 +752,10 @@ class Trainer:
                 batch_indices=batch_indices,
             )
             metrics = dict(primary_metrics)
+            # Merge the flow's per-step diagnostics so they surface in
+            # the CSV / wandb (v_norm tells us whether the velocity
+            # field is non-trivial; u_norm gives the target scale).
+            metrics.update(fm_inner_metrics)
 
         # ---- OOD components (no-op by default; require second modality) ----
         # Hooks are wired here so flipping them on in the future only requires
@@ -790,13 +913,15 @@ class Trainer:
                     kk = torch.full(
                         (B,), k_val, dtype=torch.long, device=self.device
                     )
-                    fm_loss, _ = self.model.flow.compute_loss(
+                    fm_loss, fm_inner = self.model.flow.compute_loss(
                         z_1=coords,
                         cell_embed=ce,
                         section_embed=se,
                         k_target=kk,
                     )
                     loss, m = self.criterion(fm_loss=fm_loss)
+                    m = dict(m)
+                    m.update(fm_inner)
                     val_metrics.append(m)
 
         if not val_metrics:

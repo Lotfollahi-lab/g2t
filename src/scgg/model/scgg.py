@@ -26,6 +26,7 @@ from typing import Optional, Tuple, Union, List
 from .encoder import GeneExpressionEncoder, SectionEncoder
 from .metric_head import MetricHead, CrossCellMetricHead
 from .velocity_net import VelocityNetwork
+from .velocity_net_attention import CrossAttentionVelocityNetwork
 from .flow_matching import ConditionalFlowMatching
 from .graph_constructor import GraphConstructor
 
@@ -110,22 +111,55 @@ class ScGG(nn.Module):
         else:
             self.metric_head_type = None
 
-        # ---- Flow matching (ablation mode) ----------------------------------
-        self.velocity_net: Optional[VelocityNetwork] = None
+        # ---- Flow matching (primary mode) ----------------------------------
+        # Velocity network has two flavours:
+        #   * "mlp"  (legacy): per-cell MLP with section_embed as global
+        #     context. No cell-cell information flow — empirically
+        #     produces noise on reconstruction tasks because the model
+        #     can only learn marginal positions, not spatial
+        #     arrangement.
+        #   * "cross_attention"  (default, LUNA-style): transformer
+        #     encoder with multi-head self-attention OVER cells. Each
+        #     cell's velocity depends on every other cell's current
+        #     position at each denoising step. This is the architectural
+        #     ingredient LUNA uses (see their models/transformer.py).
+        self.velocity_net = None
         self.flow: Optional[ConditionalFlowMatching] = None
         if self.objective == "flow_matching":
             vn_cfg = model_cfg["velocity_net"]
             fl_cfg = model_cfg["flow"]
-            self.velocity_net = VelocityNetwork(
-                spatial_dim=model_cfg["spatial_dim"],
-                cell_embed_dim=enc_cfg["embed_dim"],
-                section_embed_dim=sec_cfg["embed_dim"],
-                hidden_dims=vn_cfg["hidden_dims"],
-                time_embed_dim=vn_cfg["time_embed_dim"],
-                k_embed_dim=vn_cfg["k_embed_dim"],
-                k_max=config["graph"].get("k_train_range", [5, 30])[1] + 10,
-                dropout=vn_cfg["dropout"],
-            )
+            vn_type = str(vn_cfg.get("type", "cross_attention")).lower()
+            k_max = config["graph"].get("k_train_range", [5, 30])[1] + 10
+
+            if vn_type == "mlp":
+                self.velocity_net = VelocityNetwork(
+                    spatial_dim=model_cfg["spatial_dim"],
+                    cell_embed_dim=enc_cfg["embed_dim"],
+                    section_embed_dim=sec_cfg["embed_dim"],
+                    hidden_dims=vn_cfg["hidden_dims"],
+                    time_embed_dim=vn_cfg["time_embed_dim"],
+                    k_embed_dim=vn_cfg["k_embed_dim"],
+                    k_max=k_max,
+                    dropout=vn_cfg["dropout"],
+                )
+            elif vn_type == "cross_attention":
+                self.velocity_net = CrossAttentionVelocityNetwork(
+                    spatial_dim=model_cfg["spatial_dim"],
+                    cell_embed_dim=enc_cfg["embed_dim"],
+                    hidden_dim=vn_cfg.get("hidden_dim", 256),
+                    n_layers=vn_cfg.get("n_layers", 8),
+                    n_heads=vn_cfg.get("n_heads", 16),
+                    time_embed_dim=vn_cfg["time_embed_dim"],
+                    k_embed_dim=vn_cfg["k_embed_dim"],
+                    k_max=k_max,
+                    dropout=vn_cfg["dropout"],
+                    ff_mult=vn_cfg.get("ff_mult", 4),
+                )
+            else:
+                raise ValueError(
+                    f"model.velocity_net.type must be 'mlp' or "
+                    f"'cross_attention'; got {vn_type!r}"
+                )
             self.flow = ConditionalFlowMatching(
                 velocity_net=self.velocity_net,
                 sigma_min=fl_cfg["sigma_min"],

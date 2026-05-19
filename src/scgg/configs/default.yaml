@@ -51,8 +51,27 @@ model:
     hidden_dims: [256, 128]
 
   # Velocity network (only built when objective == "flow_matching")
+  #
+  # Two flavours:
+  #   "mlp"  (legacy): per-cell MLP velocity. Cell-cell context only via
+  #       a scalar section_embed. Produces noise on reconstruction —
+  #       kept for ablations.
+  #   "cross_attention"  (default, LUNA-style): transformer encoder
+  #       with multi-head self-attention OVER cells of the slice.
+  #       Mirrors LUNA's `models/transformer.TransformerLayer`. This is
+  #       the variant that can actually learn spatial arrangement
+  #       because every cell's velocity depends on every other cell's
+  #       current position at each denoising step.
   velocity_net:
+    type: "cross_attention"     # mlp | cross_attention
+    # --- "mlp" specific (ignored when type == cross_attention) ---
     hidden_dims: [512, 512, 256]
+    # --- "cross_attention" specific (ignored when type == mlp) ---
+    hidden_dim: 256             # transformer width  (LUNA default: 256)
+    n_layers: 8                 # transformer depth  (LUNA default: 8)
+    n_heads: 16                 # MHA heads          (LUNA default: 16)
+    ff_mult: 4                  # FFN expansion factor
+    # --- common ---
     time_embed_dim: 64
     k_embed_dim: 16
     dropout: 0.1
