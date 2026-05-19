@@ -435,19 +435,49 @@ def run_benchmark(
         logger.info(f"Using pre-built train CSV: {src_train}")
         logger.info(f"Using pre-built test  CSV: {src_test}")
 
-        # n_genes: trust user override if passed; otherwise infer from
-        # the CSV header (n_columns - 4 metadata columns).
+        # n_genes: trust user override if passed; otherwise infer by
+        # finding where the metadata block starts. LUNA's CSV convention
+        # is "gene columns first, then coord_X / coord_Y / cell_section /
+        # cell_class" — but LUNA's own data loader also accepts the
+        # aliases x / y / subclass / region (renamed via
+        # standardise_dataframe_colnames). LUNA's preprocessed CSVs
+        # sometimes include EXTRA metadata columns (e.g., sample id,
+        # cluster id, batch), so naive `n_columns - 4` over-counts genes
+        # and pulls string columns into the gene block → torch chokes
+        # with "can't convert np.ndarray of type numpy.object_".
+        #
+        # We instead find the LOWEST index of any known metadata column
+        # and treat everything before it as genes.
+        _METADATA_NAMES = (
+            "coord_X", "coord_Y", "cell_section", "cell_class",
+            "x", "y", "subclass", "region",
+        )
         if n_genes is None:
             head = pd.read_csv(src_train, nrows=1, index_col=0)
-            n_genes_inferred = len(head.columns) - 4
-            if n_genes_inferred <= 0:
+            cols = list(head.columns)
+            meta_positions = [
+                cols.index(name) for name in _METADATA_NAMES if name in cols
+            ]
+            if not meta_positions:
                 raise ValueError(
-                    f"Could not infer n_genes from {src_train} (column "
-                    f"count {len(head.columns)} - 4 metadata = "
-                    f"{n_genes_inferred}). Pass --n_genes explicitly."
+                    f"None of {_METADATA_NAMES} found in {src_train}'s "
+                    f"columns. Pass --n_genes explicitly."
                 )
-            n_genes = n_genes_inferred
-        logger.info(f"n_genes = {n_genes}")
+            n_genes = min(meta_positions)
+            if n_genes <= 0:
+                raise ValueError(
+                    f"Inferred n_genes={n_genes} from {src_train} but "
+                    f"that means there are no gene columns before the "
+                    f"first metadata column ({cols[n_genes]!r}). "
+                    f"The CSV layout looks wrong."
+                )
+            logger.info(
+                f"n_genes inferred = {n_genes}  "
+                f"(first metadata column found: {cols[n_genes]!r} at "
+                f"position {n_genes}; CSV has {len(cols)} total columns)"
+            )
+        else:
+            logger.info(f"n_genes (explicit) = {n_genes}")
     else:
         # ---- Silver h5ad path: build CSVs ourselves -----------------------
         data_path = Path(data_dir)
