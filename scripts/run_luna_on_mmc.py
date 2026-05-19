@@ -437,33 +437,59 @@ def run_benchmark(
 
         # n_genes: trust user override if passed; otherwise infer by
         # finding where the metadata block starts. LUNA's CSV convention
-        # is "gene columns first, then coord_X / coord_Y / cell_section /
-        # cell_class" — but LUNA's own data loader also accepts the
-        # aliases x / y / subclass / region (renamed via
-        # standardise_dataframe_colnames). LUNA's preprocessed CSVs
-        # sometimes include EXTRA metadata columns (e.g., sample id,
-        # cluster id, batch), so naive `n_columns - 4` over-counts genes
-        # and pulls string columns into the gene block → torch chokes
-        # with "can't convert np.ndarray of type numpy.object_".
+        # is "gene columns first, then metadata" — but in practice their
+        # preprocessed CSVs include MORE metadata than the standard four
+        # (e.g., `cell_name`, `class`, `mouse`, `sample_id` are present
+        # in addition to coord_X / coord_Y / cell_class / cell_section).
+        # If we include any of those in the gene block, torch fails with
+        # "can't convert np.ndarray of type numpy.object_" because some
+        # of them carry string values.
         #
-        # We instead find the LOWEST index of any known metadata column
-        # and treat everything before it as genes.
+        # We use TWO complementary signals to locate the boundary and
+        # take whichever appears earlier:
+        #   (a) NAME-based: lowest index of any known metadata column
+        #       name. Catches numeric-typed metadata (coord_X / coord_Y
+        #       are floats — dtype check wouldn't see them).
+        #   (b) DTYPE-based: lowest index of a non-numeric column.
+        #       Catches metadata columns we didn't anticipate by name
+        #       (e.g., `cell_name` with too-big-for-int64 cell IDs that
+        #       parse as strings).
         _METADATA_NAMES = (
-            "coord_X", "coord_Y", "cell_section", "cell_class",
-            "x", "y", "subclass", "region",
+            # standard positions
+            "coord_X", "coord_Y", "x", "y",
+            "cell_section", "section", "region", "slice",
+            "cell_class", "cell_type", "class", "subclass", "type",
+            # additional metadata commonly present in LUNA's CSVs
+            "cell_name", "cell_id", "cell_barcode", "barcode",
+            "mouse", "animal", "donor",
+            "sample", "sample_id", "batch", "experiment", "cluster",
         )
         if n_genes is None:
-            head = pd.read_csv(src_train, nrows=1, index_col=0)
-            cols = list(head.columns)
-            meta_positions = [
+            head_data = pd.read_csv(src_train, nrows=20, index_col=0)
+            cols = list(head_data.columns)
+
+            # (a) name-based
+            meta_positions_by_name = [
                 cols.index(name) for name in _METADATA_NAMES if name in cols
             ]
-            if not meta_positions:
+            name_based = min(meta_positions_by_name) if meta_positions_by_name else None
+
+            # (b) dtype-based
+            dtype_based = None
+            for i, c in enumerate(cols):
+                if not pd.api.types.is_numeric_dtype(head_data[c]):
+                    dtype_based = i
+                    break
+
+            candidates = [v for v in (name_based, dtype_based) if v is not None]
+            if not candidates:
                 raise ValueError(
-                    f"None of {_METADATA_NAMES} found in {src_train}'s "
-                    f"columns. Pass --n_genes explicitly."
+                    f"Could not locate the gene/metadata boundary in "
+                    f"{src_train}. None of {_METADATA_NAMES} found in "
+                    f"the header, and all columns parse as numeric. "
+                    f"Pass --n_genes explicitly."
                 )
-            n_genes = min(meta_positions)
+            n_genes = min(candidates)
             if n_genes <= 0:
                 raise ValueError(
                     f"Inferred n_genes={n_genes} from {src_train} but "
@@ -473,8 +499,9 @@ def run_benchmark(
                 )
             logger.info(
                 f"n_genes inferred = {n_genes}  "
-                f"(first metadata column found: {cols[n_genes]!r} at "
-                f"position {n_genes}; CSV has {len(cols)} total columns)"
+                f"(boundary at column {cols[n_genes]!r}; "
+                f"name-based={name_based}, dtype-based={dtype_based}; "
+                f"CSV has {len(cols)} total columns)"
             )
         else:
             logger.info(f"n_genes (explicit) = {n_genes}")
