@@ -851,16 +851,28 @@ def run_inference(
     test_save_dir = luna_run_dir / "test_results"
     test_save_dir.mkdir(parents=True, exist_ok=True)
 
+    # LUNA's checkpoint filenames are `epoch=N.ckpt`. Hydra's override
+    # parser eagerly splits on the FIRST `=`, then chokes on the second
+    # one inside the path with:
+    #     mismatched input '=' expecting <EOF>
+    # The Hydra grammar lets us escape the value by wrapping it in
+    # single quotes; those are stripped from the value at parse time, so
+    # the resulting config sees the unmodified path. We single-quote
+    # every path defensively in case the user ever has a path with `=`
+    # or other Hydra-special characters in the directory tree.
+    def _h(v: object) -> str:
+        return f"'{v}'"
+
     overrides = [
         f"general.name={run_name}",
         "general.mode=test",
-        f"dataset.train_data_path={train_csv.resolve()}",
-        f"dataset.test_data_path={test_csv.resolve()}",
+        f"dataset.train_data_path={_h(train_csv.resolve())}",
+        f"dataset.test_data_path={_h(test_csv.resolve())}",
         "dataset.gene_columns_start=0",
         f"dataset.gene_columns_end={n_genes}",
-        f"test.checkpoint_path={ckpt_path.resolve()}",
-        f"test.save_dir={test_save_dir.resolve()}",
-        f"hydra.run.dir={luna_run_dir.resolve()}",
+        f"test.checkpoint_path={_h(ckpt_path.resolve())}",
+        f"test.save_dir={_h(test_save_dir.resolve())}",
+        f"hydra.run.dir={_h(luna_run_dir.resolve())}",
     ]
     if extra_overrides:
         overrides.extend(extra_overrides)

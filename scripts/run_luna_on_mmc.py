@@ -447,19 +447,26 @@ def run_benchmark(
     # Only deliberate departure: general.wandb defaults to "disabled" here
     # (LUNA defaults to "online", which crashes if the host isn't logged
     # in). Override via --wandb_mode if you want LUNA to log to wandb.
+    # Single-quote path values so Hydra's override parser tolerates any
+    # `=` (or other special chars) in the path tree. Critical for paths
+    # containing LUNA's `epoch=N.ckpt` checkpoint filenames; harmless for
+    # the rest.
+    def _h(v: object) -> str:
+        return f"'{v}'"
+
     overrides = [
         f"general.name={run_name}",
         "general.mode=train_and_test",
         f"general.seed={seed}",
         f"general.wandb={wandb_mode}",
-        f"dataset.train_data_path={train_csv.resolve()}",
-        f"dataset.test_data_path={test_csv.resolve()}",
+        f"dataset.train_data_path={_h(train_csv.resolve())}",
+        f"dataset.test_data_path={_h(test_csv.resolve())}",
         "dataset.gene_columns_start=0",
         f"dataset.gene_columns_end={n_genes}",
         f"train.batch_size={batch_size}",
         f"train.n_epochs={epochs}",
-        f"test.save_dir={test_save_dir.resolve()}",
-        f"hydra.run.dir={luna_run_dir.resolve()}",
+        f"test.save_dir={_h(test_save_dir.resolve())}",
+        f"hydra.run.dir={_h(luna_run_dir.resolve())}",
     ]
     if lr is not None:
         overrides.append(f"train.lr={lr}")
