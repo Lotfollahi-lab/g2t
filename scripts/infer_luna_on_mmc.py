@@ -851,45 +851,53 @@ def run_inference(
     test_save_dir = luna_run_dir / "test_results"
     test_save_dir.mkdir(parents=True, exist_ok=True)
 
-    # LUNA's `test_model()` (when general.mode='test_only') iterates over
-    # checkpoints found in `test.checkpoints_parent_dir`, applies
-    # `test.checkpoints_name_list` (default 'all') to pick which to run,
-    # and parses each filename via `name.split("=")[-1].split(".")[0]`
-    # to extract an epoch number — so the file MUST be named
-    # `epoch=N.ckpt`. Our wrapper accepts a single checkpoint path; we
-    # isolate it by symlinking into a dedicated dir under our output
-    # location, preserving the original filename (resolving any
-    # `best_model.ckpt` symlink to its actual `epoch=N.ckpt` target).
+    # Resolve the checkpoint (in case it's a `best_model.ckpt` symlink)
+    # and locate the original training run dir. LUNA's `test_only` flow:
+    #
+    #   def load_model_config(cfg, checkpoint_path):
+    #       config_file = "/".join(checkpoint_path.split("/")[:-2])
+    #       loading_model_cfg = safe_load(open(f"{config_file}/.hydra/config.yaml"))
+    #       cfg["model"] = loading_model_cfg["model"]
+    #
+    # reads the *training-time* model config from the grandparent of the
+    # checkpoint path (i.e., `<training_run_dir>/.hydra/config.yaml`).
+    # We therefore must point LUNA at the original training checkpoints
+    # dir, NOT a freshly-created isolated dir — otherwise LUNA picks up
+    # the inference-time Hydra config (which has default model settings)
+    # and would silently mismatch the architecture if training used any
+    # model overrides.
+    #
+    # To limit LUNA to a single checkpoint inside that dir we set
+    # `test.checkpoints_name_list=['epoch=N.ckpt']` instead of the
+    # default `"all"` (which would otherwise iterate every checkpoint
+    # LUNA saved during training).
     real_ckpt = ckpt_path.resolve()
     if not real_ckpt.exists():
         raise FileNotFoundError(
             f"Checkpoint symlink targets a missing file: "
             f"{ckpt_path} -> {real_ckpt}"
         )
-    if not real_ckpt.name.startswith("epoch=") or not real_ckpt.name.endswith(".ckpt"):
-        logger.warning(
-            f"  checkpoint target {real_ckpt.name!r} does not match "
-            "LUNA's expected 'epoch=N.ckpt' pattern; LUNA's "
-            "test_single_checkpoint will return silently. Pass a "
-            "checkpoint with that naming, or rename your target."
+    if not (real_ckpt.name.startswith("epoch=") and real_ckpt.name.endswith(".ckpt")):
+        raise ValueError(
+            f"Checkpoint name must match LUNA's `epoch=N.ckpt` pattern; "
+            f"got {real_ckpt.name!r}. (LUNA's test_single_checkpoint "
+            f"parses N via `name.split('=')[-1].split('.')[0]` and "
+            f"returns silently on ValueError, so a mis-named checkpoint "
+            f"would produce no predictions.)"
         )
-    ckpt_isolation_dir = luna_run_dir / "single_ckpt"
-    ckpt_isolation_dir.mkdir(parents=True, exist_ok=True)
-    linked = ckpt_isolation_dir / real_ckpt.name
-    if linked.exists() or linked.is_symlink():
-        linked.unlink()
-    try:
-        linked.symlink_to(real_ckpt)
-    except OSError as e:
-        raise RuntimeError(
-            f"Could not symlink {real_ckpt} -> {linked}: {e}. "
-            "LUNA's test phase requires a writable dir holding the "
-            "checkpoint under its `epoch=N.ckpt` name."
+    training_ckpts_dir = real_ckpt.parent              # <training>/luna_run/checkpoints
+    training_run_dir = training_ckpts_dir.parent       # <training>/luna_run
+    hydra_cfg_yaml = training_run_dir / ".hydra" / "config.yaml"
+    if not hydra_cfg_yaml.exists():
+        logger.warning(
+            f"  expected training-time Hydra config at {hydra_cfg_yaml} "
+            "but it doesn't exist. LUNA's test_only mode requires it to "
+            "recover the training-time model architecture; the run may "
+            "fail or use a mismatched model config."
         )
 
-    # Single-quote paths so Hydra's override parser tolerates `=` and
-    # other special chars (LUNA's `epoch=N.ckpt` filenames have a literal
-    # `=` that would otherwise be split as a key-value separator).
+    # Single-quote paths so Hydra's override parser tolerates `=` (in
+    # `epoch=N.ckpt`) and other special chars in the directory tree.
     def _h(v: object) -> str:
         return f"'{v}'"
 
@@ -900,7 +908,10 @@ def run_inference(
         f"dataset.test_data_path={_h(test_csv.resolve())}",
         "dataset.gene_columns_start=0",
         f"dataset.gene_columns_end={n_genes}",
-        f"test.checkpoints_parent_dir={_h(ckpt_isolation_dir.resolve())}",
+        f"test.checkpoints_parent_dir={_h(training_ckpts_dir.resolve())}",
+        # Hydra list syntax with a quoted element so the `=` inside the
+        # filename doesn't get parsed as another key/value separator.
+        f"test.checkpoints_name_list=['{real_ckpt.name}']",
         f"test.save_dir={_h(test_save_dir.resolve())}",
         f"hydra.run.dir={_h(luna_run_dir.resolve())}",
     ]
