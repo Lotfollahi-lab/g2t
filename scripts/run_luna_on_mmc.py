@@ -345,10 +345,11 @@ def run_benchmark(
     epochs: int = 1000,
     batch_size: int = 6,
     lr: Optional[float] = None,
-    seed: int = 42,
+    seed: int = 0,
     luna_repo: str = str(_DEFAULT_LUNA_REPO),
     run_name: str = "MERFISH_mouse_cortex",
     log2_normalize: bool = True,
+    wandb_mode: str = "disabled",
     extra_overrides: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
@@ -430,10 +431,27 @@ def run_benchmark(
     test_save_dir = luna_run_dir / "test_results"
     test_save_dir.mkdir(parents=True, exist_ok=True)
 
+    # NOTE on hyperparameters: the defaults below are bit-identical to
+    # LUNA's published MERFISH cortex config (configs/experiment/
+    # MERFISH_mouse_cortex.yaml on the upstream LUNA repo):
+    #
+    #   train.n_epochs         = 1000   (experiment override)
+    #   train.batch_size       = 6      (experiment override)
+    #   train.lr               = 5e-4   (LUNA train default, we don't touch)
+    #   train.weight_decay     = 1e-12  (LUNA train default, we don't touch)
+    #   general.seed           = 0      (LUNA general default, we now match)
+    #   general.mode           = train_and_test
+    #   validation.if_validate = False  (LUNA experiment default)
+    #   validation.save_model_every_n_epochs = 250  (LUNA experiment default)
+    #
+    # Only deliberate departure: general.wandb defaults to "disabled" here
+    # (LUNA defaults to "online", which crashes if the host isn't logged
+    # in). Override via --wandb_mode if you want LUNA to log to wandb.
     overrides = [
         f"general.name={run_name}",
         "general.mode=train_and_test",
         f"general.seed={seed}",
+        f"general.wandb={wandb_mode}",
         f"dataset.train_data_path={train_csv.resolve()}",
         f"dataset.test_data_path={test_csv.resolve()}",
         "dataset.gene_columns_start=0",
@@ -549,9 +567,19 @@ def main() -> int:
     p.add_argument("--batch_size", type=int, default=6,
                    help="train.batch_size override (LUNA paper default: 6).")
     p.add_argument("--lr", type=float, default=None,
-                   help="Optional train.lr override.")
-    p.add_argument("--seed", type=int, default=42,
-                   help="general.seed override.")
+                   help="Optional train.lr override. LUNA's published "
+                        "default for the cortex experiment is 5e-4 (used "
+                        "when this flag is not passed).")
+    p.add_argument("--seed", type=int, default=0,
+                   help="general.seed override. Default 0 matches LUNA's "
+                        "published config (configs/general/default.yaml).")
+    p.add_argument(
+        "--wandb_mode", default="disabled",
+        choices=("disabled", "online", "offline", "dryrun"),
+        help="general.wandb override. Default 'disabled' to avoid LUNA "
+             "crashing when the host isn't logged into WandB. Pass "
+             "'online' to match LUNA's upstream default.",
+    )
     p.add_argument(
         "--luna_repo", default=str(_DEFAULT_LUNA_REPO),
         help=f"Path to the LUNA repository. Default: {_DEFAULT_LUNA_REPO}",
@@ -583,6 +611,7 @@ def main() -> int:
             luna_repo=args.luna_repo,
             run_name=args.run_name,
             log2_normalize=not args.no_log2_normalize,
+            wandb_mode=args.wandb_mode,
             extra_overrides=args.luna_override,
         )
     except Exception:
