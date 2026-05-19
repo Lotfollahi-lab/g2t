@@ -261,6 +261,139 @@ def _timestamp_from_path(p: Path) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Pre-built CSV mode: filter LUNA's published CSVs to specific sections
+# ---------------------------------------------------------------------------
+
+
+_METADATA_NAMES_FOR_CSV = (
+    "coord_X", "coord_Y", "x", "y",
+    "cell_section", "section", "region", "slice",
+    "cell_class", "cell_type", "class", "subclass", "type",
+    "cell_name", "cell_id", "cell_barcode", "barcode",
+    "mouse", "animal", "donor",
+    "sample", "sample_id", "batch", "experiment", "cluster",
+)
+
+
+def _infer_n_genes_from_csv(csv_path: Path) -> int:
+    """Same heuristic as run_luna_on_mmc.py: combine name-based + dtype-
+    based detection of the gene/metadata boundary."""
+    head = pd.read_csv(csv_path, nrows=20, index_col=0)
+    cols = list(head.columns)
+    meta_pos_by_name = [
+        cols.index(n) for n in _METADATA_NAMES_FOR_CSV if n in cols
+    ]
+    name_based = min(meta_pos_by_name) if meta_pos_by_name else None
+    dtype_based = None
+    for i, c in enumerate(cols):
+        if not pd.api.types.is_numeric_dtype(head[c]):
+            dtype_based = i
+            break
+    candidates = [v for v in (name_based, dtype_based) if v is not None]
+    if not candidates:
+        raise ValueError(
+            f"Could not locate the gene/metadata boundary in {csv_path}. "
+            "Pass --n_genes explicitly."
+        )
+    n = min(candidates)
+    if n <= 0:
+        raise ValueError(
+            f"Inferred n_genes={n} from {csv_path}; CSV layout looks wrong."
+        )
+    return n
+
+
+def _filter_luna_csv_by_section(
+    train_csv: Path,
+    test_csv: Path,
+    sections: List[str],
+    out_csv: Path,
+) -> Dict[str, object]:
+    """Read LUNA's train + test CSVs, concatenate, filter to the requested
+    sections, save as a single test CSV for inference.
+
+    LUNA needs the `dataset.test_data_path` to contain ONLY the cells we
+    want predictions for. Since `--sections` can mix train-side (Mouse 1)
+    and test-side (Mouse 2) slices freely, we scan BOTH source CSVs by
+    `cell_section` column value.
+
+    Returns a dict with `n_rows`, `n_sections`, `matched`, `missing` for
+    logging.
+    """
+    parts = []
+    for src in (train_csv, test_csv):
+        df = pd.read_csv(src, index_col=0)
+        if "cell_section" not in df.columns:
+            raise ValueError(
+                f"No 'cell_section' column in {src} — is this a LUNA-format CSV?"
+            )
+        parts.append(df)
+    combined = pd.concat(parts, axis=0)
+    available = set(str(s) for s in combined["cell_section"].unique())
+    matched = [s for s in sections if s in available]
+    missing = [s for s in sections if s not in available]
+    if not matched:
+        raise ValueError(
+            f"None of --sections {sections} matched any cell_section value "
+            f"in the provided CSVs. Available (first 10): "
+            f"{sorted(available)[:10]}..."
+        )
+    if missing:
+        logger.warning(
+            f"  --sections values not found in CSVs and skipped: {missing}"
+        )
+    filtered = combined[combined["cell_section"].astype(str).isin(matched)].copy()
+    # Preserve the LUNA index dtype (integer cell IDs) — we don't reset.
+    filtered.to_csv(out_csv)
+    return {
+        "n_rows": len(filtered),
+        "n_sections": int(filtered["cell_section"].nunique()),
+        "matched": matched,
+        "missing": missing,
+    }
+
+
+def _adata_from_luna_outputs(pred_df: pd.DataFrame, true_df: pd.DataFrame):
+    """Build a minimal AnnData from LUNA's per-section pred + true CSVs
+    so the existing `_plot_comparison(adata, ...)` can render directly,
+    without needing a silver h5ad on disk.
+
+    The AnnData carries:
+      .obsm['spatial']        = GT coords from metadata_true.csv (raw scale)
+      .obsm['spatial_pred']   = LUNA's predicted coords (normalized [-0.5, 0.5])
+      .obs['cell_class']      = cell class labels (categorical)
+      .X                      = empty (0 vars) — plotting only uses .obsm/.obs
+    """
+    import anndata as ad
+
+    # Align by index if possible; otherwise assume row order matches.
+    if not pred_df.index.equals(true_df.index):
+        common = pred_df.index.intersection(true_df.index)
+        if len(common) < min(len(pred_df), len(true_df)):
+            logger.warning(
+                f"    pred and true CSVs partially mismatch; using "
+                f"{len(common)} common cells."
+            )
+        pred_df = pred_df.loc[common]
+        true_df = true_df.loc[common]
+
+    coords_true = true_df[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+    coords_pred = pred_df[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+    cell_class = (
+        true_df["cell_class"].astype(str).to_numpy()
+        if "cell_class" in true_df.columns
+        else np.full(len(true_df), "unknown")
+    )
+    n = len(true_df)
+    adata = ad.AnnData(X=np.zeros((n, 0), dtype=np.float32))
+    adata.obs_names = [str(i) for i in true_df.index]
+    adata.obs["cell_class"] = pd.Categorical(cell_class)
+    adata.obsm["spatial"] = coords_true
+    adata.obsm["spatial_pred"] = coords_pred
+    return adata
+
+
+# ---------------------------------------------------------------------------
 # Build LUNA-format CSVs from per-slice h5ads
 # ---------------------------------------------------------------------------
 
@@ -720,8 +853,11 @@ def _write_pred_into_h5ad(
 
 def run_inference(
     checkpoint: str,
-    silver_dir: str,
     sections: List[str],
+    silver_dir: Optional[str] = None,
+    test_csv: Optional[str] = None,
+    train_csv: Optional[str] = None,
+    n_genes: Optional[int] = None,
     output_dir: Optional[str] = None,
     color_col: str = "cell_class",
     luna_repo: str = str(_DEFAULT_LUNA_REPO),
@@ -735,12 +871,59 @@ def run_inference(
     include_train_section: bool = False,
     extra_overrides: Optional[List[str]] = None,
 ) -> None:
-    """Run LUNA inference; mirror of ``infer_scgg_on_cns:run_inference``."""
+    """Run LUNA inference; mirror of ``infer_scgg_on_cns:run_inference``.
+
+    Two input modes:
+
+      * **CSV mode** (recommended when the model was trained on LUNA's
+        published preprocessed CSVs): pass ``test_csv`` + ``train_csv``,
+        or auto-detect from the training output dir. Sections are
+        filtered by the ``cell_section`` column. Plots are produced
+        directly from LUNA's per-section ``metadata_pred.csv`` and
+        ``metadata_true.csv`` — no h5ad needed.
+
+      * **h5ad mode** (original): pass ``silver_dir``. Sections are
+        resolved to h5ad files, gene expression is log2-normalized and
+        written to a fresh test CSV, and the original h5ad is used as
+        the plot backbone.
+
+    For models trained on LUNA's CSVs, CSV mode is the **only correct
+    choice** — h5ad-derived test data has a different normalization than
+    the training data, so the model produces garbage on it.
+    """
     ckpt_path = Path(checkpoint)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
 
-    silver_path = Path(silver_dir)
+    # ----- Determine input mode + auto-detect paired CSVs --------------
+    use_csv = (test_csv is not None and train_csv is not None)
+
+    if not use_csv and silver_dir is None:
+        # Auto-detect paired CSVs next to the checkpoint: training scripts
+        # leave them at <output_dir>/work/{train,test}.csv.
+        real_ckpt = ckpt_path.resolve()
+        for parent in real_ckpt.parents:
+            cand_train = parent / "work" / "train.csv"
+            cand_test = parent / "work" / "test.csv"
+            if cand_train.exists() and cand_test.exists():
+                train_csv = str(cand_train)
+                test_csv = str(cand_test)
+                use_csv = True
+                logger.info(
+                    "Auto-detected paired CSVs from the training run:"
+                )
+                logger.info(f"  train_csv: {cand_train}")
+                logger.info(f"  test_csv:  {cand_test}")
+                break
+        if not use_csv:
+            raise ValueError(
+                "Need either --silver_dir (h5ad mode) OR --test_csv + "
+                "--train_csv (CSV mode). Auto-detection of paired CSVs at "
+                f".../work/{{train,test}}.csv next to {ckpt_path} also "
+                "failed."
+            )
+
+    # ----- Output dir ---------------------------------------------------
     if output_dir is None:
         model_ts = _timestamp_from_path(ckpt_path)
         if model_ts is None:
@@ -749,7 +932,16 @@ def run_inference(
                 f"  checkpoint path has no luna_model/<timestamp>/ ancestor; "
                 f"using fresh inference timestamp {model_ts}"
             )
-        out_dir = _ARTIFACTS_ROOT / silver_path.name / "luna_inference" / model_ts
+        if use_csv:
+            # Derive a dataset-like name from the training run's parent dir.
+            ckpt_parent = ckpt_path.resolve().parents
+            # ckpt_parent[0]=run_dir, [1]=luna_model, [2]=<dataset>
+            base = (
+                ckpt_parent[2].name if len(ckpt_parent) >= 3 else "luna_csv"
+            )
+        else:
+            base = Path(silver_dir).name
+        out_dir = _ARTIFACTS_ROOT / base / "luna_inference" / model_ts
     else:
         out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -770,80 +962,138 @@ def run_inference(
     if not luna_repo_p.exists():
         raise FileNotFoundError(f"LUNA repo not found: {luna_repo_p}")
 
-    # ---- 1. Resolve sections --------------------------------------------
-    section_paths = _resolve_section_files(silver_path, sections)
-
-    if include_train_section:
-        train_pick = _pick_representative_cortex_slice(silver_path, mouse_id=1)
-        if train_pick is None:
-            logger.warning(
-                f"  --include_train_section requested but no Mouse-1 silver "
-                f"h5ad found under {silver_path}; skipping."
-            )
-        elif train_pick in section_paths:
-            logger.info(
-                f"  --include_train_section: {train_pick.name} already in "
-                "the requested set; not duplicating."
-            )
-        else:
-            section_paths = [train_pick] + section_paths
-            logger.info(
-                f"  --include_train_section: prepended {train_pick.name}."
-            )
-
-    logger.info(
-        f"Inference on {len(section_paths)} sections: "
-        f"{[p.name for p in section_paths]}"
-    )
-
-    # ---- 2. Build test CSV + ensure train CSV is available -------------
     work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
-    test_csv = work / "test.csv"
-    train_csv = work / "train.csv"
+    inference_test_csv = work / "test.csv"
+    inference_train_csv = work / "train.csv"
 
-    test_files = _section_files_with_mouse(section_paths)
-    logger.info(f"Writing test CSV  -> {test_csv}")
-    test_stats = _build_luna_csv(
-        test_files, test_csv, log2_normalize=log2_normalize,
-    )
-    n_genes = int(test_stats["n_genes"])
+    if use_csv:
+        # ---- CSV mode: filter LUNA's pre-built CSVs by section -------
+        # `test_csv` / `train_csv` (args) are LUNA's full train+test
+        # CSVs (typically the ones the training run used). We extract
+        # only the requested sections into a single filtered CSV that
+        # we'll point LUNA's test_data_path at.
+        src_train_csv = Path(train_csv).resolve()
+        src_test_csv = Path(test_csv).resolve()
+        logger.info("CSV mode: filtering pre-built LUNA CSVs by --sections")
+        logger.info(f"  source train CSV: {src_train_csv}")
+        logger.info(f"  source test CSV:  {src_test_csv}")
 
-    # Train CSV: reuse the training-run's train.csv if available;
-    # otherwise rebuild from Mouse-1 silver h5ads.
-    candidate_train_csvs = [
-        ckpt_path.resolve().parent / "work" / "train.csv",
-        ckpt_path.resolve().parent.parent / "work" / "train.csv",
-    ]
-    reused = False
-    for c in candidate_train_csvs:
-        if c.exists():
-            if train_csv.exists() or train_csv.is_symlink():
-                train_csv.unlink()
-            try:
-                train_csv.symlink_to(c.resolve())
-                reused = True
-                logger.info(f"Reusing existing train CSV: {c}")
-                break
-            except OSError:
-                pass
-    if not reused:
-        all_files = []
-        for p in sorted(silver_path.iterdir()):
-            mm = _SLICE_RE.match(p.name)
-            if mm:
-                all_files.append((int(mm["mouse"]), int(mm["slice"]), p))
-        mouse1_files = [f for f in all_files if f[0] == 1]
-        if not mouse1_files:
-            raise FileNotFoundError(
-                f"No existing train.csv near {ckpt_path}, and no Mouse-1 "
-                f"silver h5ads under {silver_path} to rebuild it."
-            )
-        logger.info(
-            f"Re-building train CSV from {len(mouse1_files)} Mouse-1 "
-            f"silver h5ads -> {train_csv}"
+        if include_train_section:
+            extra_train_slice = "mouse1_slice99"
+            if extra_train_slice not in sections:
+                sections = [extra_train_slice] + list(sections)
+                logger.info(
+                    f"  --include_train_section: prepended "
+                    f"{extra_train_slice!r}."
+                )
+
+        filt_stats = _filter_luna_csv_by_section(
+            src_train_csv, src_test_csv, list(sections),
+            out_csv=inference_test_csv,
         )
-        _build_luna_csv(mouse1_files, train_csv, log2_normalize=log2_normalize)
+        logger.info(
+            f"  filtered test CSV -> {inference_test_csv}  "
+            f"({filt_stats['n_rows']:,} rows across "
+            f"{filt_stats['n_sections']} sections: "
+            f"{filt_stats['matched']})"
+        )
+
+        # LUNA needs a train_data_path too even in test_only mode
+        # (for dataset setup). Symlink to the source train CSV so we
+        # don't duplicate gigabytes on disk.
+        if inference_train_csv.exists() or inference_train_csv.is_symlink():
+            inference_train_csv.unlink()
+        try:
+            inference_train_csv.symlink_to(src_train_csv)
+        except OSError:
+            # FS without symlink support — fall through to direct path.
+            inference_train_csv = src_train_csv
+
+        # Infer n_genes from the source train CSV header if not passed
+        # (uses the same dual name+dtype detection as run_luna_on_mmc).
+        if n_genes is None:
+            n_genes = _infer_n_genes_from_csv(src_train_csv)
+            logger.info(f"  n_genes inferred from CSV = {n_genes}")
+        else:
+            logger.info(f"  n_genes (explicit) = {n_genes}")
+    else:
+        # ---- h5ad mode (legacy): build test CSV from silver h5ads ----
+        silver_path = Path(silver_dir)
+        section_paths = _resolve_section_files(silver_path, sections)
+
+        if include_train_section:
+            train_pick = _pick_representative_cortex_slice(silver_path, mouse_id=1)
+            if train_pick is None:
+                logger.warning(
+                    f"  --include_train_section requested but no Mouse-1 silver "
+                    f"h5ad found under {silver_path}; skipping."
+                )
+            elif train_pick in section_paths:
+                logger.info(
+                    f"  --include_train_section: {train_pick.name} already in "
+                    "the requested set; not duplicating."
+                )
+            else:
+                section_paths = [train_pick] + section_paths
+                logger.info(
+                    f"  --include_train_section: prepended {train_pick.name}."
+                )
+
+        logger.info(
+            f"Inference on {len(section_paths)} sections: "
+            f"{[p.name for p in section_paths]}"
+        )
+
+        test_files = _section_files_with_mouse(section_paths)
+        logger.info(f"Writing test CSV  -> {inference_test_csv}")
+        test_stats = _build_luna_csv(
+            test_files, inference_test_csv, log2_normalize=log2_normalize,
+        )
+        n_genes = int(test_stats["n_genes"])
+
+        # Train CSV: reuse the training-run's train.csv if available;
+        # otherwise rebuild from Mouse-1 silver h5ads.
+        candidate_train_csvs = [
+            ckpt_path.resolve().parent / "work" / "train.csv",
+            ckpt_path.resolve().parent.parent / "work" / "train.csv",
+        ]
+        reused = False
+        for c in candidate_train_csvs:
+            if c.exists():
+                if inference_train_csv.exists() or inference_train_csv.is_symlink():
+                    inference_train_csv.unlink()
+                try:
+                    inference_train_csv.symlink_to(c.resolve())
+                    reused = True
+                    logger.info(f"Reusing existing train CSV: {c}")
+                    break
+                except OSError:
+                    pass
+        if not reused:
+            all_files = []
+            for p in sorted(silver_path.iterdir()):
+                mm = _SLICE_RE.match(p.name)
+                if mm:
+                    all_files.append((int(mm["mouse"]), int(mm["slice"]), p))
+            mouse1_files = [f for f in all_files if f[0] == 1]
+            if not mouse1_files:
+                raise FileNotFoundError(
+                    f"No existing train.csv near {ckpt_path}, and no Mouse-1 "
+                    f"silver h5ads under {silver_path} to rebuild it."
+                )
+            logger.info(
+                f"Re-building train CSV from {len(mouse1_files)} Mouse-1 "
+                f"silver h5ads -> {inference_train_csv}"
+            )
+            _build_luna_csv(
+                mouse1_files, inference_train_csv, log2_normalize=log2_normalize,
+            )
+
+    # All downstream code uses these names; rebind to whatever path we
+    # actually settled on.
+    train_csv = inference_train_csv  # noqa: F811
+    test_csv = inference_test_csv
 
     # ---- 3. Invoke LUNA test mode --------------------------------------
     luna_run_dir = out_dir / "luna_run"
@@ -924,28 +1174,62 @@ def run_inference(
         raise RuntimeError(f"LUNA inference failed (exit {rc}). See {log_path}")
 
     # ---- 4. Read predictions + plot per section ------------------------
+    # _read_luna_predictions returns {label: pred_df}. We also need the
+    # paired metadata_true.csv for plotting / metrics — re-read it here.
     pred_sections = _read_luna_predictions(test_save_dir)
-    label_to_silver = {f"mouse{m}_slice{s}": p for (m, s, p) in test_files}
+    if use_csv:
+        label_to_silver: Dict[str, Optional[Path]] = {}
+    else:
+        label_to_silver = {
+            f"mouse{m}_slice{s}": p for (m, s, p) in test_files
+        }
+
+    # Resolve per-section paths to metadata_true.csv (LUNA writes it
+    # alongside metadata_pred.csv in each section subdir).
+    def _true_csv_for(label: str) -> Optional[Path]:
+        for pred in test_save_dir.rglob("metadata_pred.csv"):
+            if pred.parent.name == label:
+                t = pred.parent / "metadata_true.csv"
+                return t if t.exists() else None
+        return None
 
     summary: List[Dict[str, object]] = []
     for section_label, pred_df in pred_sections.items():
-        silver_for_label = label_to_silver.get(section_label)
-        if silver_for_label is None:
-            matches = [
-                p for k, p in label_to_silver.items() if k in section_label
-            ]
-            if not matches:
+        # Resolve a plot title and an h5ad backbone (h5ad mode) OR build
+        # an AnnData from LUNA's metadata CSVs (CSV mode).
+        if use_csv:
+            true_csv_path = _true_csv_for(section_label)
+            if true_csv_path is None:
                 logger.warning(
-                    f"  no silver h5ad matches LUNA section "
+                    f"  no metadata_true.csv for LUNA section "
                     f"{section_label!r}; skipping plot."
                 )
                 continue
-            silver_for_label = matches[0]
-        section_id = _strip_known_prefix(silver_for_label.stem)
-        logger.info(f"[{section_id}] LUNA -> {silver_for_label}")
-
-        out_h5ad = out_dir / f"{section_id}_predicted.h5ad"
-        adata = _write_pred_into_h5ad(silver_for_label, pred_df, out_h5ad)
+            true_df = pd.read_csv(true_csv_path, index_col=0)
+            section_id = section_label
+            logger.info(f"[{section_id}] LUNA -> CSV mode")
+            adata = _adata_from_luna_outputs(pred_df, true_df)
+            out_h5ad = out_dir / f"{section_id}_predicted.h5ad"
+            adata.write(out_h5ad)
+            input_source = str(true_csv_path)
+        else:
+            silver_for_label = label_to_silver.get(section_label)
+            if silver_for_label is None:
+                matches = [
+                    p for k, p in label_to_silver.items() if k in section_label
+                ]
+                if not matches:
+                    logger.warning(
+                        f"  no silver h5ad matches LUNA section "
+                        f"{section_label!r}; skipping plot."
+                    )
+                    continue
+                silver_for_label = matches[0]
+            section_id = _strip_known_prefix(silver_for_label.stem)
+            logger.info(f"[{section_id}] LUNA -> {silver_for_label}")
+            out_h5ad = out_dir / f"{section_id}_predicted.h5ad"
+            adata = _write_pred_into_h5ad(silver_for_label, pred_df, out_h5ad)
+            input_source = str(silver_for_label)
 
         coords_true_2d = (
             np.asarray(adata.obsm["spatial"], dtype=np.float32)[:, :2]
@@ -994,7 +1278,7 @@ def run_inference(
 
         rec: Dict[str, object] = {
             "section_id": section_id,
-            "input_path": str(silver_for_label),
+            "input_path": input_source,
             "output_h5ad": str(out_h5ad),
             "n_cells": int(adata.n_obs),
             "color_col": color_col_eff,
@@ -1008,7 +1292,10 @@ def run_inference(
             {
                 "method": "LUNA",
                 "checkpoint": str(ckpt_path),
-                "silver_dir": str(silver_path),
+                "input_mode": "csv" if use_csv else "h5ad",
+                "silver_dir": (None if use_csv else str(silver_dir)),
+                "source_train_csv": (str(train_csv) if use_csv else None),
+                "source_test_csv": (str(test_csv) if use_csv else None),
                 "sections": summary,
             },
             f, indent=2, default=str,
@@ -1030,8 +1317,27 @@ def main() -> int:
         help="Path to the LUNA .ckpt file (produced by run_luna_on_mmc.py).",
     )
     p.add_argument(
-        "--silver_dir", required=True,
-        help="Per-slice silver h5ad directory.",
+        "--silver_dir", default=None,
+        help="Per-slice silver h5ad directory (h5ad mode). Either this OR "
+             "(--train_csv + --test_csv) must be provided — or, when the "
+             "checkpoint sits under .../luna_model/<TS>/, paired CSVs are "
+             "auto-detected from <TS>/work/{train,test}.csv.",
+    )
+    p.add_argument(
+        "--train_csv", default=None,
+        help="Pre-built LUNA train CSV (CSV mode). Pair with --test_csv. "
+             "REQUIRED when the model was trained on LUNA's preprocessed "
+             "CSVs (h5ad-derived test data has a different normalization "
+             "and will produce garbage predictions).",
+    )
+    p.add_argument(
+        "--test_csv", default=None,
+        help="Pre-built LUNA test CSV. Pair with --train_csv.",
+    )
+    p.add_argument(
+        "--n_genes", type=int, default=None,
+        help="Number of gene columns in the pre-built CSVs (CSV mode). "
+             "Auto-inferred from the train CSV header when omitted.",
     )
     p.add_argument(
         "--sections", nargs="+", default=None,
@@ -1095,13 +1401,30 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    sections = args.sections or ["all_test"]
+    # Default --sections: 'all_test' in h5ad mode (resolves to every
+    # mouse2_*.h5ad). In CSV mode 'all_test' isn't supported (we filter
+    # by exact cell_section names), so require the user to be explicit.
+    if args.sections is not None:
+        sections = args.sections
+    elif args.train_csv is None and args.test_csv is None:
+        sections = ["all_test"]
+    else:
+        raise SystemExit(
+            "--sections must be specified when using --train_csv/--test_csv "
+            "(CSV mode). Examples:\n"
+            "  --sections mouse2_slice99 mouse2_slice119 mouse1_slice1\n"
+            "  --sections mouse2_slice99\n"
+            "(The 'all_test' / 'paper' presets only work in h5ad mode.)"
+        )
 
     try:
         run_inference(
             checkpoint=args.checkpoint,
-            silver_dir=args.silver_dir,
             sections=sections,
+            silver_dir=args.silver_dir,
+            test_csv=args.test_csv,
+            train_csv=args.train_csv,
+            n_genes=args.n_genes,
             output_dir=args.output_dir,
             color_col=args.color,
             luna_repo=args.luna_repo,
