@@ -181,6 +181,27 @@ class CrossAttentionVelocityNetwork(nn.Module):
         # k=0 reserved for "no control"; +1 to span [0, k_max] inclusive.
         self.k_embed = nn.Embedding(k_max + 1, k_embed_dim)
 
+        # Per-modality LayerNorms applied BEFORE concatenation, so each
+        # input modality enters the transformer at unit norm regardless
+        # of its native scale.
+        #
+        # Why this matters: at init, the L2 norms of the four streams
+        # differ by ~8x — z_t ≈ √2, t_emb ≈ √(time_embed_dim/2),
+        # cell_embed ≈ √cell_embed_dim, k_emb ≈ √k_embed_dim. With
+        # cell_embed_dim=128 the cell embedding dominates by ~8x over
+        # z_t (which carries the position the model is trying to
+        # denoise). A single Linear can in principle re-weight, but in
+        # practice the transformer can ignore z_t entirely for many
+        # steps and never recover.
+        #
+        # `z_t` gets a LayerNorm with `elementwise_affine=False` to keep
+        # the spatial geometry (the affine would let the net rescale
+        # both coordinates independently, defeating the purpose).
+        self.z_norm = nn.LayerNorm(spatial_dim, elementwise_affine=False)
+        self.t_norm = nn.LayerNorm(time_embed_dim)
+        self.cell_norm = nn.LayerNorm(cell_embed_dim)
+        self.k_norm = nn.LayerNorm(k_embed_dim)
+
         # Per-cell input projection.
         in_dim = spatial_dim + time_embed_dim + cell_embed_dim + k_embed_dim
         self.in_proj = nn.Linear(in_dim, hidden_dim)
@@ -227,8 +248,17 @@ class CrossAttentionVelocityNetwork(nn.Module):
             k_target = torch.zeros(n, dtype=torch.long, device=device)
         k_emb = self.k_embed(k_target)                                # (n, k_dim)
 
-        # Per-cell feature stack
-        x = torch.cat([z_t, t_emb, cell_embed, k_emb], dim=-1)        # (n, in_dim)
+        # Per-cell feature stack — normalize each modality independently
+        # so cell_embed doesn't dominate z_t at init (see __init__ note).
+        x = torch.cat(
+            [
+                self.z_norm(z_t),
+                self.t_norm(t_emb),
+                self.cell_norm(cell_embed),
+                self.k_norm(k_emb),
+            ],
+            dim=-1,
+        )                                                              # (n, in_dim)
         h = self.in_proj(x)                                            # (n, hidden)
 
         # Treat the n cells as one sequence of length n that gets

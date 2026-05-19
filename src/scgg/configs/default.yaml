@@ -88,7 +88,12 @@ model:
 # --- Graph ---
 graph:
   k_default: 10            # default kNN parameter (the user's k=10)
-  k_train_range: [5, 30]   # range of k values seen during flow-matching training
+  # k_train_range pinned to [k_default, k_default] so every step uses the
+  # same k value the model is evaluated at. The previous wide range
+  # [5, 30] meant only ~1/26 of training steps saw k=10, diluting the
+  # per-k conditioning signal. Widen again only when you specifically
+  # want to train a k-conditional flow.
+  k_train_range: [10, 10]
   k_train_probs: null      # uniform if null
   backend: "faiss"         # faiss | sklearn
   metric: "euclidean"
@@ -103,7 +108,14 @@ data:
   scale: true
   min_cells_per_section: 100
   coord_normalize: "per_section"
-  coord_augment_rotation: true
+  # Random per-section rotation each epoch. Useful for invariance, but
+  # disabled while we diagnose flow-matching collapse: with rotation on,
+  # the only learnable structure is *pairwise* (the absolute coord-from-
+  # gene_expr signal is randomized away), which doubles the work the
+  # cross-attention has to do. Turn back on once the encoder produces
+  # discriminative embeddings (cell_class_aux + contrastive_spatial
+  # take care of that).
+  coord_augment_rotation: false
   coord_center: true
 
 # --- Training ---
@@ -219,15 +231,22 @@ training:
       # and comparable across slices with different physical scales.
       normalize_by_var: true
 
-    # Optional auxiliary classifier on the encoder cell_embed against the GT
+    # Auxiliary classifier on the encoder cell_embed against the GT
     # cell-class labels. Adds orthogonal supervision: same-class cells tend
     # to co-localize spatially (cortical layers etc.), so a class-aware
     # encoder is a useful inductive bias for spatial-graph prediction.
-    # Off by default; enable when running on data with cell-class annotation
-    # (the LUNA cortex split has 23 classes — automatically wired by the
-    # luna_cortex loader).
+    #
+    # ON by default for flow_matching because the velocity-MSE gradient is
+    # a notoriously dilute signal for the encoder (it has to back-prop
+    # through 8 transformer layers from a noisy per-cell MSE). Without
+    # this, the encoder tends to produce near-identical embeddings for
+    # all cells in a slice, the cross-attention has nothing to distinguish
+    # them, and the model collapses to Spearman ~ 0. With this enabled
+    # the encoder gets a direct classification gradient.
+    # The luna_cortex loader auto-wires `n_classes` from `cell_class`
+    # in obs; the head is silently skipped if no labels are available.
     cell_class_aux:
-      enabled: false
+      enabled: true
       weight: 0.5
       hidden_dim: 128
       dropout: 0.1
@@ -235,10 +254,16 @@ training:
     # Settings for the flow-matching objective. Only used when
     # objective == "flow_matching"; ignored in contrastive mode.
     flow_matching: 1.0           # weight of the FM (velocity MSE) term
-    # Auxiliary InfoNCE on the encoder cell embeddings — LUNA doesn't use
-    # this, and our previous experiments with it muddied the ablation. Off
-    # by default; bump to 0.1 if you want the legacy two-term loss.
-    contrastive_spatial: 0.0
+    # Auxiliary InfoNCE on the encoder cell embeddings, using the GT
+    # spatial kNN graph as positives. LUNA doesn't need this because
+    # their adaLN-style conditioning gives the encoder a strong gradient
+    # at every transformer layer; our concat-only conditioning passes
+    # encoder gradient through a single Linear projection, so the
+    # encoder needs an additional direct supervision signal to learn
+    # discriminative per-cell embeddings. Without this, all cells in a
+    # slice get near-identical embeddings and the cross-attention
+    # velocity net collapses.
+    contrastive_spatial: 0.1
     contrastive_temperature: 0.1
     contrastive_n_negatives: 64
 

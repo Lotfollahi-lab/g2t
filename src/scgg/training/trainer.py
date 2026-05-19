@@ -170,31 +170,6 @@ class Trainer:
             else:
                 self.coord_criterion = None
 
-            # Optional cell-class auxiliary classifier on the encoder output.
-            cc_cfg = loss_cfg.get("cell_class_aux", {}) or {}
-            n_classes = getattr(train_dataset, "n_classes", 0)
-            self.use_cellclass_aux = (
-                bool(cc_cfg.get("enabled", False)) and n_classes > 0
-            )
-            self.cellclass_aux_weight = float(cc_cfg.get("weight", 1.0))
-            if self.use_cellclass_aux:
-                self.cellclass_aux_criterion = CellClassAuxLoss(
-                    cell_embed_dim=config["model"]["encoder"]["embed_dim"],
-                    n_classes=n_classes,
-                    hidden_dim=cc_cfg.get("hidden_dim", 128),
-                    dropout=cc_cfg.get("dropout", 0.1),
-                ).to(self.device)
-                logger.info(
-                    "Cell-class auxiliary loss ENABLED "
-                    f"(n_classes={n_classes}, weight={self.cellclass_aux_weight})"
-                )
-            else:
-                self.cellclass_aux_criterion = None
-                if cc_cfg.get("enabled", False) and n_classes == 0:
-                    logger.warning(
-                        "cell_class_aux enabled in config but train dataset has "
-                        "no cell_class labels (n_classes=0); skipping."
-                    )
         elif self.objective == "flow_matching":
             self.criterion = FlowMatchingLoss(
                 lambda_contrastive=loss_cfg.get("contrastive_spatial", 0.1),
@@ -206,6 +181,40 @@ class Trainer:
                 f"Unknown objective {self.objective!r}; expected one of "
                 f"'contrastive' or 'flow_matching'."
             )
+
+        # ---- Cell-class auxiliary classifier (objective-agnostic) ----------
+        # Auxiliary supervision on the encoder cell_embed against the GT
+        # cell-class labels. Shared by both objectives because both can
+        # benefit from a class-aware encoder, but it's particularly
+        # important for flow_matching: there the encoder's only signal
+        # otherwise has to flow back through 8 transformer layers from a
+        # noisy per-cell velocity MSE, which empirically isn't enough to
+        # learn discriminative per-cell embeddings.
+        cc_cfg = loss_cfg.get("cell_class_aux", {}) or {}
+        n_classes = getattr(train_dataset, "n_classes", 0)
+        self.use_cellclass_aux = (
+            bool(cc_cfg.get("enabled", False)) and n_classes > 0
+        )
+        self.cellclass_aux_weight = float(cc_cfg.get("weight", 1.0))
+        if self.use_cellclass_aux:
+            self.cellclass_aux_criterion = CellClassAuxLoss(
+                cell_embed_dim=config["model"]["encoder"]["embed_dim"],
+                n_classes=n_classes,
+                hidden_dim=cc_cfg.get("hidden_dim", 128),
+                dropout=cc_cfg.get("dropout", 0.1),
+            ).to(self.device)
+            logger.info(
+                "Cell-class auxiliary loss ENABLED "
+                f"(n_classes={n_classes}, weight={self.cellclass_aux_weight}, "
+                f"objective={self.objective})"
+            )
+        else:
+            self.cellclass_aux_criterion = None
+            if cc_cfg.get("enabled", False) and n_classes == 0:
+                logger.warning(
+                    "cell_class_aux enabled in config but train dataset has "
+                    "no cell_class labels (n_classes=0); skipping."
+                )
 
         # ---- Optional OOD components ----------------------------------------
         ood_cfg = train_cfg.get("ood", {}) or {}
@@ -757,6 +766,25 @@ class Trainer:
             # field is non-trivial; u_norm gives the target scale).
             metrics.update(fm_inner_metrics)
 
+            # Auxiliary cell-class classifier on cell_embed. Provides the
+            # encoder with a direct supervision signal that doesn't need
+            # to back-prop through 8 transformer layers from the noisy
+            # velocity MSE. Without this, the encoder tends to produce
+            # near-identical embeddings for all cells in a slice and the
+            # cross-attention velocity net collapses.
+            if self.use_cellclass_aux and self.cellclass_aux_criterion is not None:
+                cls = batch.get("cell_class", None)
+                if cls is not None:
+                    cls = cls.to(self.device)
+                    valid = cls >= 0
+                    if valid.any():
+                        cc_loss, cc_metrics = self.cellclass_aux_criterion(
+                            cell_embed[valid], cls[valid]
+                        )
+                        loss = loss + self.cellclass_aux_weight * cc_loss
+                        metrics["cellclass_aux_loss"] = cc_metrics["cellclass_aux_loss"]
+                        metrics["cellclass_aux_acc"] = cc_metrics["cellclass_aux_acc"]
+
         # ---- OOD components (no-op by default; require second modality) ----
         # Hooks are wired here so flipping them on in the future only requires
         # plumbing a paired-modality batch into _train_step. We currently do
@@ -922,6 +950,26 @@ class Trainer:
                     loss, m = self.criterion(fm_loss=fm_loss)
                     m = dict(m)
                     m.update(fm_inner)
+                    # Mirror the train step: report cellclass_aux on val too
+                    # if it's wired up. Loss accumulation here is just for
+                    # the scalar val "total_loss"; the head's running stats
+                    # are eval-mode (no dropout etc.).
+                    if (
+                        self.use_cellclass_aux
+                        and self.cellclass_aux_criterion is not None
+                    ):
+                        cls = batch.get("cell_class", None)
+                        if cls is not None:
+                            cls = cls.to(self.device)
+                            valid = cls >= 0
+                            if valid.any():
+                                cc_loss, cc_m = self.cellclass_aux_criterion(
+                                    ce[valid], cls[valid]
+                                )
+                                loss = loss + self.cellclass_aux_weight * cc_loss
+                                m["cellclass_aux_loss"] = cc_m["cellclass_aux_loss"]
+                                m["cellclass_aux_acc"] = cc_m["cellclass_aux_acc"]
+                    m["total_loss"] = loss.item()
                     val_metrics.append(m)
 
         if not val_metrics:
