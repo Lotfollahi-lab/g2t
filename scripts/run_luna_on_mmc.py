@@ -340,7 +340,7 @@ def _evaluate_predictions(
 
 
 def run_benchmark(
-    data_dir: str,
+    data_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
     epochs: int = 1000,
     batch_size: int = 6,
@@ -351,6 +351,9 @@ def run_benchmark(
     log2_normalize: bool = True,
     wandb_mode: str = "disabled",
     extra_overrides: Optional[List[str]] = None,
+    train_csv: Optional[str] = None,
+    test_csv: Optional[str] = None,
+    n_genes: Optional[int] = None,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
@@ -361,10 +364,26 @@ def run_benchmark(
 
     Returns a dict with the headline ``spearman_mean_of_medians`` metric.
     """
-    data_path = Path(data_dir)
+    # Validate args: either we build CSVs from silver h5ads (data_dir),
+    # or the caller supplies pre-built CSVs (train_csv + test_csv).
+    use_prebuilt = train_csv is not None and test_csv is not None
+    if not use_prebuilt and data_dir is None:
+        raise ValueError(
+            "Either --data_dir (build CSVs from silver h5ads) or both "
+            "--train_csv and --test_csv (use pre-built LUNA CSVs) must "
+            "be provided."
+        )
+    if (train_csv is None) != (test_csv is None):
+        raise ValueError("--train_csv and --test_csv must be passed together.")
+
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_dir is None:
-        out = _ARTIFACTS_ROOT / data_path.name / "luna_model" / run_ts
+        if use_prebuilt:
+            # Derive a sensible default from the train CSV's parent dir name.
+            base = Path(train_csv).resolve().parent.name or "luna_paper_csvs"
+        else:
+            base = Path(data_dir).name
+        out = _ARTIFACTS_ROOT / base / "luna_model" / run_ts
     else:
         out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -385,45 +404,96 @@ def run_benchmark(
     if not luna_repo_p.exists():
         raise FileNotFoundError(f"LUNA repo not found: {luna_repo_p}")
 
-    # ---- 1. Discover silver h5ads ---------------------------------------
-    files = _enumerate_slice_files(data_path)
-    train_files = _split_by_mouse(files, 1)
-    test_files = _split_by_mouse(files, 2)
-    logger.info(
-        f"Silver dir: {data_path} "
-        f"({len(train_files)} train [Mouse 1], {len(test_files)} test [Mouse 2])"
-    )
-    if not train_files or not test_files:
-        raise FileNotFoundError(
-            f"Need Mouse 1 AND Mouse 2 slices under {data_path}. "
-            f"Found train={len(train_files)}, test={len(test_files)}"
-        )
-
-    # ---- 2. Build LUNA CSVs ---------------------------------------------
     work = out / "work"
     work.mkdir(parents=True, exist_ok=True)
-    train_csv = work / "train.csv"
-    test_csv = work / "test.csv"
-    if train_csv.exists() and test_csv.exists():
-        logger.info("LUNA CSVs already exist under work/; reusing")
-        head = pd.read_csv(train_csv, nrows=1, index_col=0)
-        n_genes = len(head.columns) - 4  # coord_X, coord_Y, cell_section, cell_class
+
+    if use_prebuilt:
+        # ---- Pre-built CSV path: use LUNA's preprocessed files directly.
+        # This is the bit-exact paper-reproduction path; no h5ad → CSV
+        # conversion. Symlink them into work/ so LUNA's run dir is
+        # self-contained, and so a later inference script can resolve
+        # train.csv from a deterministic relative path.
+        src_train = Path(train_csv).resolve()
+        src_test = Path(test_csv).resolve()
+        if not src_train.exists():
+            raise FileNotFoundError(f"--train_csv not found: {src_train}")
+        if not src_test.exists():
+            raise FileNotFoundError(f"--test_csv not found: {src_test}")
+        train_csv_path = work / "train.csv"
+        test_csv_path = work / "test.csv"
+        for link, target in [(train_csv_path, src_train), (test_csv_path, src_test)]:
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            try:
+                link.symlink_to(target)
+            except OSError:
+                # Filesystems that disallow symlinks: fall through to direct path.
+                pass
+        # Use the symlink if it materialized; otherwise the source path.
+        train_csv_path = train_csv_path if train_csv_path.exists() else src_train
+        test_csv_path = test_csv_path if test_csv_path.exists() else src_test
+        logger.info(f"Using pre-built train CSV: {src_train}")
+        logger.info(f"Using pre-built test  CSV: {src_test}")
+
+        # n_genes: trust user override if passed; otherwise infer from
+        # the CSV header (n_columns - 4 metadata columns).
+        if n_genes is None:
+            head = pd.read_csv(src_train, nrows=1, index_col=0)
+            n_genes_inferred = len(head.columns) - 4
+            if n_genes_inferred <= 0:
+                raise ValueError(
+                    f"Could not infer n_genes from {src_train} (column "
+                    f"count {len(head.columns)} - 4 metadata = "
+                    f"{n_genes_inferred}). Pass --n_genes explicitly."
+                )
+            n_genes = n_genes_inferred
+        logger.info(f"n_genes = {n_genes}")
     else:
-        logger.info(f"Writing train CSV -> {train_csv}")
-        train_stats = _build_luna_csv(train_files, train_csv, log2_normalize=log2_normalize)
+        # ---- Silver h5ad path: build CSVs ourselves -----------------------
+        data_path = Path(data_dir)
+        files = _enumerate_slice_files(data_path)
+        train_files = _split_by_mouse(files, 1)
+        test_files = _split_by_mouse(files, 2)
         logger.info(
-            f"  train: {train_stats['n_rows']:,} rows, "
-            f"{train_stats['n_genes']} genes, "
-            f"{train_stats['n_sections']} sections"
+            f"Silver dir: {data_path} "
+            f"({len(train_files)} train [Mouse 1], {len(test_files)} test [Mouse 2])"
         )
-        logger.info(f"Writing test CSV  -> {test_csv}")
-        test_stats = _build_luna_csv(test_files, test_csv, log2_normalize=log2_normalize)
-        logger.info(
-            f"  test : {test_stats['n_rows']:,} rows, "
-            f"{test_stats['n_genes']} genes, "
-            f"{test_stats['n_sections']} sections"
-        )
-        n_genes = int(train_stats["n_genes"])
+        if not train_files or not test_files:
+            raise FileNotFoundError(
+                f"Need Mouse 1 AND Mouse 2 slices under {data_path}. "
+                f"Found train={len(train_files)}, test={len(test_files)}"
+            )
+
+        train_csv_path = work / "train.csv"
+        test_csv_path = work / "test.csv"
+        if train_csv_path.exists() and test_csv_path.exists():
+            logger.info("LUNA CSVs already exist under work/; reusing")
+            head = pd.read_csv(train_csv_path, nrows=1, index_col=0)
+            n_genes = len(head.columns) - 4
+        else:
+            logger.info(f"Writing train CSV -> {train_csv_path}")
+            train_stats = _build_luna_csv(
+                train_files, train_csv_path, log2_normalize=log2_normalize,
+            )
+            logger.info(
+                f"  train: {train_stats['n_rows']:,} rows, "
+                f"{train_stats['n_genes']} genes, "
+                f"{train_stats['n_sections']} sections"
+            )
+            logger.info(f"Writing test CSV  -> {test_csv_path}")
+            test_stats = _build_luna_csv(
+                test_files, test_csv_path, log2_normalize=log2_normalize,
+            )
+            logger.info(
+                f"  test : {test_stats['n_rows']:,} rows, "
+                f"{test_stats['n_genes']} genes, "
+                f"{test_stats['n_sections']} sections"
+            )
+            n_genes = int(train_stats["n_genes"])
+
+    # Reuse the path-variables for the rest of the function.
+    train_csv = train_csv_path  # noqa: F811  (intentional rebinding for downstream f-strings)
+    test_csv = test_csv_path
 
     # ---- 3. Invoke LUNA train_and_test ---------------------------------
     luna_run_dir = out / "luna_run"
@@ -529,14 +599,18 @@ def run_benchmark(
     cfg_snap = {
         "method": "LUNA",
         "run_timestamp": run_ts,
-        "data_dir": str(data_path),
+        "data_source": "prebuilt_csv" if use_prebuilt else "silver_h5ad",
+        "data_dir": (str(data_dir) if not use_prebuilt else None),
+        "train_csv": str(train_csv),
+        "test_csv": str(test_csv),
+        "n_genes": n_genes,
         "luna_repo": str(luna_repo_p),
         "run_name": run_name,
         "epochs": epochs,
         "batch_size": batch_size,
         "lr": lr,
         "seed": seed,
-        "log2_normalize": log2_normalize,
+        "log2_normalize": log2_normalize if not use_prebuilt else None,
         "extra_overrides": extra_overrides or [],
         "luna_run_dir": str(luna_run_dir),
         "test_save_dir": str(test_save_dir),
@@ -559,9 +633,28 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--data_dir", required=True,
+        "--data_dir", default=None,
         help="Per-slice silver h5ad directory (LUNA cortex split). "
-             "Mouse 1 => train, Mouse 2 => test.",
+             "Mouse 1 => train, Mouse 2 => test. Either this OR "
+             "(--train_csv + --test_csv) must be provided.",
+    )
+    p.add_argument(
+        "--train_csv", default=None,
+        help="Pre-built LUNA-format train CSV (e.g., LUNA's published "
+             "MERFISH_mouse_cortex_train.csv from their Google Drive: "
+             "https://drive.google.com/drive/folders/1vWxVUSuQzRDF1o9Vw_cnm-wbEYw_e1Gu"
+             "). Skips the h5ad → CSV conversion step entirely. "
+             "Required (with --test_csv) for bit-exact LUNA-paper "
+             "reproduction.",
+    )
+    p.add_argument(
+        "--test_csv", default=None,
+        help="Pre-built LUNA-format test CSV. Pair with --train_csv.",
+    )
+    p.add_argument(
+        "--n_genes", type=int, default=None,
+        help="Number of gene columns in the pre-built CSVs. Auto-inferred "
+             "from the CSV header (n_columns - 4 metadata) when omitted.",
     )
     p.add_argument(
         "--output_dir", default=None,
@@ -620,6 +713,9 @@ def main() -> int:
             log2_normalize=not args.no_log2_normalize,
             wandb_mode=args.wandb_mode,
             extra_overrides=args.luna_override,
+            train_csv=args.train_csv,
+            test_csv=args.test_csv,
+            n_genes=args.n_genes,
         )
     except Exception:
         logger.exception("LUNA training failed")
