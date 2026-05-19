@@ -851,26 +851,56 @@ def run_inference(
     test_save_dir = luna_run_dir / "test_results"
     test_save_dir.mkdir(parents=True, exist_ok=True)
 
-    # LUNA's checkpoint filenames are `epoch=N.ckpt`. Hydra's override
-    # parser eagerly splits on the FIRST `=`, then chokes on the second
-    # one inside the path with:
-    #     mismatched input '=' expecting <EOF>
-    # The Hydra grammar lets us escape the value by wrapping it in
-    # single quotes; those are stripped from the value at parse time, so
-    # the resulting config sees the unmodified path. We single-quote
-    # every path defensively in case the user ever has a path with `=`
-    # or other Hydra-special characters in the directory tree.
+    # LUNA's `test_model()` (when general.mode='test_only') iterates over
+    # checkpoints found in `test.checkpoints_parent_dir`, applies
+    # `test.checkpoints_name_list` (default 'all') to pick which to run,
+    # and parses each filename via `name.split("=")[-1].split(".")[0]`
+    # to extract an epoch number — so the file MUST be named
+    # `epoch=N.ckpt`. Our wrapper accepts a single checkpoint path; we
+    # isolate it by symlinking into a dedicated dir under our output
+    # location, preserving the original filename (resolving any
+    # `best_model.ckpt` symlink to its actual `epoch=N.ckpt` target).
+    real_ckpt = ckpt_path.resolve()
+    if not real_ckpt.exists():
+        raise FileNotFoundError(
+            f"Checkpoint symlink targets a missing file: "
+            f"{ckpt_path} -> {real_ckpt}"
+        )
+    if not real_ckpt.name.startswith("epoch=") or not real_ckpt.name.endswith(".ckpt"):
+        logger.warning(
+            f"  checkpoint target {real_ckpt.name!r} does not match "
+            "LUNA's expected 'epoch=N.ckpt' pattern; LUNA's "
+            "test_single_checkpoint will return silently. Pass a "
+            "checkpoint with that naming, or rename your target."
+        )
+    ckpt_isolation_dir = luna_run_dir / "single_ckpt"
+    ckpt_isolation_dir.mkdir(parents=True, exist_ok=True)
+    linked = ckpt_isolation_dir / real_ckpt.name
+    if linked.exists() or linked.is_symlink():
+        linked.unlink()
+    try:
+        linked.symlink_to(real_ckpt)
+    except OSError as e:
+        raise RuntimeError(
+            f"Could not symlink {real_ckpt} -> {linked}: {e}. "
+            "LUNA's test phase requires a writable dir holding the "
+            "checkpoint under its `epoch=N.ckpt` name."
+        )
+
+    # Single-quote paths so Hydra's override parser tolerates `=` and
+    # other special chars (LUNA's `epoch=N.ckpt` filenames have a literal
+    # `=` that would otherwise be split as a key-value separator).
     def _h(v: object) -> str:
         return f"'{v}'"
 
     overrides = [
         f"general.name={run_name}",
-        "general.mode=test",
+        "general.mode=test_only",
         f"dataset.train_data_path={_h(train_csv.resolve())}",
         f"dataset.test_data_path={_h(test_csv.resolve())}",
         "dataset.gene_columns_start=0",
         f"dataset.gene_columns_end={n_genes}",
-        f"test.checkpoint_path={_h(ckpt_path.resolve())}",
+        f"test.checkpoints_parent_dir={_h(ckpt_isolation_dir.resolve())}",
         f"test.save_dir={_h(test_save_dir.resolve())}",
         f"hydra.run.dir={_h(luna_run_dir.resolve())}",
     ]
