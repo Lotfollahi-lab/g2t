@@ -90,7 +90,20 @@ class SpatialTranscriptomicsDataset(Dataset):
     def _normalize_coords(
         self, coords: np.ndarray, section_ids: np.ndarray
     ) -> np.ndarray:
-        """Normalize coordinates per section: center and scale to unit variance."""
+        """Normalize coordinates.
+
+        Modes:
+          * ``per_section`` (legacy): zero-mean / unit-std per section,
+            using a SCALAR std across both axes (preserves aspect ratio).
+          * ``per_section_minmax`` (LUNA-aligned, recommended): per
+            section, scale EACH AXIS independently to [-0.5, 0.5] via
+            ``(x - min) / (max - min) - 0.5``. Matches LUNA's
+            ``utils.data.load.position_normalize``. The model's prior
+            ``N(0, I)`` covers this box comfortably; the slice's aspect
+            ratio is squashed to 1, which is fine because the model is
+            trained against per-axis min-maxed targets.
+          * ``global``: zero-mean / unit-std across the whole dataset.
+        """
         normalized = coords.copy()
         mode = self.config.get("coord_normalize", "per_section")
 
@@ -104,6 +117,16 @@ class SpatialTranscriptomicsDataset(Dataset):
                     normalized[mask] = (sec_coords - center) / std
                 else:
                     normalized[mask] = sec_coords - center
+        elif mode == "per_section_minmax":
+            for s in np.unique(section_ids):
+                mask = section_ids == s
+                sec_coords = coords[mask]
+                mn = sec_coords.min(axis=0)
+                mx = sec_coords.max(axis=0)
+                rng = mx - mn
+                # Guard against degenerate axes (rng == 0).
+                rng = np.where(rng > 0, rng, 1.0)
+                normalized[mask] = (sec_coords - mn) / rng - 0.5
         elif mode == "global":
             center = coords.mean(axis=0)
             std = coords.std()

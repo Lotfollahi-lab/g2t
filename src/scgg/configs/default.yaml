@@ -128,10 +128,26 @@ data:
   data_dir: "./data/merfish"
   gene_list: null
   n_top_hvg: null
-  normalize: true
-  scale: true
+  # LUNA-compatible defaults: pass gene-expression values through as-is.
+  # The silver h5ad (built from LUNA's CSVs) carries non-integer
+  # per-cell-normalized counts in [0, ~250]; LUNA's model is trained on
+  # exactly these values with no further transformation. Our prior
+  # default (normalize_total(1e4) + log1p + scale) turned the input
+  # into z-scored [-10, 10] values — a completely different distribution
+  # than what the architecture (cross-attention transformer) and the
+  # newly aligned pairwise-distance loss expect. The audit against
+  # LUNA's pipeline (datasets/data_module.py + utils/data/load.py)
+  # confirmed log2_norm is defined but NEVER called in their pipeline.
+  normalize: false
+  scale: false
   min_cells_per_section: 100
-  coord_normalize: "per_section"
+  # LUNA's `position_normalize` does per-section, per-axis min-max to
+  # [-0.5, 0.5] (each axis scaled independently). This matches our new
+  # `per_section_minmax` mode. The legacy `per_section` (zero-mean
+  # unit-std with a SCALAR std) was the prior default and preserves the
+  # slice's aspect ratio but produces values outside the [-0.5, 0.5]
+  # box LUNA's model is trained against.
+  coord_normalize: "per_section_minmax"
   # Random per-section rotation each epoch. Useful for invariance, but
   # disabled while we diagnose flow-matching collapse: with rotation on,
   # the only learnable structure is *pairwise* (the absolute coord-from-
