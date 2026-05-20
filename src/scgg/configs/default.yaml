@@ -50,28 +50,43 @@ model:
     # mlp-specific (ignored for cross_attention)
     hidden_dims: [256, 128]
 
-  # Velocity network (only built when objective == "flow_matching")
+  # Velocity / coord-predictor network (built when objective == "flow_matching")
   #
-  # Two flavours:
-  #   "mlp"  (legacy): per-cell MLP velocity. Cell-cell context only via
-  #       a scalar section_embed. Produces noise on reconstruction —
-  #       kept for ablations.
-  #   "cross_attention"  (default, LUNA-style): transformer encoder
-  #       with multi-head self-attention OVER cells of the slice.
-  #       Mirrors LUNA's `models/transformer.TransformerLayer`. This is
-  #       the variant that can actually learn spatial arrangement
-  #       because every cell's velocity depends on every other cell's
-  #       current position at each denoising step.
+  # Three flavours:
+  #   "mlp" (legacy): per-cell MLP velocity. No cell-cell context.
+  #       Kept for ablations only.
+  #   "cross_attention": single-stream transformer with multi-head
+  #       self-attention over cells of the slice. Predicts velocity.
+  #       Faster + simpler than the LUNA variant.
+  #   "luna" (default, recommended): faithful port of LUNA's
+  #       architecture — three input streams (node features, diffusion
+  #       time, positions) processed by separate MLPs, jointly updated
+  #       by N transformer layers with position-direction conditioning,
+  #       and an output stage that produces x_0 by modulating the
+  #       running position's magnitude via a feature-conditioned MLP.
+  #       Predicts x_0 directly (not velocity); the pairwise-distance
+  #       loss in ConditionalFlowMatching consumes it.
   velocity_net:
-    type: "cross_attention"     # mlp | cross_attention
-    # --- "mlp" specific (ignored when type == cross_attention) ---
+    type: "luna"                # mlp | cross_attention | luna
+    # --- "mlp" specific ----------------------------------------------
     hidden_dims: [512, 512, 256]
-    # --- "cross_attention" specific (ignored when type == mlp) ---
+    # --- "cross_attention" specific ----------------------------------
     hidden_dim: 256             # transformer width  (LUNA default: 256)
+    # --- "luna" specific ---------------------------------------------
+    # LUNA's `hidden_dims` dict translates to:
+    #   dx   -> node_dim          (node feature stream width)
+    #   dy   -> time_dim_hidden   (time stream width)
+    #   dd   -> delta_dim         (position-direction embedding)
+    # n_heads must divide node_dim. 256 / 8 = 32 head_dim — same as
+    # LUNA's `num_heads=16, dx=256` would give a smaller head_dim, but
+    # 8 heads with head_dim=32 is plenty.
+    node_dim: 256
+    time_dim_hidden: 128
+    delta_dim: 64
+    # --- common (all flavours) ---------------------------------------
     n_layers: 8                 # transformer depth  (LUNA default: 8)
-    n_heads: 16                 # MHA heads          (LUNA default: 16)
+    n_heads: 8                  # MHA heads
     ff_mult: 4                  # FFN expansion factor
-    # --- common ---
     time_embed_dim: 64
     k_embed_dim: 16
     dropout: 0.1
@@ -108,6 +123,14 @@ model:
     # larger than this. Cortex slices are ~5-7k so the default 4k is
     # a no-op for most slices and a soft cap for the largest.
     pairwise_dist_max_cells: 4096
+    # What the underlying network is parameterised to predict.
+    # Set automatically based on `model.velocity_net.type`:
+    #   * "luna"             -> "x_0"
+    #   * "cross_attention"  -> "velocity"
+    #   * "mlp"              -> "velocity"
+    # Override here to force a different mode (e.g. train the cross-
+    # attention net with x_0 prediction instead of velocity).
+    # prediction_target: x_0
 
 # --- Graph ---
 graph:

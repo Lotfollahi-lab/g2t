@@ -2,6 +2,7 @@ from .encoder import GeneExpressionEncoder, SectionEncoder
 from .metric_head import MetricHead
 from .velocity_net import VelocityNetwork
 from .velocity_net_attention import CrossAttentionVelocityNetwork
+from .luna_model import LunaTransformerNet
 from .flow_matching import ConditionalFlowMatching
 from .graph_constructor import GraphConstructor
 from .scgg import ScGG
@@ -12,6 +13,7 @@ __all__ = [
     "MetricHead",
     "VelocityNetwork",
     "CrossAttentionVelocityNetwork",
+    "LunaTransformerNet",
     "ConditionalFlowMatching",
     "GraphConstructor",
     "ScGG",

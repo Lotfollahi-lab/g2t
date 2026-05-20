@@ -43,6 +43,7 @@ class ConditionalFlowMatching(nn.Module):
         velocity_mse_weight: float = 0.1,
         translation_equivariant: bool = True,
         pairwise_dist_max_cells: int = 4096,
+        prediction_target: str = "velocity",
     ):
         """Conditional flow matching with LUNA-style pairwise-distance loss.
 
@@ -87,6 +88,20 @@ class ConditionalFlowMatching(nn.Module):
         self.velocity_mse_weight = float(velocity_mse_weight)
         self.translation_equivariant = bool(translation_equivariant)
         self.pairwise_dist_max_cells = int(pairwise_dist_max_cells)
+
+        # What the underlying network is parameterised to predict:
+        #   * "velocity": output is the OT-CFM velocity v_t = z_1 - (1-σ)·z_0.
+        #     Implied x_0 is computed as `x_hat_0 = z_t + (1-t)·v_t`.
+        #   * "x_0": output IS x_hat_0 directly (LUNA's choice). The
+        #     velocity for sampling is derived as
+        #     `v = (x_hat_0 - z_t) / max(1-t, eps)`.
+        # The pairwise-distance loss runs on x_hat_0 either way.
+        if prediction_target not in ("velocity", "x_0"):
+            raise ValueError(
+                f"prediction_target must be 'velocity' or 'x_0'; got "
+                f"{prediction_target!r}"
+            )
+        self.prediction_target = prediction_target
 
     @staticmethod
     def _center(x: torch.Tensor) -> torch.Tensor:
@@ -140,26 +155,36 @@ class ConditionalFlowMatching(nn.Module):
         u_t = z_1 - (1.0 - self.sigma_min) * z_0
 
         # ----- 3. Network prediction -----------------------------------
-        v_t = self.velocity_net(z_t, t, cell_embed, section_embed, k_target)
+        # `velocity_net` is the underlying network; the interpretation
+        # of its output depends on `self.prediction_target`.
+        net_out = self.velocity_net(z_t, t, cell_embed, section_embed, k_target)
         if self.translation_equivariant:
-            # Subtract per-batch mean of the velocity prediction. This
-            # makes the velocity field translation-equivariant: the model
-            # cannot predict a net drift away from the slice centroid.
-            v_t = self._center(v_t)
+            net_out = self._center(net_out)
 
-        # ----- 4. Velocity MSE (the original FM objective) -------------
-        velocity_mse = torch.mean((v_t - u_t) ** 2)
-
-        # ----- 5. Implied x_0 estimate ---------------------------------
-        # For OT-CFM with sigma_min ≈ 0:
-        #   z_t = (1-t)*z_0 + t*z_1   and   v_t = z_1 - z_0
-        #   ⇒  z_1 = z_t + (1-t)*v_t
-        # With sigma_min > 0 the correction is O(sigma_min) and negligible
-        # (sigma_min defaults to 1e-4).
         one_minus_t = (1.0 - t).unsqueeze(-1)
-        x_hat_0 = z_t + one_minus_t * v_t
+
+        if self.prediction_target == "velocity":
+            # Network predicts the OT-CFM velocity directly.
+            v_t = net_out
+            # Implied x_0 estimate (OT-CFM with σ_min≈0):
+            #   z_t = (1-t)*z_0 + t*z_1   and   v_t = z_1 - z_0
+            #   ⇒  z_1 = z_t + (1-t)*v_t
+            x_hat_0 = z_t + one_minus_t * v_t
+        else:  # "x_0"
+            # Network predicts x_0 directly (LUNA's choice).
+            x_hat_0 = net_out
+            # Implied velocity (rearrangement of the relation above).
+            # Clamp the denominator to avoid blow-up at t≈1 (where the
+            # implied velocity is undefined — and where the loss
+            # gradient on velocity vanishes anyway).
+            denom = one_minus_t.clamp_min(1e-3)
+            v_t = (x_hat_0 - z_t) / denom
+
         if self.translation_equivariant:
             x_hat_0 = self._center(x_hat_0)
+
+        # ----- 4. Velocity MSE (regulariser when pdist is primary) -----
+        velocity_mse = torch.mean((v_t - u_t) ** 2)
 
         # ----- 6. Pairwise-distance MSE (LUNA's loss) ------------------
         # Subsample cells for the cdist to keep memory bounded. For
@@ -230,26 +255,33 @@ class ConditionalFlowMatching(nn.Module):
 
         dt = 1.0 / n_steps
 
+        # Inner helper: returns the velocity at (z, t), regardless of
+        # whether the underlying net predicts velocity or x_0.
+        def _velocity(zz, tt):
+            out = self.velocity_net(zz, tt, cell_embed, section_embed, k_target)
+            if self.translation_equivariant:
+                out = self._center(out)
+            if self.prediction_target == "velocity":
+                return out
+            # x_0 prediction → derive velocity. Clamp the denominator
+            # to avoid blow-up at t≈1.
+            one_minus_t = (1.0 - tt).unsqueeze(-1).clamp_min(1e-3)
+            return (out - zz) / one_minus_t
+
         for step in range(n_steps):
             t_val = step * dt
             t = torch.full((n_cells,), t_val, device=device)
 
             if solver == "euler":
-                v = self.velocity_net(z, t, cell_embed, section_embed, k_target)
-                if self.translation_equivariant:
-                    v = self._center(v)
+                v = _velocity(z, t)
                 z = z + dt * v
 
             elif solver == "midpoint":
                 # Half step
-                v1 = self.velocity_net(z, t, cell_embed, section_embed, k_target)
-                if self.translation_equivariant:
-                    v1 = self._center(v1)
+                v1 = _velocity(z, t)
                 z_mid = z + 0.5 * dt * v1
                 t_mid = torch.full((n_cells,), t_val + 0.5 * dt, device=device)
-                v2 = self.velocity_net(z_mid, t_mid, cell_embed, section_embed, k_target)
-                if self.translation_equivariant:
-                    v2 = self._center(v2)
+                v2 = _velocity(z_mid, t_mid)
                 z = z + dt * v2
 
             elif solver == "rk4":
@@ -258,14 +290,10 @@ class ConditionalFlowMatching(nn.Module):
                 t3 = t2
                 t4 = torch.full((n_cells,), t_val + dt, device=device)
 
-                def _v(zz, tt):
-                    out = self.velocity_net(zz, tt, cell_embed, section_embed, k_target)
-                    return self._center(out) if self.translation_equivariant else out
-
-                k1 = _v(z, t1)
-                k2 = _v(z + 0.5 * dt * k1, t2)
-                k3 = _v(z + 0.5 * dt * k2, t3)
-                k4 = _v(z + dt * k3, t4)
+                k1 = _velocity(z, t1)
+                k2 = _velocity(z + 0.5 * dt * k1, t2)
+                k3 = _velocity(z + 0.5 * dt * k2, t3)
+                k4 = _velocity(z + dt * k3, t4)
                 z = z + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
         return z

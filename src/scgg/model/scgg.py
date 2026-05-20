@@ -27,6 +27,7 @@ from .encoder import GeneExpressionEncoder, SectionEncoder
 from .metric_head import MetricHead, CrossCellMetricHead
 from .velocity_net import VelocityNetwork
 from .velocity_net_attention import CrossAttentionVelocityNetwork
+from .luna_model import LunaTransformerNet
 from .flow_matching import ConditionalFlowMatching
 from .graph_constructor import GraphConstructor
 
@@ -131,6 +132,31 @@ class ScGG(nn.Module):
             vn_type = str(vn_cfg.get("type", "cross_attention")).lower()
             k_max = config["graph"].get("k_train_range", [5, 30])[1] + 10
 
+            # Default prediction target depends on the net flavour.
+            # LUNA predicts x_0; the MLP and cross-attention velocity
+            # nets predict velocity.
+            default_prediction_target = (
+                "x_0" if vn_type == "luna" else "velocity"
+            )
+            prediction_target = str(
+                fl_cfg.get("prediction_target", default_prediction_target)
+            ).lower()
+
+            # Default velocity_mse_weight depends on prediction_target.
+            # When predicting x_0, the derived velocity is
+            # v = (x_hat_0 - z_t) / (1-t) which blows up at t≈1 — the
+            # velocity MSE term can dominate the loss by 2500x at init.
+            # LUNA's actual setup uses ONLY the pairwise-distance loss,
+            # so we follow suit: default vel-MSE weight to 0 when
+            # x_0 is predicted; leave it as the configured value
+            # (typically 0.1) for explicit velocity prediction.
+            default_velocity_mse_weight = (
+                0.0 if prediction_target == "x_0" else 0.1
+            )
+            velocity_mse_weight = float(
+                fl_cfg.get("velocity_mse_weight", default_velocity_mse_weight)
+            )
+
             if vn_type == "mlp":
                 self.velocity_net = VelocityNetwork(
                     spatial_dim=model_cfg["spatial_dim"],
@@ -155,10 +181,23 @@ class ScGG(nn.Module):
                     dropout=vn_cfg["dropout"],
                     ff_mult=vn_cfg.get("ff_mult", 4),
                 )
+            elif vn_type == "luna":
+                self.velocity_net = LunaTransformerNet(
+                    spatial_dim=model_cfg["spatial_dim"],
+                    cell_embed_dim=enc_cfg["embed_dim"],
+                    time_embed_dim=vn_cfg["time_embed_dim"],
+                    node_dim=vn_cfg.get("node_dim", 256),
+                    time_dim_hidden=vn_cfg.get("time_dim_hidden", 128),
+                    delta_dim=vn_cfg.get("delta_dim", 64),
+                    n_layers=vn_cfg.get("n_layers", 8),
+                    n_heads=vn_cfg.get("n_heads", 8),
+                    ff_mult=vn_cfg.get("ff_mult", 4),
+                    dropout=vn_cfg["dropout"],
+                )
             else:
                 raise ValueError(
-                    f"model.velocity_net.type must be 'mlp' or "
-                    f"'cross_attention'; got {vn_type!r}"
+                    f"model.velocity_net.type must be 'mlp', "
+                    f"'cross_attention', or 'luna'; got {vn_type!r}"
                 )
             self.flow = ConditionalFlowMatching(
                 velocity_net=self.velocity_net,
@@ -166,15 +205,14 @@ class ScGG(nn.Module):
                 pairwise_dist_weight=float(
                     fl_cfg.get("pairwise_dist_weight", 1.0)
                 ),
-                velocity_mse_weight=float(
-                    fl_cfg.get("velocity_mse_weight", 0.1)
-                ),
+                velocity_mse_weight=velocity_mse_weight,
                 translation_equivariant=bool(
                     fl_cfg.get("translation_equivariant", True)
                 ),
                 pairwise_dist_max_cells=int(
                     fl_cfg.get("pairwise_dist_max_cells", 4096)
                 ),
+                prediction_target=prediction_target,
             )
 
         # ---- Graph constructor (always present, parameter-free) -------------
