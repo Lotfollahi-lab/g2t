@@ -221,17 +221,24 @@ class Trainer:
         self._setup_ood_components(ood_cfg, train_cfg)
 
         # ---- Optimizer ------------------------------------------------------
+        # LUNA uses AdamW with amsgrad=True; we expose it as a config knob
+        # (default true to match LUNA). Setting amsgrad=True maintains the
+        # running max of the squared gradients, which empirically
+        # stabilises diffusion-style training at low weight_decay.
+        amsgrad = bool(train_cfg.get("amsgrad", True))
         if train_cfg["optimizer"] == "adamw":
             self.optimizer = torch.optim.AdamW(
                 self._all_params(),
                 lr=train_cfg["lr"],
                 weight_decay=train_cfg["weight_decay"],
+                amsgrad=amsgrad,
             )
         else:
             self.optimizer = torch.optim.Adam(
                 self._all_params(),
                 lr=train_cfg["lr"],
                 weight_decay=train_cfg["weight_decay"],
+                amsgrad=amsgrad,
             )
 
         # ---- LR schedule ----------------------------------------------------

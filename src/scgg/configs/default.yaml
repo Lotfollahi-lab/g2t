@@ -68,25 +68,27 @@ model:
   #       loss in ConditionalFlowMatching consumes it.
   velocity_net:
     type: "luna"                # mlp | cross_attention | luna
-    # --- "mlp" specific ----------------------------------------------
+    # --- "mlp" specific (legacy) -------------------------------------
     hidden_dims: [512, 512, 256]
     # --- "cross_attention" specific ----------------------------------
-    hidden_dim: 256             # transformer width  (LUNA default: 256)
-    # --- "luna" specific ---------------------------------------------
-    # LUNA's `hidden_dims` dict translates to:
-    #   dx   -> node_dim          (node feature stream width)
-    #   dy   -> time_dim_hidden   (time stream width)
-    #   dd   -> delta_dim         (position-direction embedding)
-    # n_heads must divide node_dim. 256 / 8 = 32 head_dim — same as
-    # LUNA's `num_heads=16, dx=256` would give a smaller head_dim, but
-    # 8 heads with head_dim=32 is plenty.
-    node_dim: 256
-    time_dim_hidden: 128
-    delta_dim: 64
+    hidden_dim: 256
+    # --- "luna" specific (DEFAULTS MIRROR LUNA's configs/model) ------
+    # LUNA's `hidden_dims`:
+    node_dim: 256             # dx   — node feature stream
+    time_dim: 1               # dy   — time stream is a SCALAR per cell
+                              #        (LUNA's choice; keep it tiny)
+    delta_dim: 64             # dd   — position-direction embedding
+    dim_ff_node: 256          # dim_ffX — node FFN expansion (absolute)
+    dim_ff_time: 256          # dim_ffy — time FFN expansion (absolute)
+    output_features_dim: 4    # output_features_to_pos_dims
+    # LUNA's `hidden_mlp_dims`:
+    hidden_mlp_x: 256         # input node MLP hidden
+    hidden_mlp_y: 256         # input time MLP hidden
+    hidden_mlp_pos: 64        # PositionsMLP hidden
     # --- common (all flavours) ---------------------------------------
-    n_layers: 8                 # transformer depth  (LUNA default: 8)
-    n_heads: 8                  # MHA heads
-    ff_mult: 4                  # FFN expansion factor
+    n_layers: 8               # LUNA default
+    n_heads: 16               # LUNA default (must divide node_dim)
+    ff_mult: 4                # used only by cross_attention
     time_embed_dim: 64
     k_embed_dim: 16
     dropout: 0.1
@@ -203,12 +205,16 @@ training:
   objective: "flow_matching"
 
   seed: 42
-  epochs: 200
-  batch_size: 8192
+  # LUNA-aligned defaults (matches configs/experiment/MERFISH_mouse_cortex.yaml
+  # and configs/train/default.yaml from the LUNA repo).
+  epochs: 1000               # LUNA default: 1000
+  batch_size: 8192           # cells per mini-batch (within a slice)
   sections_per_epoch: null
-  lr: 1.0e-3
-  weight_decay: 1.0e-4
+  lr: 5.0e-4                 # LUNA default: 5e-4
+  weight_decay: 1.0e-12      # LUNA default: 1e-12 (essentially OFF;
+                             # our prior 1e-4 was 1e8x more aggressive)
   optimizer: "adamw"
+  amsgrad: true              # LUNA uses AdamW with amsgrad=True
   scheduler: "cosine"
   warmup_epochs: 10
   grad_clip: 1.0
@@ -299,17 +305,15 @@ training:
     # to co-localize spatially (cortical layers etc.), so a class-aware
     # encoder is a useful inductive bias for spatial-graph prediction.
     #
-    # ON by default for flow_matching because the velocity-MSE gradient is
-    # a notoriously dilute signal for the encoder (it has to back-prop
-    # through 8 transformer layers from a noisy per-cell MSE). Without
-    # this, the encoder tends to produce near-identical embeddings for
-    # all cells in a slice, the cross-attention has nothing to distinguish
-    # them, and the model collapses to Spearman ~ 0. With this enabled
-    # the encoder gets a direct classification gradient.
-    # The luna_cortex loader auto-wires `n_classes` from `cell_class`
-    # in obs; the head is silently skipped if no labels are available.
+    # Cell-class auxiliary classifier. LUNA does NOT use any auxiliary
+    # supervision — their loss is purely pairwise-distance MSE on x_0.
+    # We turned this on in earlier rounds as a workaround for an
+    # encoder-collapse hypothesis that turned out not to be the root
+    # cause. With LUNA's architecture and per-slice t now in place, the
+    # primary pairwise-distance loss has enough signal on its own.
+    # Disable to match LUNA exactly. Set enabled: true to ablate it.
     cell_class_aux:
-      enabled: true
+      enabled: false
       weight: 0.5
       hidden_dim: 128
       dropout: 0.1
@@ -317,16 +321,10 @@ training:
     # Settings for the flow-matching objective. Only used when
     # objective == "flow_matching"; ignored in contrastive mode.
     flow_matching: 1.0           # weight of the FM (velocity MSE) term
-    # Auxiliary InfoNCE on the encoder cell embeddings, using the GT
-    # spatial kNN graph as positives. LUNA doesn't need this because
-    # their adaLN-style conditioning gives the encoder a strong gradient
-    # at every transformer layer; our concat-only conditioning passes
-    # encoder gradient through a single Linear projection, so the
-    # encoder needs an additional direct supervision signal to learn
-    # discriminative per-cell embeddings. Without this, all cells in a
-    # slice get near-identical embeddings and the cross-attention
-    # velocity net collapses.
-    contrastive_spatial: 0.1
+    # Auxiliary InfoNCE on encoder cell embeddings. Off by default in
+    # the LUNA-aligned setup (LUNA itself uses only pairwise-distance
+    # MSE — no auxiliary terms). Set > 0 to ablate.
+    contrastive_spatial: 0.0
     contrastive_temperature: 0.1
     contrastive_n_negatives: 64
 

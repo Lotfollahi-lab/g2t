@@ -141,7 +141,12 @@ class ConditionalFlowMatching(nn.Module):
             z_1 = self._center(z_1)
 
         # ----- 2. Sample t and z_0, build z_t / u_t --------------------
-        t = torch.rand(batch_size, device=device)
+        # Per-SLICE t (not per-cell). LUNA samples one t per slice and
+        # broadcasts it to every cell in that slice — all cells see the
+        # SAME noise level in one forward. Our per-cell t made the model
+        # solve a harder, dispersed denoising problem.
+        t_scalar = torch.rand(1, device=device)
+        t = t_scalar.expand(batch_size)
         z_0 = torch.randn_like(z_1)
         if self.translation_equivariant:
             z_0 = self._center(z_0)

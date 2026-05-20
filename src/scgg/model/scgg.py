@@ -186,12 +186,20 @@ class ScGG(nn.Module):
                     spatial_dim=model_cfg["spatial_dim"],
                     cell_embed_dim=enc_cfg["embed_dim"],
                     time_embed_dim=vn_cfg["time_embed_dim"],
+                    # LUNA's `hidden_dims` block
                     node_dim=vn_cfg.get("node_dim", 256),
-                    time_dim_hidden=vn_cfg.get("time_dim_hidden", 128),
+                    time_dim=vn_cfg.get("time_dim", 1),
                     delta_dim=vn_cfg.get("delta_dim", 64),
+                    dim_ff_node=vn_cfg.get("dim_ff_node", 256),
+                    dim_ff_time=vn_cfg.get("dim_ff_time", 256),
+                    output_features_dim=vn_cfg.get("output_features_dim", 4),
+                    # LUNA's `hidden_mlp_dims` block
+                    hidden_mlp_x=vn_cfg.get("hidden_mlp_x", 256),
+                    hidden_mlp_y=vn_cfg.get("hidden_mlp_y", 256),
+                    hidden_mlp_pos=vn_cfg.get("hidden_mlp_pos", 64),
+                    # Stack + heads
                     n_layers=vn_cfg.get("n_layers", 8),
-                    n_heads=vn_cfg.get("n_heads", 8),
-                    ff_mult=vn_cfg.get("ff_mult", 4),
+                    n_heads=vn_cfg.get("n_heads", 16),
                     dropout=vn_cfg["dropout"],
                 )
             else:
