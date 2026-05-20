@@ -155,7 +155,15 @@ def _build_luna_csv(
         X = adata.X
         if sp.issparse(X):
             X = X.toarray()
-        X = np.asarray(X, dtype=np.float32)
+        # Preserve the h5ad's native precision (float64 if the silver
+        # was built via build_h5ad_from_luna_csv.py with the float64
+        # default). Casting to float32 here would introduce LSB
+        # rounding that, combined with the cast inside LUNA's
+        # data_module (`.float()`), makes h5ad-derived training
+        # diverge slightly from CSV-direct training even when the
+        # source data is identical. Both paths end up at float32
+        # inside LUNA; we just want THAT cast to be the only one.
+        X = np.asarray(X, dtype=np.float64)
         if log2_normalize:
             X = np.log2(X + 1.0)
 
@@ -174,11 +182,11 @@ def _build_luna_csv(
             else np.full(adata.n_obs, "unknown")
         )
         if "spatial" in adata.obsm:
-            xy = np.asarray(adata.obsm["spatial"], dtype=np.float32)[:, :2]
+            xy = np.asarray(adata.obsm["spatial"], dtype=np.float64)[:, :2]
         else:
             xy = np.column_stack([
-                adata.obs["coord_X"].to_numpy(dtype=np.float32),
-                adata.obs["coord_Y"].to_numpy(dtype=np.float32),
+                adata.obs["coord_X"].to_numpy(dtype=np.float64),
+                adata.obs["coord_Y"].to_numpy(dtype=np.float64),
             ])
 
         df = pd.DataFrame(X, columns=gene_names)
@@ -194,7 +202,12 @@ def _build_luna_csv(
         df.index = range(len(df))
         df.index.name = "cell_id"
 
-        df.to_csv(out_csv, mode="a", header=first)
+        # `float_format=None` (default) uses str() which writes enough
+        # digits to round-trip float64 exactly (17 significant digits).
+        # This guarantees: bronze CSV → h5ad (float64) → fresh CSV →
+        # LUNA → same float32 tensor LUNA would build from the bronze
+        # CSV directly. No precision is lost in the round-trip.
+        df.to_csv(out_csv, mode="a", header=first, float_format=None)
         rows_total += len(df)
         first = False
         logger.info(f"    wrote {len(df):>6,} cells from {section_label}")

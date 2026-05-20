@@ -362,17 +362,14 @@ class DiffusionDDPM(nn.Module):
             if self.translation_equivariant:
                 x_0_pred = self._center(x_0_pred)
 
-            if s > 0:
-                # Sample z_{t-1} ~ N(μ, σ² I).
-                z_t = self.noise_model.sample_zs_from_zt_and_pred(
-                    z_t, x_0_pred, t_int, s_int
-                )
-            else:
-                # Last step (t=1, s=0): the standard convention is that
-                # at s=0 the prediction IS the final output (no further
-                # noise is added). LUNA's loop also exits with z at the
-                # final step.
-                z_t = x_0_pred
+            # Sample z_{t-1} ~ N(μ, σ² I). Matches LUNA's loop: the
+            # call is unconditional. At s=0, the math collapses to
+            # z_{0} = x_0_pred (the position prefactor goes to 1, noise
+            # scale goes to 0) — see the σ_sq_ratio computation, which
+            # produces ~0 at s=0 because σ²_s = -expm1(0) = 0.
+            z_t = self.noise_model.sample_zs_from_zt_and_pred(
+                z_t, x_0_pred, t_int, s_int
+            )
 
             if self.translation_equivariant:
                 z_t = self._center(z_t)

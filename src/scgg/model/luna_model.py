@@ -33,10 +33,16 @@ missing) are:
   * **Predict x_0 directly**, not velocity. The pairwise-distance loss
     in ``flow_matching.py`` then compares the predicted x_0 to the GT.
 
-We use ``nn.MultiheadAttention`` instead of LUNA's
-``LinearAttentionTransformer`` (their dependency on the
-``linear_attention_transformer`` package). For cortex slices of
-< ~8k cells per forward, standard MHA fits in memory easily.
+We use LUNA's exact attention implementation — the
+``LinearAttentionTransformer`` from the
+``linear_attention_transformer`` package (depth=1 = one full
+transformer block with LN + linear attention + residual + LN + FFN
++ residual). Linear-time attention (O(n·d²) instead of standard
+MHA's O(n²·d)) is essential for 1000-step DDPM reverse sampling
+on multi-thousand-cell slices — without it inference would take
+hours per slice on cortex data.
+
+Install: ``pip install linear-attention-transformer``
 
 The forward signature matches our other velocity nets
 (``CrossAttentionVelocityNetwork``, ``VelocityNetwork``):
@@ -53,6 +59,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +90,93 @@ class _SinusoidalTimeEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 # Position-equivariant MLP and norm (LUNA's models/layers.py)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Linear-time attention (Katharopoulos et al. 2020, "Transformers are RNNs")
+# Inline replacement for `linear_attention_transformer.LinearAttentionTransformer`
+# (the library LUNA imports). Same math: φ(Q)·(φ(K)^T·V) with
+# φ(x) = elu(x)+1, O(n·d²) instead of O(n²·d).
+# ---------------------------------------------------------------------------
+
+
+class _LinearAttention(nn.Module):
+    """Single-head-merged linear attention with elu+1 feature map.
+
+    Computes ``φ(Q) · ((φ(K)^T · V)) / (φ(Q) · (φ(K)^T · 1))``
+    where ``φ(x) = elu(x) + 1`` ensures positivity (matches what
+    lucidrains' ``linear_attention_transformer`` uses by default).
+    """
+
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        assert dim % heads == 0, (
+            f"dim ({dim}) must be divisible by heads ({heads})"
+        )
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.to_out = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, D)
+        B, N, D = x.shape
+        H, Hd = self.heads, self.head_dim
+
+        qkv = self.to_qkv(x).reshape(B, N, 3, H, Hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]                     # (B, H, N, Hd)
+
+        # Positive feature map.
+        q = F.elu(q) + 1.0
+        k = F.elu(k) + 1.0
+
+        # K^T · V  →  (B, H, Hd, Hd). The "key-value summary" reused
+        # across all queries — this is where linear attention's
+        # O(n·d²) cost comes from (no n×n matrix).
+        kv = torch.einsum("bhnd,bhne->bhde", k, v)
+
+        # Numerator: Q · (K^T · V)  →  (B, H, N, Hd).
+        num = torch.einsum("bhnd,bhde->bhne", q, kv)
+
+        # Denominator: Q · (K^T · 1)  →  (B, H, N).
+        k_sum = k.sum(dim=2)                                  # (B, H, Hd)
+        denom = torch.einsum("bhnd,bhd->bhn", q, k_sum)       # (B, H, N)
+        denom = denom.unsqueeze(-1).clamp_min(1e-6)           # (B, H, N, 1)
+
+        out = num / denom                                     # (B, H, N, Hd)
+        out = out.transpose(1, 2).reshape(B, N, D)            # (B, N, D)
+        return self.to_out(out)
+
+
+class _LinearAttentionBlock(nn.Module):
+    """One pre-norm transformer block: LN + linear-attn + residual +
+    LN + FFN + residual. Equivalent to
+    ``LinearAttentionTransformer(dim, heads, depth=1)`` in lucidrains'
+    library, which LUNA imports and uses.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = _LinearAttention(dim, heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * ff_mult),
+            nn.GELU(),
+            nn.Linear(dim * ff_mult, dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.dropout(self.attn(self.norm1(x)))
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x
 
 
 class PositionsMLP(nn.Module):
@@ -140,15 +234,22 @@ class PositionNorm(nn.Module):
 
 
 class _LunaSelfAttention(nn.Module):
-    """LUNA-style multi-head self-attention that:
-       1. transforms positions → direction-MLP → delta-embedding,
-       2. concatenates [node, delta, time_broadcast] → linear → hidden,
-       3. runs multi-head self-attention over all cells in the slice,
-       4. derives a fresh position via Linear(features) → spatial_dim.
+    """LUNA-style attention. Direct port of LUNA's
+    ``models/self_attention.SelfAttention``:
+
+      1. positions → direction MLP → delta embedding,
+      2. concatenate [node, delta, time_broadcast] → Linear → hidden,
+      3. **LinearAttentionTransformer(depth=1)** over all cells in the
+         slice (linear-time attention + FFN, all internal),
+      4. derive a fresh position via Linear(features) → spatial_dim.
 
     Returns (node_features_new, time_new, position_new). The time
-    stream is updated by a separate Linear (the "y_y" projection in
-    LUNA's code).
+    stream is updated by a separate Linear (LUNA's ``y_y`` projection).
+
+    Args:
+        max_seq_len: cap on cells per slice for LinearAttentionTransformer's
+            positional bias buffer. LUNA uses 70_000 — large enough for
+            any single MERFISH slice.
     """
 
     def __init__(
@@ -171,10 +272,7 @@ class _LunaSelfAttention(nn.Module):
         self.n_heads = n_heads
 
         # Direction-of-position → delta-embedding (LUNA's
-        # `transform_positions_for_attn_mlp`). Operating on the unit
-        # vector (not the raw coords) lets the attention condition on
-        # WHICH WAY a cell sits relative to the centroid, separate
-        # from how far away it is.
+        # `transform_positions_for_attn_mlp`).
         self.pos_dir_mlp = nn.Sequential(
             nn.Linear(spatial_dim, 64),
             nn.ReLU(),
@@ -187,15 +285,21 @@ class _LunaSelfAttention(nn.Module):
         # Project [node || delta || time_broadcast] back to node_dim.
         self.concat_proj = nn.Linear(node_dim + delta_dim + time_dim, node_dim)
 
-        # Self-attention over the n_cells "sequence".
-        self.attn = nn.MultiheadAttention(
-            embed_dim=node_dim,
-            num_heads=n_heads,
+        # Linear-attention transformer (LUNA's `self.attention`).
+        # One full pre-norm transformer block: LN + linear-attn +
+        # residual + LN + FFN + residual. Inlined (no external dep)
+        # via `_LinearAttentionBlock` above. Mathematically equivalent
+        # to `LinearAttentionTransformer(dim, heads, depth=1)` that
+        # LUNA imports in `models/self_attention.py`.
+        self.attention = _LinearAttentionBlock(
+            dim=node_dim,
+            heads=n_heads,
+            ff_mult=4,
             dropout=dropout,
-            batch_first=True,
         )
 
-        # Fresh position from attended features.
+        # Fresh position from attended features (LUNA's
+        # `head_features_to_position`).
         self.feat_to_pos = nn.Linear(node_dim, spatial_dim)
 
         # Time-stream update (LUNA's `y_y`).
@@ -212,15 +316,15 @@ class _LunaSelfAttention(nn.Module):
         direction = positions / norm                       # (n, spatial_dim)
         delta = self.pos_dir_mlp(direction)                # (n, delta_dim)
 
-        # 2. Concat + project
+        # 2. Concat + project (mirrors LUNA's `transform_node_features`).
         node_lin = self.lin_node(node_features)            # (n, node_dim)
         concat = torch.cat([node_lin, delta, time_features], dim=-1)
         h = self.concat_proj(concat)                       # (n, node_dim)
 
-        # 3. Self-attention over cells. Treat n_cells as the sequence
-        # length, with a leading batch dim of 1.
+        # 3. LinearAttentionTransformer over the n_cells sequence.
+        # Expects (batch, seq_len, dim) so add a batch dim.
         h = h.unsqueeze(0)                                  # (1, n, node_dim)
-        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        attn_out = self.attention(h)                        # (1, n, node_dim)
         attn_out = attn_out.squeeze(0)                     # (n, node_dim)
 
         # 4. Fresh position from attended features.

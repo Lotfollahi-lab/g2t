@@ -190,11 +190,18 @@ def _adata_for_section(
             f"missing (have: {list(df.columns)[:10]}...)"
         )
 
-    X = df.iloc[:, :n_genes].to_numpy(dtype=np.float32)
+    # Use float64 (pandas' default for CSV reads) for the gene matrix
+    # and coords. Casting to float32 here would introduce a LSB
+    # rounding error that compounds when this h5ad is later round-
+    # tripped back to a CSV for LUNA training — making h5ad-derived
+    # training slightly different from CSV-direct training even
+    # though the source data is identical. Memory cost: 2x the
+    # h5ad's gene matrix (≤ 10 MB per cortex slice), negligible.
+    X = df.iloc[:, :n_genes].to_numpy(dtype=np.float64)
 
     has_coords = "coord_X" in df.columns and "coord_Y" in df.columns
     if has_coords:
-        coords = df[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+        coords = df[["coord_X", "coord_Y"]].to_numpy(dtype=np.float64)
     else:
         coords = None
 
