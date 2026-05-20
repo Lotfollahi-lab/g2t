@@ -451,8 +451,12 @@ class LunaTransformerNet(nn.Module):
             nn.Linear(hidden_mlp_x, 1),
         )
 
-        # Final output PositionsMLP (LUNA's `mlp_out_pos`).
-        self.mlp_out_pos = PositionsMLP(hidden_dim=hidden_mlp_pos)
+        # NOTE: LUNA's `models/model.Model.__init__` also creates
+        # `self.mlp_out_pos = PositionsMLP(hidden_mlp_dims["pos"])`
+        # but the `forward()` method NEVER CALLS IT — it's dead code.
+        # We intentionally do NOT create or call it here; applying an
+        # extra PositionsMLP at the output adds a random norm-
+        # modulation that corrupts the prediction.
 
         self.eps = 1e-9
 
@@ -482,9 +486,8 @@ class LunaTransformerNet(nn.Module):
             torch.cat([node_out, pos, norm], dim=-1)
         )                                                              # (n, 1)
         new_pos = pos * new_norm / (norm + self.eps)
-        # Final translation equivariance.
+        # Final translation equivariance — matches LUNA's exact final
+        # step in `models/model.Model.forward`.
         new_pos = new_pos - new_pos.mean(dim=0, keepdim=True)
-        # Final PositionsMLP (LUNA's mlp_out_pos).
-        new_pos = self.mlp_out_pos(new_pos)
 
         return new_pos
