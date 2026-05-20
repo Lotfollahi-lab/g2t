@@ -286,13 +286,17 @@ class Trainer:
             "distance_n_classes_used",
             "coord_loss", "coord_mse", "coord_scale",
             "cellclass_aux_loss", "cellclass_aux_acc",
-            # Flow-matching diagnostics: fm_loss is the velocity MSE
-            # (== total_loss when no aux contrastive). v_norm / u_norm
-            # are the mean L2 norms of predicted vs target velocity
-            # vectors — if v_norm stays ≪ u_norm, the velocity field
-            # is too small to actually denoise to GT scale and the
-            # ODE output will look like noise even with a low fm_loss.
-            "fm_loss", "v_norm", "u_norm",
+            # Flow-matching diagnostics: fm_loss is the combined loss
+            # (pairwise_dist_weight·pdist_mse + velocity_mse_weight·vel_mse).
+            # fm_pairwise_dist_mse is the primary LUNA-style signal;
+            # fm_velocity_mse is the regulariser. v_norm / u_norm are the
+            # mean L2 norms of predicted vs target velocity vectors; if
+            # v_norm stays ≪ u_norm the velocity field is too small to
+            # denoise to GT scale. x_hat_0_norm tracks the implied x_0
+            # estimate's magnitude — should converge toward u_norm (≈
+            # target std) as training progresses.
+            "fm_loss", "fm_velocity_mse", "fm_pairwise_dist_mse",
+            "v_norm", "u_norm", "x_hat_0_norm",
             # Sample-Spearman during flow_matching training: per-cell
             # Spearman of pairwise distances between ODE-sampled coords
             # and GT on one held-out val section. The metric we

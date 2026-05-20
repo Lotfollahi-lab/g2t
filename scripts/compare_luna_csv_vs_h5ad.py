@@ -346,11 +346,21 @@ def compare_section(
     # suffix from obs_names. This gives a true cell-by-cell pairing
     # for the subset of cells present in both.
     #
-    # For the 2 known renamed gene pairs (`1-Mar`↔`March1`,
-    # `Fam19a2`↔`Tafa2`) we rename the CSV columns to the modern symbols
-    # before aligning, so the gene panels become identical.
-    rename_csv_to_h5ad = {"1-Mar": "March1", "Fam19a2": "Tafa2"}
-    csv_df_for_align = csv_df.rename(columns=rename_csv_to_h5ad)
+    # The original VQNiche silver applied a gene-alias map that
+    # modernized two of the 254 LUNA gene symbols (1-Mar→March1,
+    # Fam19a2→Tafa2). Apply that rename ONLY when the h5ad uses the
+    # modernized convention; the new LUNA-CSV-derived silver preserves
+    # the original CSV symbols, in which case the gene panels already
+    # match exactly and the rename would FALSELY de-align them.
+    h5ad_gene_set = set(h5ad_genes)
+    if "March1" in h5ad_gene_set and "1-Mar" in csv_genes:
+        rename_csv_to_h5ad = {"1-Mar": "March1", "Fam19a2": "Tafa2"}
+    else:
+        rename_csv_to_h5ad = {}
+    csv_df_for_align = (
+        csv_df.rename(columns=rename_csv_to_h5ad)
+        if rename_csv_to_h5ad else csv_df
+    )
     csv_genes_renamed = [
         rename_csv_to_h5ad.get(g, g) for g in csv_genes
     ]

@@ -163,6 +163,18 @@ class ScGG(nn.Module):
             self.flow = ConditionalFlowMatching(
                 velocity_net=self.velocity_net,
                 sigma_min=fl_cfg["sigma_min"],
+                pairwise_dist_weight=float(
+                    fl_cfg.get("pairwise_dist_weight", 1.0)
+                ),
+                velocity_mse_weight=float(
+                    fl_cfg.get("velocity_mse_weight", 0.1)
+                ),
+                translation_equivariant=bool(
+                    fl_cfg.get("translation_equivariant", True)
+                ),
+                pairwise_dist_max_cells=int(
+                    fl_cfg.get("pairwise_dist_max_cells", 4096)
+                ),
             )
 
         # ---- Graph constructor (always present, parameter-free) -------------

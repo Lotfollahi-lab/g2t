@@ -84,6 +84,30 @@ model:
     sigma_min: 1.0e-4
     solver: "euler"     # euler | midpoint | rk4
     n_steps: 100
+    # LUNA-aligned loss configuration. Two loss terms run jointly:
+    #   * pairwise_dist_weight: MSE on the cdist matrix of the implied
+    #     x_0 estimate vs GT (LUNA's `metrics.loss_function.LossFunction`).
+    #     Rotation/translation/reflection invariant — directly
+    #     optimises the structural property the Spearman headline
+    #     measures. This is the primary training signal.
+    #   * velocity_mse_weight: standard OT-CFM velocity MSE. Kept as a
+    #     small regulariser; setting to 0 disables it entirely.
+    # With the prior (velocity-only) setup the Spearman collapsed to
+    # ~0 because the velocity target u_t = z_1 - (1-σ_min)·z_0 varies
+    # with the random noise direction z_0, so MSE on velocity sees a
+    # very noisy target. The pairwise-distance loss is computed on
+    # x_hat_0 := z_t + (1-t)·v_t — which is invariant to z_0.
+    pairwise_dist_weight: 1.0
+    velocity_mse_weight: 0.1
+    # Subtract the per-batch mean of the velocity prediction so the
+    # network can't waste capacity learning the slice centroid (LUNA
+    # does this via remove_mean_with_mask). With centred targets, this
+    # is a pure constraint, no information lost.
+    translation_equivariant: true
+    # cdist over all N cells is O(N^2) memory; subsample when N is
+    # larger than this. Cortex slices are ~5-7k so the default 4k is
+    # a no-op for most slices and a soft cap for the largest.
+    pairwise_dist_max_cells: 4096
 
 # --- Graph ---
 graph:

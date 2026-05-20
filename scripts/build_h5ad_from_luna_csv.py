@@ -5,22 +5,23 @@ Build per-slice h5ad files from LUNA's published CSV(s).
 Produces a directory of per-section h5ads that drop in as
 ``--data_dir`` for the existing scGG and LUNA training scripts:
 
-    {out_dir}/{prefix}_mouse{M}_slice{S}.h5ad
+    {out_dir}/{prefix}_{cell_section_value}.h5ad
 
-with the same layout as ``DATASETS/silver/mmc_luna``:
+with the same layout as the existing silver dirs (``mmc_luna``,
+``abc_luna``, ``cns_luna``):
 
   * ``.X``               (n_cells, n_genes) float32 — LUNA's CSV expression
                          values as-is (non-integer per-cell-normalized counts).
-  * ``.obsm['spatial']`` (n_cells, 2) float32 — raw micron coords
-                         from ``coord_X``, ``coord_Y``.
-  * ``.obs['cell_class']`` categorical — cell type label.
-  * ``.obs['cell_section']`` — repeated section label (e.g. "mouse1_slice1").
+  * ``.obsm['spatial']`` (n_cells, 2) float32 — raw micron coords from
+                         ``coord_X``, ``coord_Y``. **Omitted** when the
+                         CSV has no such columns (scRNA-seq case — those
+                         cells are dissociated and have no spatial info).
+  * ``.obs['cell_class']`` categorical — cell type label (when present).
+  * ``.obs['cell_section']`` — repeated section label.
   * ``.obs['cell_id']``  — original integer cell id from CSV index.
   * ``.obs[<other>]``    — any other metadata column we find in the CSV
-                         (e.g. ``class``, ``mouse``, ``sample_id``).
-  * ``.var_names``       — gene symbols as written in LUNA's CSV
-                         (preserves the Excel-corrupted ``1-Mar`` and the
-                         pre-2020 ``Fam19a2``; train + infer on the same set).
+                         (e.g. ``class``, ``animal``, ``donor``, ``sample_id``).
+  * ``.var_names``       — gene symbols as written in LUNA's CSV.
 
 Why this exists
 ---------------
@@ -41,22 +42,40 @@ consume *as if they were the regular silver h5ads*.
 Usage
 -----
 
-    # From both LUNA CSVs (typical):
+    # MERFISH mouse cortex (LUNA Fig 3): sections look like
+    #   "mouse1_slice1" → filename "merfish_mouse_cortex_mouse1_slice1.h5ad"
     python scripts/build_h5ad_from_luna_csv.py \\
-        --train_csv /nfs/team361/sb75/.../MERFISH_mouse_cortex/train.csv \\
-        --test_csv  /nfs/team361/sb75/.../MERFISH_mouse_cortex/test.csv \\
-        --out_dir   /nfs/team361/sb75/DATASETS/silver/mmc_luna_csv
+        --train_csv /nfs/team361/sb75/DATASETS/bronze/mmc_luna/MERFISH_mouse_cortex_train.csv \\
+        --test_csv  /nfs/team361/sb75/DATASETS/bronze/mmc_luna/MERFISH_mouse_cortex_test.csv \\
+        --out_dir   /nfs/team361/sb75/DATASETS/silver/mmc_luna \\
+        --prefix    merfish_mouse_cortex \\
+        --overwrite
 
-    # Or a single combined CSV:
+    # ABC Zhuang ABCA1 (LUNA Fig 4 train side): sections look like
+    #   "Zhuang-ABCA-1-001" → filename "abc_zhuang_abca1_Zhuang-ABCA-1-001.h5ad"
     python scripts/build_h5ad_from_luna_csv.py \\
-        --csv /path/to/combined.csv \\
-        --out_dir /path/to/out
+        --train_csv /nfs/team361/sb75/DATASETS/bronze/abc_luna/MERFISH_ABCA_animal1_train.csv \\
+        --test_csv  /nfs/team361/sb75/DATASETS/bronze/abc_luna/MERFISH_ABCA_animal1_test.csv \\
+        --out_dir   /nfs/team361/sb75/DATASETS/silver/abc_luna \\
+        --prefix    abc_zhuang_abca1 \\
+        --overwrite
 
-Then train scGG with this directory in place of the silver dir:
+    # CNS harmonized (LUNA Fig 4 cross-modality): train = ABCA spatial,
+    # test = scRNA-seq. scRNA cells have no real spatial coords; the
+    # resulting h5ads will be missing obsm['spatial'] for those sections.
+    python scripts/build_h5ad_from_luna_csv.py \\
+        --train_csv /nfs/team361/sb75/DATASETS/bronze/cns_luna/ABCA_harmonized_train.csv \\
+        --test_csv  /nfs/team361/sb75/DATASETS/bronze/cns_luna/scRNA_harmonized_test.csv \\
+        --out_dir   /nfs/team361/sb75/DATASETS/silver/cns_luna \\
+        --prefix    cns_scrna \\
+        --overwrite
 
-    python scripts/run_luna_cortex_benchmark.py \\
-        --data_dir /nfs/team361/sb75/DATASETS/silver/mmc_luna_csv \\
-        --wandb_run_name "scgg_on_luna_csvs"
+Filename convention
+-------------------
+Each section in the CSV becomes one h5ad named
+``{prefix}_{cell_section_value}.h5ad``. The section label is preserved
+verbatim except for filesystem-unsafe characters (``/``, control chars)
+which are replaced with ``_``.
 """
 
 from __future__ import annotations
@@ -86,7 +105,19 @@ _METADATA_NAMES = (
     "sample", "sample_id", "batch", "experiment", "cluster",
 )
 
-_SECTION_RE = re.compile(r"^mouse(?P<mouse>\d+)_slice(?P<slice>\d+)$")
+
+def _sanitize_for_filename(label: str) -> str:
+    """Replace filesystem-unsafe characters in section labels.
+
+    Section labels in LUNA CSVs can be anything string-shaped (e.g.
+    ``Zhuang-ABCA-1-001`` or ``well06``); we only sanitize characters
+    that are problematic in filenames (path separators, NULs, control
+    chars), preserving the rest verbatim so users can still
+    reverse-map filename → cell_section.
+    """
+    bad = re.compile(r"[/\x00-\x1f]")
+    out = bad.sub("_", label)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -144,19 +175,28 @@ def _adata_for_section(
     n_genes: int,
     section_label: str,
 ):
-    """Construct an AnnData for one section from the matching CSV slice."""
+    """Construct an AnnData for one section from the matching CSV slice.
+
+    Spatial coords are optional — datasets like scRNA-seq don't carry
+    real (x, y), in which case ``obsm['spatial']`` is omitted and the
+    downstream code paths that need it must check for its absence.
+    ``cell_section`` is required (it's how we groupby).
+    """
     import anndata as ad
 
-    # Required columns
-    for col in ("coord_X", "coord_Y", "cell_section"):
-        if col not in df.columns:
-            raise ValueError(
-                f"section {section_label!r}: required column {col!r} missing "
-                f"from CSV (have: {list(df.columns)[:10]}...)"
-            )
+    if "cell_section" not in df.columns:
+        raise ValueError(
+            f"section {section_label!r}: required column 'cell_section' "
+            f"missing (have: {list(df.columns)[:10]}...)"
+        )
 
     X = df.iloc[:, :n_genes].to_numpy(dtype=np.float32)
-    coords = df[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+
+    has_coords = "coord_X" in df.columns and "coord_Y" in df.columns
+    if has_coords:
+        coords = df[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+    else:
+        coords = None
 
     # All non-gene columns flow to obs (preserving the CSV's metadata).
     # We do NOT copy coord_X / coord_Y into obs to avoid the AnnData
@@ -184,7 +224,8 @@ def _adata_for_section(
     var = pd.DataFrame(index=pd.Index(gene_names, name="var_name"))
 
     adata = ad.AnnData(X=X, obs=obs, var=var)
-    adata.obsm["spatial"] = coords
+    if coords is not None:
+        adata.obsm["spatial"] = coords
     return adata
 
 
@@ -229,14 +270,8 @@ def build_from_csvs(
         for section_label, sec_df in df.groupby(
             df["cell_section"].astype(str)
         ):
-            try:
-                mouse, slice_id = _parse_section(section_label)
-            except ValueError as e:
-                logger.warning(f"  skipping section {section_label!r}: {e}")
-                continue
-            out_path = (
-                out_dir / f"{prefix}_mouse{mouse}_slice{slice_id}.h5ad"
-            )
+            safe_label = _sanitize_for_filename(section_label)
+            out_path = out_dir / f"{prefix}_{safe_label}.h5ad"
             if out_path.exists() and not overwrite:
                 logger.info(
                     f"  skip (exists): {out_path.name}  "
@@ -249,16 +284,16 @@ def build_from_csvs(
             )
             adata.write(out_path)
             logger.info(
-                f"  wrote {out_path.name:<48s}  "
-                f"n_cells={adata.n_obs:>5d}  n_genes={adata.n_vars}"
+                f"  wrote {out_path.name:<60s}  "
+                f"n_cells={adata.n_obs:>6d}  n_genes={adata.n_vars}  "
+                f"spatial={'yes' if 'spatial' in adata.obsm else 'no'}"
             )
             sections_written.append({
                 "section": section_label,
                 "path": str(out_path),
                 "n_cells": int(adata.n_obs),
                 "n_genes": int(adata.n_vars),
-                "mouse": mouse,
-                "slice": slice_id,
+                "has_spatial": "spatial" in adata.obsm,
                 "source_csv": str(csv_path),
             })
 
