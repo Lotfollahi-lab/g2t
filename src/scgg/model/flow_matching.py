@@ -236,7 +236,7 @@ class ConditionalFlowMatching(nn.Module):
         section_embed: torch.Tensor,
         k_target: torch.Tensor,
         n_steps: int = 100,
-        solver: Literal["euler", "midpoint", "rk4"] = "euler",
+        solver: Literal["euler", "midpoint", "rk4", "one_shot"] = "euler",
     ) -> torch.Tensor:
         """Generate spatial embeddings by integrating the learned flow.
 
@@ -244,8 +244,17 @@ class ConditionalFlowMatching(nn.Module):
             cell_embed: Cell expression embeddings, shape (n_cells, cell_embed_dim).
             section_embed: Section embedding, shape (embed_dim,).
             k_target: Target k values, shape (n_cells,) of ints.
-            n_steps: Number of ODE integration steps.
-            solver: ODE solver type.
+            n_steps: Number of ODE integration steps. Ignored for
+                solver='one_shot'.
+            solver: One of:
+                'euler', 'midpoint', 'rk4': OT-CFM ODE integration.
+                'one_shot': for x_0-prediction nets only — sample
+                    z ~ N(0, I), run the model once at t=0, return
+                    its raw x_0 prediction. Mirrors LUNA's training
+                    objective directly (predict the target from noise)
+                    without the deterministic-ODE error accumulation
+                    that plagues OT-CFM Euler when 1-t is small near
+                    the end of the trajectory.
 
         Returns:
             Generated spatial embeddings, shape (n_cells, spatial_dim).
@@ -257,6 +266,21 @@ class ConditionalFlowMatching(nn.Module):
         z = torch.randn(n_cells, self.spatial_dim, device=device)
         if self.translation_equivariant:
             z = self._center(z)
+
+        # One-shot: skip ODE entirely, just run the model on the prior.
+        if solver == "one_shot":
+            if self.prediction_target != "x_0":
+                raise ValueError(
+                    "solver='one_shot' requires prediction_target='x_0'. "
+                    "Either switch to a x_0-prediction net (e.g. "
+                    "velocity_net.type='luna') or use a standard "
+                    "ODE solver."
+                )
+            t = torch.zeros(n_cells, device=device)
+            out = self.velocity_net(z, t, cell_embed, section_embed, k_target)
+            if self.translation_equivariant:
+                out = self._center(out)
+            return out
 
         dt = 1.0 / n_steps
 

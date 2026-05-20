@@ -29,6 +29,7 @@ from .velocity_net import VelocityNetwork
 from .velocity_net_attention import CrossAttentionVelocityNetwork
 from .luna_model import LunaTransformerNet
 from .flow_matching import ConditionalFlowMatching
+from .diffusion_ddpm import DiffusionDDPM
 from .graph_constructor import GraphConstructor
 
 
@@ -207,21 +208,48 @@ class ScGG(nn.Module):
                     f"model.velocity_net.type must be 'mlp', "
                     f"'cross_attention', or 'luna'; got {vn_type!r}"
                 )
-            self.flow = ConditionalFlowMatching(
-                velocity_net=self.velocity_net,
-                sigma_min=fl_cfg["sigma_min"],
-                pairwise_dist_weight=float(
-                    fl_cfg.get("pairwise_dist_weight", 1.0)
-                ),
-                velocity_mse_weight=velocity_mse_weight,
-                translation_equivariant=bool(
-                    fl_cfg.get("translation_equivariant", True)
-                ),
-                pairwise_dist_max_cells=int(
-                    fl_cfg.get("pairwise_dist_max_cells", 4096)
-                ),
-                prediction_target=prediction_target,
-            )
+            # Diffusion model: two flavours.
+            #   * "ddpm" (default, LUNA-aligned): cosine-β VP-DDPM with
+            #     1000 discrete timesteps, stochastic reverse sampling.
+            #     Direct port of LUNA's `noise_model.py` + `sample.py`.
+            #     Use this to reproduce LUNA's results.
+            #   * "ot_cfm": continuous OT-CFM with deterministic ODE
+            #     sampling. Kept for ablation only.
+            diff_cfg = model_cfg.get("diffusion", {}) or {}
+            diff_type = str(diff_cfg.get("type", "ddpm")).lower()
+            if diff_type == "ddpm":
+                self.flow = DiffusionDDPM(
+                    velocity_net=self.velocity_net,
+                    timesteps=int(diff_cfg.get("timesteps", 1000)),
+                    nu=float(diff_cfg.get("nu", 2.0)),
+                    translation_equivariant=bool(
+                        fl_cfg.get("translation_equivariant", True)
+                    ),
+                    pairwise_dist_max_cells=int(
+                        fl_cfg.get("pairwise_dist_max_cells", 8192)
+                    ),
+                )
+            elif diff_type == "ot_cfm":
+                self.flow = ConditionalFlowMatching(
+                    velocity_net=self.velocity_net,
+                    sigma_min=fl_cfg["sigma_min"],
+                    pairwise_dist_weight=float(
+                        fl_cfg.get("pairwise_dist_weight", 1.0)
+                    ),
+                    velocity_mse_weight=velocity_mse_weight,
+                    translation_equivariant=bool(
+                        fl_cfg.get("translation_equivariant", True)
+                    ),
+                    pairwise_dist_max_cells=int(
+                        fl_cfg.get("pairwise_dist_max_cells", 4096)
+                    ),
+                    prediction_target=prediction_target,
+                )
+            else:
+                raise ValueError(
+                    f"model.diffusion.type must be 'ddpm' or 'ot_cfm'; "
+                    f"got {diff_type!r}"
+                )
 
         # ---- Graph constructor (always present, parameter-free) -------------
         self.graph_constructor = GraphConstructor(

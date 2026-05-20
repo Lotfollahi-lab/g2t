@@ -4,6 +4,7 @@ from .velocity_net import VelocityNetwork
 from .velocity_net_attention import CrossAttentionVelocityNetwork
 from .luna_model import LunaTransformerNet
 from .flow_matching import ConditionalFlowMatching
+from .diffusion_ddpm import DDPMNoiseModel, DiffusionDDPM
 from .graph_constructor import GraphConstructor
 from .scgg import ScGG
 
@@ -15,6 +16,8 @@ __all__ = [
     "CrossAttentionVelocityNetwork",
     "LunaTransformerNet",
     "ConditionalFlowMatching",
+    "DDPMNoiseModel",
+    "DiffusionDDPM",
     "GraphConstructor",
     "ScGG",
 ]

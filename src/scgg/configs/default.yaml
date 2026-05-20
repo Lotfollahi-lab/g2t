@@ -8,11 +8,21 @@
 # --- Model ---
 model:
   # Gene expression encoder
+  #
+  # LUNA does NOT have a separate encoder. Their `mlp_in_node_features`
+  # maps gene_expr (254 dims) → 256 → 256 directly. To match LUNA, we
+  # keep the encoder as a single Linear(n_genes, 256) (no hidden
+  # blocks, no bottleneck) so `cell_embed` has the same width as
+  # LUNA's first feature stream. The LunaTransformerNet's internal
+  # `mlp_in_node` then does the rest of the mapping (256 → 256 → 256
+  # via two Linear + ReLU). The result is functionally equivalent to
+  # LUNA's input MLP with one extra Linear, which adds negligible
+  # capacity but preserves no information.
   encoder:
-    hidden_dims: [512, 256]
-    embed_dim: 128
-    dropout: 0.1
-    norm: "layernorm"  # layernorm | batchnorm | none
+    hidden_dims: []          # was [512, 256] — no hidden bottleneck
+    embed_dim: 256           # was 128 — matches LUNA's mlp_in_node input
+    dropout: 0.0             # was 0.1 — LUNA's mlp_in_node_features has no dropout
+    norm: "none"             # was "layernorm" — LUNA has no norm in mlp_in_node
 
   # Section-level encoder (DeepSets-style attention pooling)
   section_encoder:
@@ -96,10 +106,41 @@ model:
   # Spatial dim for the flow-matching ablation (target is GT 2D coords)
   spatial_dim: 2
 
-  # Flow matching (only used when objective == "flow_matching")
+  # Diffusion model: choose the training + sampling paradigm.
+  #
+  #   * "ddpm" (default, LUNA-aligned): variance-preserving DDPM with a
+  #     cosine β schedule, 1000 discrete timesteps. Training:
+  #         z_t = α̅_t · x_0 + σ̅_t · ε,   loss = MSE(cdist(x_0_pred), cdist(x_0))
+  #     Sampling: 1000 stochastic reverse steps, each predicting x_0
+  #     and sampling z_{t-1} ~ N(μ, σ² I) with fresh noise. Direct
+  #     port of LUNA's `utils/diffusion_model/diffusion/noise_model.py`.
+  #
+  #   * "ot_cfm" (legacy, ablation only): continuous OT-CFM with linear
+  #     interpolation paths and deterministic ODE sampling. Did not
+  #     reproduce LUNA's results — kept here only for comparison runs.
+  diffusion:
+    type: "ddpm"             # ddpm | ot_cfm
+    timesteps: 1000          # LUNA default
+    nu: 2.0                  # LUNA's cosine-β exponent for positions ("p")
+
+  # OT-CFM-specific knobs (only used when diffusion.type == "ot_cfm")
   flow:
     sigma_min: 1.0e-4
-    solver: "euler"     # euler | midpoint | rk4
+    # Sampling solver:
+    #   * euler / midpoint / rk4: deterministic OT-CFM ODE integration.
+    #     The last step (t≈0.99) snaps z to the model's x_0 prediction,
+    #     so error accumulation in earlier steps can land z somewhere
+    #     the model wasn't asked to denoise from.
+    #   * one_shot: skip ODE entirely. Sample z ~ N(0,I), run the model
+    #     once at t=0, return its raw x_0 prediction. This is exactly
+    #     what the training objective asks the model to learn (predict
+    #     x_0 from noise) and avoids ODE-trajectory artifacts. Requires
+    #     `prediction_target=x_0` (auto-set when velocity_net.type=luna).
+    #     Use this to compare against the deterministic Euler path —
+    #     LUNA itself uses stochastic DDPM reverse sampling which we
+    #     don't have, but one_shot is the closest analog that's cheap
+    #     to add on top of OT-CFM training.
+    solver: "one_shot"
     n_steps: 100
     # LUNA-aligned loss configuration.
     #
