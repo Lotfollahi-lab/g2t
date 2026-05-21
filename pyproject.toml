@@ -36,12 +36,22 @@ dev = [
     "ruff>=0.4",
 ]
 
+# Source layout is src/. Map the empty package root to src/ so BOTH
+# `[tool.setuptools.packages.find]` AND `py-modules` resolve relative to
+# src/. Without this `package-dir`, the top-level py-modules
+# (`main.py`, `diffusion_model.py`) silently fail to install on editable
+# pip and `import main` / `import diffusion_model` raise
+# ModuleNotFoundError at runtime.
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["main", "diffusion_model"]
+
 # Packages found under src/. We register both:
 #   - `scgg.*`             — our entry-point package (scripts/eval/data live here)
 #   - LUNA's top-level pkgs — vendored verbatim, imported as `models`,
-#                             `utils`, `metrics`, `datasets`, `configs`,
-#                             `diffusion_model`, `main` (LUNA's own import
-#                             style, kept unchanged to track upstream).
+#                             `utils`, `metrics`, `datasets`, `configs`
+#                             (LUNA's own import style, kept unchanged
+#                             so we track upstream).
 [tool.setuptools.packages.find]
 where = ["src"]
 include = [
@@ -52,11 +62,6 @@ include = [
     "datasets", "datasets.*",
     "configs", "configs.*",
 ]
-
-# LUNA's `main.py` and `diffusion_model.py` are top-level single modules
-# (not packages). Register them as py-modules so they end up installed.
-[tool.setuptools]
-py-modules = ["main", "diffusion_model"]
 
 [tool.setuptools.package-data]
 # LUNA's Hydra configs are YAML files inside the `configs` package; they
