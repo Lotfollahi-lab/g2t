@@ -875,9 +875,18 @@ def main() -> int:
         "--luna_repo", default=str(_DEFAULT_LUNA_REPO),
         help=f"Path to the LUNA repository. Default: {_DEFAULT_LUNA_REPO}",
     )
+    # Two argparse names for the same Hydra `general.name` value:
+    # `--wandb_run_name` to match run_scgg.py's CLI surface (so users
+    # can flip between the two scripts without rewriting their command
+    # lines), and `--run_name` kept as an alias because earlier
+    # invocations and docs reference it.
     p.add_argument(
-        "--run_name", default="MERFISH_mouse_cortex",
-        help="Sets general.name in LUNA's Hydra config.",
+        "--wandb_run_name", "--run_name",
+        dest="wandb_run_name",
+        default="MERFISH_mouse_cortex",
+        help="Sets general.name in LUNA's Hydra config (drives the "
+             "wandb run name and LUNA's output dir basename). "
+             "Aliases: --run_name.",
     )
     # By default we write raw counts (LUNA's published CSVs are
     # non-integer per-cell-normalized values in the same magnitude
@@ -906,7 +915,7 @@ def main() -> int:
             lr=args.lr,
             seed=args.seed,
             luna_repo=args.luna_repo,
-            run_name=args.run_name,
+            run_name=args.wandb_run_name,
             log2_normalize=args.log2_normalize,
             wandb_mode=args.wandb_mode,
             extra_overrides=args.luna_override,
