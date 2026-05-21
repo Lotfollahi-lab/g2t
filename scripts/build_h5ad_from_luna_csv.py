@@ -3,12 +3,22 @@
 Build per-slice h5ad files from LUNA's published CSV(s).
 
 Produces a directory of per-section h5ads that drop in as
-``--data_dir`` for the existing scGG and LUNA training scripts:
+``--data_dir`` for the existing scGG and LUNA training scripts. The
+filename encodes the train/test split, not a dataset prefix:
 
-    {out_dir}/{prefix}_{cell_section_value}.h5ad
+    {out_dir}/{cell_section_value}_train.h5ad   # from --train_csv
+    {out_dir}/{cell_section_value}_test.h5ad    # from --test_csv
+    {out_dir}/{cell_section_value}.h5ad         # from --csv (no split)
 
-with the same layout as the existing silver dirs (``mmc_luna``,
-``abc_luna``, ``cns_luna``):
+That keeps the section label verbatim (``mouse1_slice1``,
+``Zhuang-ABCA-1-001``, ``well06``, ...) and pushes the dataset
+identity into the parent directory (``mmc_luna/``, ``abc_luna/``,
+``cns_luna/``). Downstream scripts that split a silver dir into train
+and test now do it by suffix instead of by a hand-coded
+``mouseN`` regex.
+
+Each h5ad has the same layout as the existing silver dirs
+(``mmc_luna``, ``abc_luna``, ``cns_luna``):
 
   * ``.X``               (n_cells, n_genes) float32 — LUNA's CSV expression
                          values as-is (non-integer per-cell-normalized counts).
@@ -42,40 +52,41 @@ consume *as if they were the regular silver h5ads*.
 Usage
 -----
 
-    # MERFISH mouse cortex (LUNA Fig 3): sections look like
-    #   "mouse1_slice1" → filename "merfish_mouse_cortex_mouse1_slice1.h5ad"
+    # MERFISH mouse cortex (LUNA Fig 3):
+    #   "mouse1_slice1" → "mouse1_slice1_train.h5ad" (from --train_csv)
+    #   "mouse2_slice1" → "mouse2_slice1_test.h5ad"  (from --test_csv)
     python scripts/build_h5ad_from_luna_csv.py \\
         --train_csv /nfs/team361/sb75/DATASETS/bronze/mmc_luna/MERFISH_mouse_cortex_train.csv \\
         --test_csv  /nfs/team361/sb75/DATASETS/bronze/mmc_luna/MERFISH_mouse_cortex_test.csv \\
         --out_dir   /nfs/team361/sb75/DATASETS/silver/mmc_luna \\
-        --prefix    merfish_mouse_cortex \\
         --overwrite
 
-    # ABC Zhuang ABCA1 (LUNA Fig 4 train side): sections look like
-    #   "Zhuang-ABCA-1-001" → filename "abc_zhuang_abca1_Zhuang-ABCA-1-001.h5ad"
+    # ABC Zhuang ABCA1 (LUNA Fig 4 train side):
+    #   "Zhuang-ABCA-1-001" → "Zhuang-ABCA-1-001_train.h5ad"
     python scripts/build_h5ad_from_luna_csv.py \\
         --train_csv /nfs/team361/sb75/DATASETS/bronze/abc_luna/MERFISH_ABCA_animal1_train.csv \\
         --test_csv  /nfs/team361/sb75/DATASETS/bronze/abc_luna/MERFISH_ABCA_animal1_test.csv \\
         --out_dir   /nfs/team361/sb75/DATASETS/silver/abc_luna \\
-        --prefix    abc_zhuang_abca1 \\
         --overwrite
 
     # CNS harmonized (LUNA Fig 4 cross-modality): train = ABCA spatial,
-    # test = scRNA-seq. scRNA cells have no real spatial coords; the
-    # resulting h5ads will be missing obsm['spatial'] for those sections.
+    # test = scRNA-seq. scRNA cells have no real spatial coords, so
+    # the corresponding *_test.h5ad files have no obsm['spatial'].
     python scripts/build_h5ad_from_luna_csv.py \\
         --train_csv /nfs/team361/sb75/DATASETS/bronze/cns_luna/ABCA_harmonized_train.csv \\
         --test_csv  /nfs/team361/sb75/DATASETS/bronze/cns_luna/scRNA_harmonized_test.csv \\
         --out_dir   /nfs/team361/sb75/DATASETS/silver/cns_luna \\
-        --prefix    cns_scrna \\
         --overwrite
 
 Filename convention
 -------------------
-Each section in the CSV becomes one h5ad named
-``{prefix}_{cell_section_value}.h5ad``. The section label is preserved
-verbatim except for filesystem-unsafe characters (``/``, control chars)
-which are replaced with ``_``.
+Each section in the CSV becomes one h5ad. The filename is the section
+label, sanitised for filesystem-unsafe characters (``/`` and control
+chars → ``_``), with one of three suffixes:
+
+  * ``_train.h5ad``  — sections that came in via ``--train_csv``
+  * ``_test.h5ad``   — sections that came in via ``--test_csv``
+  * ``.h5ad``        — sections from a single ``--csv`` (no split known)
 """
 
 from __future__ import annotations
@@ -263,14 +274,23 @@ def _adata_for_section(
 
 
 def build_from_csvs(
-    csv_paths: List[Path],
+    csv_specs: List[Tuple[Path, Optional[str]]],
     out_dir: Path,
-    prefix: str = "mmc",
     overwrite: bool = False,
 ) -> Dict[str, object]:
-    """Read one or more LUNA CSVs and emit per-section h5ads."""
-    if not csv_paths:
-        raise ValueError("need at least one CSV path")
+    """Read one or more LUNA CSVs and emit per-section h5ads.
+
+    Args:
+        csv_specs: list of ``(csv_path, split)`` pairs. ``split`` is one
+            of ``"train"``, ``"test"``, or ``None`` (single untagged
+            CSV). The split becomes the filename suffix:
+            ``{section}_train.h5ad`` / ``{section}_test.h5ad`` /
+            ``{section}.h5ad`` respectively.
+        out_dir: target directory for the per-section h5ads.
+        overwrite: replace existing h5ads instead of skipping them.
+    """
+    if not csv_specs:
+        raise ValueError("need at least one (csv_path, split) pair")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -278,7 +298,13 @@ def build_from_csvs(
     n_genes_ref: Optional[int] = None
     sections_written: List[Dict[str, object]] = []
 
-    for csv_path in csv_paths:
+    for csv_path, split in csv_specs:
+        if split not in (None, "train", "test"):
+            raise ValueError(
+                f"split must be None, 'train', or 'test'; got {split!r}"
+            )
+        suffix = "" if split is None else f"_{split}"
+
         df, n_genes, gene_names = _load_csv(csv_path)
 
         if gene_names_ref is None:
@@ -312,7 +338,7 @@ def build_from_csvs(
             df["cell_section"].astype(str)
         ):
             safe_label = _sanitize_for_filename(section_label)
-            out_path = out_dir / f"{prefix}_{safe_label}.h5ad"
+            out_path = out_dir / f"{safe_label}{suffix}.h5ad"
             if out_path.exists() and not overwrite:
                 logger.info(
                     f"  skip (exists): {out_path.name}  "
@@ -331,6 +357,7 @@ def build_from_csvs(
             )
             sections_written.append({
                 "section": section_label,
+                "split": split,
                 "path": str(out_path),
                 "n_cells": int(adata.n_obs),
                 "n_genes": int(adata.n_vars),
@@ -361,25 +388,21 @@ def main() -> int:
     )
     p.add_argument(
         "--csv", default=None,
-        help="Single LUNA CSV to convert. Use this OR (--train_csv + "
-             "--test_csv).",
+        help="Single LUNA CSV to convert (no train/test concept). Each "
+             "section becomes {section}.h5ad with no suffix. Use this "
+             "OR --train_csv / --test_csv.",
     )
     p.add_argument(
         "--train_csv", default=None,
-        help="LUNA's train CSV (Mouse 1 sections).",
+        help="LUNA's train CSV. Each section becomes {section}_train.h5ad.",
     )
     p.add_argument(
         "--test_csv", default=None,
-        help="LUNA's test CSV (Mouse 2 sections).",
+        help="LUNA's test CSV. Each section becomes {section}_test.h5ad.",
     )
     p.add_argument(
         "--out_dir", required=True,
         help="Where to write per-section h5ads.",
-    )
-    p.add_argument(
-        "--prefix", default="mmc",
-        help="Filename prefix. Default 'mmc' matches the silver layer; "
-             "use 'merfish_mouse_cortex' for the legacy convention.",
     )
     p.add_argument(
         "--overwrite", action="store_true",
@@ -393,32 +416,31 @@ def main() -> int:
         force=True,
     )
 
-    csv_paths: List[Path] = []
+    csv_specs: List[Tuple[Path, Optional[str]]] = []
     if args.csv is not None:
         p_single = Path(args.csv)
         if not p_single.exists():
             raise SystemExit(f"--csv not found: {p_single}")
-        csv_paths.append(p_single)
+        csv_specs.append((p_single, None))
     if args.train_csv is not None:
         p_train = Path(args.train_csv)
         if not p_train.exists():
             raise SystemExit(f"--train_csv not found: {p_train}")
-        csv_paths.append(p_train)
+        csv_specs.append((p_train, "train"))
     if args.test_csv is not None:
         p_test = Path(args.test_csv)
         if not p_test.exists():
             raise SystemExit(f"--test_csv not found: {p_test}")
-        csv_paths.append(p_test)
-    if not csv_paths:
+        csv_specs.append((p_test, "test"))
+    if not csv_specs:
         raise SystemExit(
-            "need --csv or (--train_csv and/or --test_csv)."
+            "need --csv or --train_csv and/or --test_csv."
         )
 
     out_dir = Path(args.out_dir)
     summary = build_from_csvs(
-        csv_paths=csv_paths,
+        csv_specs=csv_specs,
         out_dir=out_dir,
-        prefix=args.prefix,
         overwrite=args.overwrite,
     )
 
