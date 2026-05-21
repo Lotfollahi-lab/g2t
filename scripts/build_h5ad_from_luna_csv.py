@@ -220,6 +220,27 @@ def _adata_for_section(
     if "cell_class" in obs.columns:
         obs["cell_class"] = pd.Categorical(obs["cell_class"].astype(str))
 
+    # `cell_section` must be a pure-string column. In the ABC CSVs the
+    # section values come through as object dtype with numeric / mixed
+    # entries (e.g. integer slice ids, or NaN for any row missing a
+    # section label), which h5py's vlen-string writer rejects with
+    # `Can't implicitly convert non-string objects to strings`. Force it
+    # to str before write.
+    if "cell_section" in obs.columns:
+        obs["cell_section"] = obs["cell_section"].astype(str)
+
+    # Anything else that pandas read as `object` dtype (free-form
+    # metadata: donor ids, batch tags, etc.) hits the same h5py vlen
+    # path. Pure-string object columns serialize fine, but a mixed-type
+    # column (some str, some NaN/int) blows up. Cast every remaining
+    # object column to str so the write is robust regardless of the
+    # CSV's per-column type uniformity.
+    for col in obs.columns:
+        if col in ("cell_class", "cell_section"):
+            continue
+        if obs[col].dtype == object:
+            obs[col] = obs[col].astype(str)
+
     # Preserve the original CSV integer index as a per-cell field, then
     # rewrite obs_names to "{cell_id}_{section}" so they match the silver
     # convention (e.g. "13_mouse1_slice1"). This makes the new h5ads
