@@ -377,23 +377,27 @@ class DiffusionDDPM(nn.Module):
             x_0_pred = self._center(x_0_pred, mask=mask)
 
         # Per-section pairwise-distance MSE, then mean across sections.
-        # Uses batched cdist (B, N, N) with mask_2d to restrict the loss
-        # to real-real pairs only (real-padding and padding-padding pairs
-        # are excluded from both numerator and denominator).
-        d_pred = torch.cdist(x_0_pred, x_0_pred, p=2.0)               # (B, N, N)
-        d_true = torch.cdist(z_1, z_1, p=2.0)                         # (B, N, N)
-        sq_err = (d_pred - d_true) ** 2                                # (B, N, N)
-
-        if mask is not None:
-            # mask_2d[b, i, j] = mask[b, i] AND mask[b, j]
-            m1 = mask.unsqueeze(2)                                    # (B, N, 1)
-            m2 = mask.unsqueeze(1)                                    # (B, 1, N)
-            mask_2d = (m1 & m2).to(sq_err.dtype)                      # (B, N, N)
-            sq_err = sq_err * mask_2d
-            valid_pairs = mask_2d.sum(dim=(1, 2)).clamp_min(1.0)      # (B,)
-            loss_per_section = sq_err.sum(dim=(1, 2)) / valid_pairs   # (B,)
-        else:
-            loss_per_section = sq_err.mean(dim=(1, 2))                # (B,)
+        # IMPORTANT: must compute cdist per-section on ONLY the valid
+        # cells, not on the full padded (B, N, N) tensor. Padding cells
+        # all share position (0, 0), and `torch.cdist`'s backward at
+        # coincident points is `(x_i - x_j) / 0 = NaN`. PyTorch's
+        # autograd propagates NaN through the sum even when we
+        # multiply by mask_2d = 0 — the NaN poisons the whole
+        # gradient. Per-section cdist on valid cells avoids this and
+        # exactly mirrors LUNA's `LossFunction.compute_loss`.
+        loss_per_section_list = []
+        for b in range(B):
+            if mask is not None:
+                valid = mask[b]
+                x_pred_b = x_0_pred[b][valid]                         # (n_b, D)
+                z_1_b = z_1[b][valid]                                 # (n_b, D)
+            else:
+                x_pred_b = x_0_pred[b]
+                z_1_b = z_1[b]
+            d_pred_b = torch.cdist(x_pred_b, x_pred_b, p=2.0)
+            d_true_b = torch.cdist(z_1_b, z_1_b, p=2.0)
+            loss_per_section_list.append(((d_pred_b - d_true_b) ** 2).mean())
+        loss_per_section = torch.stack(loss_per_section_list)         # (B,)
 
         # LUNA: `mse_loss = torch.mean(stacked_losses)` — mean across sections.
         loss = loss_per_section.mean()
