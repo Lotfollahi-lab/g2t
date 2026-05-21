@@ -1,0 +1,8 @@
+save_dir: './' # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
+
+checkpoints_parent_dir: null # only for 'test_only' mode, path to the checkpoint to test. 
+checkpoints_name_list: all # only for 'test_only' mode, list of checkpoint paths to test. 'all' to test all checkpoints in the checkpoints_parent_dir., 'epoch=749.ckpt'
+batch_size: 1 # Batch size for testing
+epoch_index: null
+checkpoint_path: null # only for 'test_only' mode, path to the checkpoint to test.
+test_save_parent_path: null # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.

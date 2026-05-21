@@ -1,7 +1,7 @@
 [project]
 name = "scgg"
 version = "0.1.0"
-description = "Spatial Graph Generation via Conditional Flow Matching"
+description = "Spatial Graph Generation — LUNA codebase under the hood, scGG entry points"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
@@ -14,6 +14,16 @@ dependencies = [
     "anndata>=0.9",
     "faiss-cpu>=1.7",
     "wandb>=0.15",
+    # LUNA's runtime dependencies — vendored verbatim under scgg/src/{models,
+    # utils, metrics, datasets, configs}, called via Hydra. Keep these pinned
+    # loosely (>=) so we can pull patches from upstream LUNA without
+    # re-specifying versions here.
+    "pytorch-lightning>=2.0",
+    "torch-geometric>=2.3",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "linear-attention-transformer>=0.19",
+    "pandas>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -26,12 +36,32 @@ dev = [
     "ruff>=0.4",
 ]
 
+# Packages found under src/. We register both:
+#   - `scgg.*`             — our entry-point package (scripts/eval/data live here)
+#   - LUNA's top-level pkgs — vendored verbatim, imported as `models`,
+#                             `utils`, `metrics`, `datasets`, `configs`,
+#                             `diffusion_model`, `main` (LUNA's own import
+#                             style, kept unchanged to track upstream).
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["scgg", "scgg.*"]
+include = [
+    "scgg", "scgg.*",
+    "models", "models.*",
+    "utils", "utils.*",
+    "metrics", "metrics.*",
+    "datasets", "datasets.*",
+    "configs", "configs.*",
+]
+
+# LUNA's `main.py` and `diffusion_model.py` are top-level single modules
+# (not packages). Register them as py-modules so they end up installed.
+[tool.setuptools]
+py-modules = ["main", "diffusion_model"]
 
 [tool.setuptools.package-data]
-"scgg.configs" = ["*.yaml"]
+# LUNA's Hydra configs are YAML files inside the `configs` package; they
+# must be included in the wheel so Hydra can discover them at runtime.
+"configs" = ["**/*.yaml"]
 
 [build-system]
 # setuptools >= 64 is the first version with PEP 660 (build_editable) support.

@@ -1,0 +1,6 @@
+name : 'MERFISH_mouse_cortex' # name of the experiment
+wandb: 'online' # run, disabled, online, dryrun or offline
+mode: 'train_and_test' # 'train_and_test', 'test_only'
+seed: 0 # random seed
+enable_progress_bar: True # Enable progress bar for training and validation
+local_saved_path: null # path to save the experiment results. 'null' to save to the default path.

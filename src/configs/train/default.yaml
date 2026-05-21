@@ -1,0 +1,6 @@
+
+n_epochs: 3000 # Number of epochs
+batch_size: 1 # Batch size for training
+lr: 5e-4 # Learning rate
+fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
+weight_decay: 1.0e-12

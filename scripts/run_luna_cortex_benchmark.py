@@ -1,23 +1,36 @@
-#!/usr/bin/env python
-"""
-End-to-end LUNA Figure 3 reproduction with ScGG.
+"""LUNA-on-cortex benchmark, scGG entry point.
 
-Trains ScGG (contrastive mode by default) on the 33 Mouse 1 slices and
-evaluates per-slice on the 31 Mouse 2 slices, reporting the exact LUNA
-metrics (median Spearman, contact precision/F1, Kabsch RSSD).
+This script preserves the historical scGG CLI (``--data_dir``,
+``--wandb_run_name``, ``--output_dir``, ...) but the actual model,
+training loop, loss, and sampling are now LUNA's, vendored verbatim
+under ``scgg/src/{models,utils,metrics,datasets,configs}``.
 
-Default report row matches LUNA's headline: mean across 31 test slices of
-the per-slice MEDIAN of per-cell Spearman (LUNA reports 44.8% for this).
+Flow on a normal invocation::
 
-Usage:
-
-    python -m scgg.scripts.run_luna_cortex_benchmark \\
+    python scripts/run_luna_cortex_benchmark.py \\
         --data_dir /nfs/team361/sb75/DATASETS/silver/mmc_luna \\
-        --epochs 200 \\
-        --batch_size 8192 \\
-        --output_dir ./results/luna_cortex_run1
+        --wandb_run_name scgg_luna_baseline
 
-Or call from a notebook by importing `run_benchmark()`.
+    1. Discover per-slice h5ad files under --data_dir, split by mouse
+       (Mouse 1 -> train, Mouse 2 -> test).
+    2. Materialise LUNA-format train.csv + test.csv under the run dir.
+    3. Invoke the vendored LUNA (``scgg/src/main.py``) as a subprocess
+       with Hydra overrides — same Python interpreter, same env.
+    4. Read LUNA's ``metadata_pred.csv`` / ``metadata_true.csv`` per slice.
+    5. Compute per-slice + aggregate metrics via
+       ``scgg.evaluation.luna_metrics``.
+    6. Write ``per_slice_metrics.csv``, ``aggregate_metrics.json``,
+       ``config.yaml``, ``benchmark.log`` — same filenames as the
+       previous scGG run, so downstream tooling and notebooks keep
+       working.
+
+Removed CLI flags that referred to deleted scGG abstractions
+(``--objective``, ``--metric_embed_dim``, ``--no_coord_regression``,
+``--class_stratified_distance``, ``--k_default``, ``--n_top_hvg``,
+``--no_normalize``, ``--no_scale``, ``--config``, ``--device``,
+``--val_fraction``). Passing any of these will now produce a clear
+``unrecognized arguments`` error from argparse — that's the signal that
+LUNA is the engine now.
 """
 
 from __future__ import annotations
@@ -26,208 +39,310 @@ import argparse
 import csv
 import json
 import logging
+import re
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-import yaml
-from importlib import resources
+import pandas as pd
 
 logger = logging.getLogger("scgg.luna_cortex_benchmark")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Paths
 # ---------------------------------------------------------------------------
 
+# Root of the scgg repo (this file lives in scgg/scripts/).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+# LUNA vendored under scgg/src/. `main.py`, `models/`, `utils/`, etc.
+# all live here. The subprocess cwd we set below must be this dir so
+# Hydra resolves ``configs/`` and LUNA's top-level imports
+# (``from models.X import ...``) work.
+_VENDORED_LUNA_SRC = _REPO_ROOT / "src"
 
-def _load_config(path: Optional[Path]) -> dict:
-    if path is not None and Path(path).exists():
-        with open(path) as f:
-            return yaml.safe_load(f)
-    ref = resources.files("scgg.configs").joinpath("default.yaml")
-    return yaml.safe_load(ref.read_text())
-
-
-def _split_train_val(
-    section_ids: np.ndarray,
-    val_fraction: float,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Hold out a fraction of unique sections for validation."""
-    unique = np.unique(section_ids)
-    if val_fraction <= 0 or len(unique) < 2:
-        return np.ones(section_ids.shape, dtype=bool), np.zeros(section_ids.shape, dtype=bool)
-    n_val = max(1, int(round(val_fraction * len(unique))))
-    val = rng.choice(unique, size=n_val, replace=False)
-    val_mask = np.isin(section_ids, val)
-    train_mask = ~val_mask
-    return train_mask, val_mask
-
-
-# ---------------------------------------------------------------------------
-# Inference helpers
-# ---------------------------------------------------------------------------
-
-
-@torch.no_grad()
-def _embed_section(model, gene_expr: np.ndarray, device: torch.device) -> np.ndarray:
-    """Compute the metric embedding (or 2-D coord if flow_matching) for one section."""
-    model.eval()
-    ge = torch.from_numpy(gene_expr).float().to(device)
-    if model.objective == "contrastive":
-        emb = model.embed_batched(ge)
-    else:
-        # flow_matching ablation: integrate the ODE to get 2-D coords
-        emb = model.generate_embeddings(ge)
-    return emb.detach().cpu().numpy()
-
-
-def _evaluate_split(
-    model,
-    *,
-    gene_expr: np.ndarray,
-    coords: np.ndarray,
-    section_ids: np.ndarray,
-    cell_class: Optional[np.ndarray],
-    section_map: Dict[int, str],
-    device: torch.device,
-    contact_percentile: float,
-    compute_rssd: bool,
-) -> List[Dict[str, float]]:
-    """Run per-slice evaluation and return a list of per-slice metric dicts."""
-    from scgg.evaluation.luna_metrics import evaluate_slice
-
-    rows: List[Dict[str, float]] = []
-    for sid in np.unique(section_ids):
-        mask = section_ids == sid
-        if mask.sum() < 10:
-            logger.info(f"  skipping section {section_map.get(int(sid), sid)} (n<10)")
-            continue
-        true_xy = coords[mask]
-        ge = gene_expr[mask]
-        pred = _embed_section(model, ge, device)
-        cls = cell_class[mask] if cell_class is not None else None
-
-        row = evaluate_slice(
-            true_xy, pred, cls,
-            contact_percentile=contact_percentile,
-            compute_rssd=compute_rssd,
-            rssd_projection="pca",
-        )
-        row["section_id"] = int(sid)
-        row["section_label"] = section_map.get(int(sid), str(sid))
-        rows.append(row)
-        logger.info(
-            f"  {row['section_label']:30s}  "
-            f"spr_median={row['spearman_per_cell_median']:.4f}  "
-            f"spr_mean={row['spearman_per_cell_mean']:.4f}  "
-            f"prec={row['precision']:.4f}  "
-            f"rssd={row.get('absolute_rssd', float('nan')):.2f}"
-        )
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-
+# Default artifacts root (NFS on the cluster). Overridable via
+# --output_dir; if not set and not on NFS we still fall back to this
+# path, mirroring the prior behaviour.
 _ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
+
+# Cortex silver-file naming. Accepts both old and new prefixes.
+_SLICE_RE = re.compile(
+    r"^(?:mmc|merfish_mouse_cortex)_mouse(?P<mouse>\d+)_slice(?P<slice>\d+)\.h5ad$"
+)
+
+# LUNA's PyTorch-Lightning checkpoint filename pattern: ``epoch=NNN.ckpt``.
+_EPOCH_RE = re.compile(r"epoch=(\d+)")
+
+
+# ---------------------------------------------------------------------------
+# h5ad discovery + LUNA-format CSV materialisation
+# ---------------------------------------------------------------------------
+
+
+def _enumerate_slice_files(silver_dir: Path) -> List[Tuple[int, int, Path]]:
+    """Return (mouse_id, slice_id, path) tuples for each cortex h5ad."""
+    out: List[Tuple[int, int, Path]] = []
+    for p in sorted(silver_dir.iterdir()):
+        m = _SLICE_RE.match(p.name)
+        if not m:
+            continue
+        out.append((int(m["mouse"]), int(m["slice"]), p))
+    return out
+
+
+def _split_by_mouse(
+    files: List[Tuple[int, int, Path]], mouse_id: int,
+) -> List[Tuple[int, int, Path]]:
+    return [f for f in files if f[0] == mouse_id]
+
+
+def _build_luna_csv(
+    files: List[Tuple[int, int, Path]],
+    out_csv: Path,
+    log2_normalize: bool = False,
+) -> Dict[str, object]:
+    """Concatenate per-slice h5ads into one LUNA-format CSV.
+
+    LUNA expects: gene columns first (positions ``0..n_genes-1``), then
+    ``coord_X``, ``coord_Y``, ``cell_section``, ``cell_class``. Index =
+    original cell barcode.
+
+    No log2 normalisation by default — LUNA's published CSVs are
+    non-integer per-cell-normalised counts in the same magnitude range
+    as raw counts (max ~250). Set ``log2_normalize=True`` only for
+    ablations.
+
+    Within-section row order is reconstructed from each cell's
+    ``_bronze_row_pos`` (stamped by ``build_h5ad_from_luna_csv.py``)
+    so LUNA's unstable ``sort_values("cell_section")`` produces the
+    same post-sort ordering as it would on the bronze CSV. This is
+    what makes LUNA-on-h5ad ≡ LUNA-on-bronze for ablations / unit tests.
+    """
+    import anndata as ad
+    import scipy.sparse as sp
+
+    gene_names: Optional[List[str]] = None
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    if out_csv.exists():
+        out_csv.unlink()
+
+    per_section_dfs: List[pd.DataFrame] = []
+    has_bronze_pos = True
+
+    for mouse, slice_id, path in files:
+        adata = ad.read_h5ad(path)
+        X = adata.X
+        if sp.issparse(X):
+            X = X.toarray()
+        X = np.asarray(X, dtype=np.float64)
+        if log2_normalize:
+            X = np.log2(X + 1.0)
+
+        if gene_names is None:
+            gene_names = list(adata.var_names)
+        elif list(adata.var_names) != gene_names:
+            raise ValueError(
+                f"Gene panel mismatch in {path.name}: expected "
+                f"{len(gene_names)} genes, got {adata.n_vars}"
+            )
+
+        section_label = f"mouse{mouse}_slice{slice_id}"
+        cell_class = (
+            adata.obs["cell_class"].astype(str).values
+            if "cell_class" in adata.obs.columns
+            else np.full(adata.n_obs, "unknown")
+        )
+        if "spatial" in adata.obsm:
+            xy = np.asarray(adata.obsm["spatial"], dtype=np.float64)[:, :2]
+        else:
+            xy = np.column_stack([
+                adata.obs["coord_X"].to_numpy(dtype=np.float64),
+                adata.obs["coord_Y"].to_numpy(dtype=np.float64),
+            ])
+
+        if "cell_id" in adata.obs.columns:
+            cell_ids = adata.obs["cell_id"].to_numpy()
+        else:
+            cell_ids = np.arange(len(X))
+
+        if "_bronze_row_pos" in adata.obs.columns:
+            bronze_row_pos = adata.obs["_bronze_row_pos"].to_numpy()
+        else:
+            has_bronze_pos = False
+            order = np.argsort(cell_ids, kind="stable")
+            X = X[order]
+            xy = xy[order]
+            cell_class = cell_class[order]
+            cell_ids = cell_ids[order]
+            bronze_row_pos = cell_ids
+
+        df = pd.DataFrame(X, columns=gene_names)
+        df["coord_X"] = xy[:, 0]
+        df["coord_Y"] = xy[:, 1]
+        df["cell_section"] = section_label
+        df["cell_class"] = cell_class
+        df.index = cell_ids
+        df.index.name = "cell_id"
+        df["_bronze_row_pos"] = bronze_row_pos
+        per_section_dfs.append(df)
+        logger.info(f"    collected {len(df):>6,} cells from {section_label}")
+
+    if not per_section_dfs:
+        raise RuntimeError("no sections collected — no h5ads matched the file list")
+
+    big_df = pd.concat(per_section_dfs, axis=0)
+    if has_bronze_pos:
+        big_df = big_df.sort_values("_bronze_row_pos", kind="stable")
+    else:
+        logger.warning(
+            "  no _bronze_row_pos in any h5ad — rebuild silver with the latest "
+            "build_h5ad_from_luna_csv.py to enable bit-identical LUNA-on-h5ad "
+            "≡ LUNA-on-bronze."
+        )
+    big_df = big_df.drop(columns=["_bronze_row_pos"])
+    big_df.to_csv(out_csv, header=True, float_format="%.17g")
+    rows_total = len(big_df)
+    logger.info(f"  wrote {rows_total:,} cells total to {out_csv}")
+
+    return {
+        "n_rows": rows_total,
+        "n_genes": int(len(gene_names)) if gene_names else 0,
+        "n_sections": len(files),
+    }
+
+
+# ---------------------------------------------------------------------------
+# LUNA invocation
+# ---------------------------------------------------------------------------
+
+
+def _invoke_luna(overrides: List[str], log_path: Path) -> int:
+    """Run vendored LUNA's main.py with Hydra overrides.
+
+    Uses the same Python interpreter (``sys.executable``), so the
+    subprocess inherits the active virtualenv (must have torch,
+    pytorch-lightning, hydra-core, torch-geometric,
+    linear-attention-transformer installed).
+
+    ``cwd`` is set to the vendored LUNA root (``scgg/src/``) so
+      * Hydra resolves ``configs/`` relative to ``main.py``;
+      * LUNA's top-level absolute imports (``from models.X import ...``)
+        find their packages on ``sys.path[0]``.
+    """
+    main_py = _VENDORED_LUNA_SRC / "main.py"
+    if not main_py.exists():
+        raise FileNotFoundError(
+            f"vendored LUNA entry point missing: {main_py}. "
+            f"Did the LUNA copy under scgg/src/ get clobbered?"
+        )
+
+    cmd = [sys.executable, str(main_py), *overrides]
+    logger.info("Invoking LUNA:")
+    for arg in cmd:
+        logger.info(f"    {arg}")
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    with open(log_path, "wb") as f:
+        proc = subprocess.run(
+            cmd, cwd=str(_VENDORED_LUNA_SRC), stdout=f, stderr=subprocess.STDOUT,
+            check=False,
+        )
+    elapsed = (time.time() - t0) / 60.0
+    logger.info(
+        f"LUNA exited with code {proc.returncode} after {elapsed:.1f} min "
+        f"(log: {log_path})"
+    )
+    if proc.returncode != 0 and log_path.exists():
+        with open(log_path) as f:
+            tail = f.read().splitlines()[-60:]
+        for line in tail:
+            logger.error(f"  | {line}")
+    return proc.returncode
+
+
+# ---------------------------------------------------------------------------
+# Read LUNA predictions + run scgg.evaluation.luna_metrics
+# ---------------------------------------------------------------------------
+
+
+def _read_luna_predictions(
+    test_save_dir: Path,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
+    """Return ``{section_label: (coords_pred, coords_true, cell_class)}``."""
+    pred_files = list(test_save_dir.rglob("metadata_pred.csv"))
+    if not pred_files:
+        raise FileNotFoundError(
+            f"No metadata_pred.csv under {test_save_dir} — did LUNA finish?"
+        )
+
+    out: Dict[str, Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]] = {}
+    for pred_path in sorted(pred_files):
+        true_path = pred_path.parent / "metadata_true.csv"
+        if not true_path.exists():
+            logger.warning(f"  {pred_path.parent.name}: missing metadata_true.csv")
+            continue
+        pred = pd.read_csv(pred_path, index_col=0)
+        true = pd.read_csv(true_path, index_col=0)
+        # Align on index — LUNA writes them in matching order, but be defensive.
+        if not pred.index.equals(true.index):
+            common = pred.index.intersection(true.index)
+            pred = pred.loc[common]
+            true = true.loc[common]
+
+        coords_pred = pred[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+        coords_true = true[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+        cell_class = None
+        if "cell_class" in true.columns:
+            cell_class = true["cell_class"].astype(str).to_numpy()
+        out[pred_path.parent.name] = (coords_pred, coords_true, cell_class)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
 
 def run_benchmark(
     data_dir: str,
     output_dir: Optional[str] = None,
-    config_path: Optional[str] = None,
-    epochs: Optional[int] = None,
-    batch_size: Optional[int] = None,
+    epochs: int = 1000,
+    batch_size: int = 6,
     lr: Optional[float] = None,
-    seed: int = 42,
-    device: Optional[str] = None,
-    wandb: Optional[bool] = None,
+    seed: int = 0,
+    wandb_mode: str = "disabled",
     wandb_run_name: Optional[str] = None,
-    val_fraction: float = 0.1,
     contact_percentile: float = 0.01,
     compute_rssd: bool = True,
-    n_top_hvg: Optional[int] = None,
-    normalize: bool = True,
-    scale: bool = True,
     skip_training: bool = False,
     load_checkpoint: Optional[str] = None,
-    class_stratified_distance: Optional[bool] = None,
-    k_default: Optional[int] = None,
-    coord_regression: Optional[bool] = None,
-    metric_embed_dim: Optional[int] = None,
-    objective: Optional[str] = None,
+    log2_normalize: bool = False,
+    extra_overrides: Optional[List[str]] = None,
 ) -> Dict[str, float]:
-    """Run the full LUNA Figure 3 benchmark and return the aggregated metrics.
+    """Train vendored LUNA on Mouse 1, evaluate on Mouse 2.
 
-    Args:
-        data_dir: Path to the per-slice h5ad directory (LUNA cortex split).
-            Files like mmc_mouse{1,2}_slice{N}.h5ad (or the legacy
-            merfish_mouse_cortex_mouse{1,2}_slice{N}.h5ad). Mouse 1
-            is treated as TRAIN, Mouse 2 as TEST.
-        output_dir: Where to write the trained checkpoint + per-slice and
-            aggregated metrics. None (default) derives the path from
-            data_dir's basename plus a per-run timestamp:
-            {ARTIFACTS_ROOT}/{data_dir.name}/model/{YYYYMMDD_HHMMSS}/
-            (e.g. /nfs/team361/sb75/scgg-reproducibility/artifacts/mmc_luna/
-            model/20260518_213045/). The timestamp lets multiple training
-            runs coexist; the matching inference outputs live under
-            inference/{YYYYMMDD_HHMMSS}/.
-        config_path: Optional override path to a scgg config YAML.
-        epochs / batch_size / lr / wandb / wandb_run_name: CLI overrides.
-        val_fraction: Fraction of TRAIN slices held out for validation.
-        contact_percentile: Percentile for LUNA's contact F1 metric.
-        compute_rssd: Skip Kabsch RSSD if False (faster; for metric embeddings
-            it requires a 2-D PCA projection).
-        n_top_hvg: Optional HVG selection (seurat_v3 on train counts).
-        skip_training: If True, only run evaluation (must provide load_checkpoint).
-        load_checkpoint: Path to a saved checkpoint to evaluate (skips training).
-        class_stratified_distance: If True, switch the DistanceRegression loss
-            from all-pairs Pearson to per-cell-class Pearson averaged across
-            classes — forces the model to encode within-class spatial
-            geometry instead of just clustering by cell type. None (default)
-            leaves whatever the config specifies untouched.
-        k_default: k for the GT spatial kNN graph that defines SupCon
-            positives. None leaves the config default (10) alone. In laminar
-            tissues like cortex, small k means a cell's positives are almost
-            all in the same layer with similar tangential positions, so the
-            model can satisfy SupCon without learning tangential structure.
-            k=30–50 makes positives extend across tangential extents and
-            forces the model to encode them.
-        coord_regression: Toggle the direct (x, y) regression head with
-            Procrustes-aligned MSE on top of the metric embedding. None
-            leaves config alone (default ON). Pass False to ablate.
-        metric_embed_dim: Output dimension of the metric head. None leaves
-            the config default (8). Pass 64 to recover the pre-coord-loss
-            regime; useful for direct ablation against the larger embedding.
-        objective: Override training.objective. None leaves the config
-            default ("flow_matching"). Pass "contrastive" to ablate.
-
-    Returns:
-        Dict of aggregated metrics; identical structure to
-        scgg.evaluation.luna_metrics.aggregate_slices().
+    Returns the aggregated metrics dict (same shape as
+    ``scgg.evaluation.luna_metrics.aggregate_slices``).
     """
-    from scgg.data.luna_cortex import load_luna_cortex
-    from scgg.data.dataset import SpatialTranscriptomicsDataset
-    from scgg.model.scgg import ScGG
-    from scgg.training.trainer import Trainer
-    from scgg.evaluation.luna_metrics import aggregate_slices
+    # Defer the scgg import so the script can show ``--help`` even when
+    # the scgg env isn't activated.
+    from scgg.evaluation.luna_metrics import aggregate_slices, evaluate_slice
 
     data_path = Path(data_dir)
-    # Stamp the run so multiple training attempts don't overwrite each
-    # other and so inference can pin to a specific model version.
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_dir is None:
-        out_dir = _ARTIFACTS_ROOT / data_path.name / "model" / run_timestamp
+        out_dir = _ARTIFACTS_ROOT / data_path.name / "model" / run_ts
     else:
         out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -237,182 +352,114 @@ def run_benchmark(
         ],
         force=True,
     )
-    logger.info(f"Run timestamp: {run_timestamp}")
+    logger.info(f"Run timestamp: {run_ts}")
     logger.info(f"Output dir:    {out_dir}")
+    logger.info(f"Vendored LUNA: {_VENDORED_LUNA_SRC}")
 
-    cfg = _load_config(Path(config_path) if config_path else None)
+    # ---- 1. Materialise LUNA-format CSVs from the silver h5ads ---------
+    work = out_dir / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    train_csv = work / "train.csv"
+    test_csv = work / "test.csv"
 
-    # CLI overrides
-    if epochs is not None:
-        cfg["training"]["epochs"] = int(epochs)
-    if batch_size is not None:
-        cfg["training"]["batch_size"] = int(batch_size)
-    if lr is not None:
-        cfg["training"]["lr"] = float(lr)
-    if wandb is not None:
-        cfg["training"]["wandb"] = bool(wandb)
-    if wandb_run_name is not None:
-        cfg["training"]["wandb_run_name"] = wandb_run_name
-    cfg["training"]["checkpoint_dir"] = str(out_dir / "checkpoints")
-
-    if class_stratified_distance is not None:
-        cfg.setdefault("training", {}).setdefault("loss", {}).setdefault(
-            "distance_regression", {}
-        )["class_stratified"] = bool(class_stratified_distance)
+    if train_csv.exists() and test_csv.exists() and not skip_training:
+        logger.info("LUNA CSVs already exist under work/; reusing")
+        head = pd.read_csv(train_csv, nrows=1, index_col=0)
+        n_genes = len(head.columns) - 4  # coord_X, coord_Y, cell_section, cell_class
+    else:
+        files = _enumerate_slice_files(data_path)
+        train_files = _split_by_mouse(files, 1)
+        test_files = _split_by_mouse(files, 2)
         logger.info(
-            f"distance_regression.class_stratified overridden via CLI: "
-            f"{bool(class_stratified_distance)}"
+            f"Silver dir: {data_path} "
+            f"({len(train_files)} train [Mouse 1], {len(test_files)} test [Mouse 2])"
         )
-
-    if k_default is not None:
-        cfg.setdefault("graph", {})["k_default"] = int(k_default)
-        logger.info(f"graph.k_default overridden via CLI: {int(k_default)}")
-
-    if coord_regression is not None:
-        cfg.setdefault("training", {}).setdefault("loss", {}).setdefault(
-            "coord_regression", {}
-        )["enabled"] = bool(coord_regression)
-        logger.info(
-            f"loss.coord_regression.enabled overridden via CLI: "
-            f"{bool(coord_regression)}"
-        )
-
-    if metric_embed_dim is not None:
-        cfg.setdefault("model", {}).setdefault("metric_head", {})[
-            "embed_dim"
-        ] = int(metric_embed_dim)
-        logger.info(
-            f"model.metric_head.embed_dim overridden via CLI: "
-            f"{int(metric_embed_dim)}"
-        )
-
-    if objective is not None:
-        if objective not in ("flow_matching", "contrastive"):
-            raise ValueError(
-                f"objective must be 'flow_matching' or 'contrastive'; "
-                f"got {objective!r}"
+        if not train_files or not test_files:
+            raise FileNotFoundError(
+                f"Need Mouse 1 AND Mouse 2 slices under {data_path}. "
+                f"Found train={len(train_files)}, test={len(test_files)}"
             )
-        cfg.setdefault("training", {})["objective"] = objective
-        logger.info(f"training.objective overridden via CLI: {objective}")
+        logger.info(f"Writing train CSV -> {train_csv}")
+        train_stats = _build_luna_csv(train_files, train_csv, log2_normalize)
+        logger.info(f"Writing test CSV  -> {test_csv}")
+        test_stats = _build_luna_csv(test_files, test_csv, log2_normalize)
+        n_genes = int(train_stats["n_genes"])
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # ---- 2. Build Hydra overrides + invoke LUNA -------------------------
+    luna_run_dir = out_dir / "luna_run"
+    luna_run_dir.mkdir(parents=True, exist_ok=True)
+    test_save_dir = luna_run_dir / "test_results"
+    test_save_dir.mkdir(parents=True, exist_ok=True)
 
-    dev = torch.device(
-        device if device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    logger.info(f"Using device: {dev}")
+    def _h(v: object) -> str:
+        # Hydra single-quote escape — required for paths that contain '='
+        # (e.g. LUNA's epoch=N.ckpt filenames).
+        return f"'{v}'"
 
-    # ---- Load data ------------------------------------------------------
-    logger.info(f"Loading LUNA cortex from {data_dir}")
-    data = load_luna_cortex(
-        data_dir,
-        normalize=normalize,
-        scale=scale,
-        n_top_hvg=n_top_hvg,
-    )
-    n_genes = data["gene_expr_train"].shape[1]
-    logger.info(
-        f"Train: {data['gene_expr_train'].shape[0]} cells, "
-        f"{len(data['section_map_train'])} sections | "
-        f"Test:  {data['gene_expr_test'].shape[0]} cells, "
-        f"{len(data['section_map_test'])} sections | "
-        f"Genes: {n_genes}"
-    )
+    run_name = wandb_run_name or "scgg_luna_benchmark"
+    mode = "test_only" if skip_training else "train_and_test"
 
-    rng = np.random.default_rng(seed)
-    train_mask, val_mask = _split_train_val(
-        data["section_ids_train"], val_fraction, rng
-    )
+    overrides = [
+        f"general.name={run_name}",
+        f"general.mode={mode}",
+        f"general.seed={seed}",
+        f"general.wandb={wandb_mode}",
+        f"dataset.train_data_path={_h(train_csv.resolve())}",
+        f"dataset.test_data_path={_h(test_csv.resolve())}",
+        "dataset.gene_columns_start=0",
+        f"dataset.gene_columns_end={n_genes}",
+        f"train.batch_size={batch_size}",
+        f"train.n_epochs={epochs}",
+        f"test.save_dir={_h(test_save_dir.resolve())}",
+        f"hydra.run.dir={_h(luna_run_dir.resolve())}",
+    ]
+    if lr is not None:
+        overrides.append(f"train.lr={lr}")
+    if skip_training:
+        if load_checkpoint is None:
+            raise ValueError(
+                "--skip_training requires --load_checkpoint to point at a "
+                "LUNA-format .ckpt path."
+            )
+        ckpt_path = Path(load_checkpoint).resolve()
+        overrides.append(f"test.checkpoints_parent_dir={_h(ckpt_path.parent)}")
+        overrides.append(f"test.checkpoints_name_list=[{_h(ckpt_path.name)}]")
+    if extra_overrides:
+        overrides.extend(extra_overrides)
 
-    # In flow-matching mode the velocity network is conditioned on a
-    # target k (graph density), so training over a range of k values lets
-    # the model handle multiple inference scales. In contrastive mode we
-    # only need the one k that defines SupCon positives.
-    objective = cfg["training"]["objective"]
-    k_default = int(cfg["graph"]["k_default"])
-    if objective == "flow_matching":
-        k_range = cfg["graph"].get("k_train_range", [5, 30])
-        k_values = list(range(int(k_range[0]), int(k_range[1]) + 1))
+    log_path = out_dir / "luna_stdout.log"
+    rc = _invoke_luna(overrides, log_path)
+    if rc != 0:
+        raise RuntimeError(f"LUNA training failed (exit {rc}). See {log_path}")
+
+    # ---- 3. Read LUNA predictions, run scgg.evaluation.luna_metrics ----
+    logger.info(f"Reading LUNA predictions from {test_save_dir}")
+    sections = _read_luna_predictions(test_save_dir)
+    logger.info(f"Found predictions for {len(sections)} slices")
+
+    per_slice: List[Dict[str, float]] = []
+    for label, (coords_pred, coords_true, cell_class) in sections.items():
+        if coords_true.shape[0] < 10:
+            logger.info(f"  skipping {label} (n<10)")
+            continue
+        row = evaluate_slice(
+            coords_true, coords_pred, cell_class,
+            contact_percentile=contact_percentile,
+            compute_rssd=compute_rssd,
+            rssd_projection="pca",
+        )
+        row["section_label"] = label
+        per_slice.append(row)
         logger.info(
-            f"flow_matching objective: training over k ∈ "
-            f"[{k_values[0]}, {k_values[-1]}] ({len(k_values)} values)"
-        )
-    else:
-        k_values = [k_default]
-        logger.info(
-            f"{objective} objective: training with single k={k_default}"
+            f"  {label:30s}  "
+            f"spr_median={row['spearman_per_cell_median']:.4f}  "
+            f"spr_mean={row['spearman_per_cell_mean']:.4f}  "
+            f"prec={row['precision']:.4f}  "
+            f"rssd={row.get('absolute_rssd', float('nan')):.2f}"
         )
 
-    cc_train = data.get("cell_class_id_train")
-    train_ds = SpatialTranscriptomicsDataset(
-        gene_expr=data["gene_expr_train"][train_mask],
-        coords=data["coords_train"][train_mask],
-        section_ids=data["section_ids_train"][train_mask],
-        config=cfg["data"],
-        k_values=k_values,
-        is_train=True,
-        cell_class=(cc_train[train_mask] if cc_train is not None else None),
-    )
-    val_ds = None
-    if val_mask.any():
-        val_ds = SpatialTranscriptomicsDataset(
-            gene_expr=data["gene_expr_train"][val_mask],
-            coords=data["coords_train"][val_mask],
-            section_ids=data["section_ids_train"][val_mask],
-            config=cfg["data"],
-            k_values=k_values,
-            is_train=False,
-            cell_class=(cc_train[val_mask] if cc_train is not None else None),
-        )
-    if data.get("class_names"):
-        logger.info(
-            f"Cell-class labels available: {len(data['class_names'])} classes "
-            f"({data['class_names'][:5]}{' ...' if len(data['class_names']) > 5 else ''})"
-        )
-
-    # ---- Build model + trainer -----------------------------------------
-    model = ScGG(n_genes=n_genes, config=cfg)
-    logger.info(
-        f"Built ScGG (objective={model.objective}) with "
-        f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,} params"
-    )
-
-    trainer = Trainer(
-        model=model,
-        train_dataset=train_ds,
-        val_dataset=val_ds,
-        config=cfg,
-        device=dev,
-    )
-
-    if load_checkpoint is not None:
-        trainer.load_checkpoint(load_checkpoint)
-    elif not skip_training:
-        t0 = time.time()
-        trainer.train()
-        logger.info(f"Training finished in {(time.time() - t0) / 60:.1f} min")
-    else:
-        logger.warning("skip_training=True with no checkpoint — evaluating untrained model")
-
-    # ---- Evaluate on Mouse 2 -------------------------------------------
-    logger.info(f"Evaluating on {len(data['section_map_test'])} test slices "
-                 f"(Mouse 2, {data['gene_expr_test'].shape[0]} cells)")
-    per_slice = _evaluate_split(
-        model,
-        gene_expr=data["gene_expr_test"],
-        coords=data["coords_test"],
-        section_ids=data["section_ids_test"],
-        cell_class=data["cell_class_test"],
-        section_map=data["section_map_test"],
-        device=dev,
-        contact_percentile=contact_percentile,
-        compute_rssd=compute_rssd,
-    )
-
-    # ---- Aggregate + write results -------------------------------------
+    # ---- 4. Aggregate + write outputs ----------------------------------
     agg = aggregate_slices(per_slice)
-
     headline = agg.get("spearman_mean_of_medians", float("nan"))
     luna_reported = 0.448
     logger.info("=" * 72)
@@ -429,19 +476,14 @@ def run_benchmark(
         delta = (headline - luna_reported) * 100
         logger.info(f"Delta vs LUNA: {delta:+.2f} percentage points")
 
-    # CSV
     fieldnames = sorted({k for r in per_slice for k in r.keys()})
     with open(out_dir / "per_slice_metrics.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in per_slice:
             w.writerow(r)
-    # JSON aggregate
     with open(out_dir / "aggregate_metrics.json", "w") as f:
         json.dump(agg, f, indent=2, default=str)
-    # Config snapshot
-    with open(out_dir / "config.yaml", "w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
 
     logger.info(f"Wrote results to {out_dir}")
     return agg
@@ -453,99 +495,77 @@ def run_benchmark(
 
 
 def main():
-    p = argparse.ArgumentParser(description="Run LUNA Figure 3 reproduction with ScGG")
+    p = argparse.ArgumentParser(
+        description=(
+            "LUNA Figure 3 reproduction. Trains the vendored LUNA model "
+            "(under scgg/src/) on Mouse 1 and evaluates on Mouse 2."
+        ),
+    )
     p.add_argument(
         "--data_dir", required=True,
         help="Path to per-slice h5ad directory (LUNA cortex split).",
     )
     p.add_argument(
         "--output_dir", default=None,
-        help="Where to write the trained checkpoint + per-slice / aggregate "
-             "metrics. Default derives from --data_dir's basename and adds "
-             "a timestamp: /nfs/team361/sb75/scgg-reproducibility/artifacts/"
-             "<data_dir_name>/model/<YYYYMMDD_HHMMSS>/.",
+        help="Where to write LUNA checkpoints + per-slice / aggregate "
+             "metrics. Default: "
+             "/nfs/team361/sb75/scgg-reproducibility/artifacts/<data_dir_name>/"
+             "model/<YYYYMMDD_HHMMSS>/.",
     )
-    p.add_argument("--config", default=None, help="Optional config YAML override.")
-    p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--batch_size", type=int, default=None)
-    p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", default=None, help="cuda|cpu (auto if omitted)")
-    p.add_argument("--no_wandb", action="store_true")
-    p.add_argument("--wandb_run_name", default=None)
-    p.add_argument("--val_fraction", type=float, default=0.1)
-    p.add_argument("--contact_percentile", type=float, default=0.01)
+    p.add_argument("--epochs", type=int, default=1000,
+                   help="LUNA train.n_epochs (default 1000 — matches paper).")
+    p.add_argument("--batch_size", type=int, default=6,
+                   help="LUNA train.batch_size (number of SECTIONS per "
+                        "gradient step; default 6 — matches paper).")
+    p.add_argument("--lr", type=float, default=None,
+                   help="LUNA train.lr (default unset → LUNA default 5e-4).")
+    p.add_argument("--seed", type=int, default=0,
+                   help="LUNA general.seed (default 0 — matches paper).")
+    p.add_argument("--no_wandb", action="store_true",
+                   help="Set LUNA's general.wandb=disabled (default).")
+    p.add_argument("--wandb_online", action="store_true",
+                   help="Set LUNA's general.wandb=online — requires "
+                        "`wandb login` on the host.")
+    p.add_argument("--wandb_run_name", default=None,
+                   help="Becomes LUNA's general.name (drives the wandb "
+                        "run name and the LUNA run-dir basename).")
+    p.add_argument("--contact_percentile", type=float, default=0.01,
+                   help="Percentile for LUNA's contact F1 metric "
+                        "(scgg.evaluation.luna_metrics).")
     p.add_argument("--skip_rssd", action="store_true",
-                   help="Skip Kabsch RSSD (faster — no PCA projection for embeddings)")
-    p.add_argument("--n_top_hvg", type=int, default=None)
-    p.add_argument("--no_normalize", action="store_true")
-    p.add_argument("--no_scale", action="store_true")
-    p.add_argument("--skip_training", action="store_true")
-    p.add_argument("--load_checkpoint", default=None)
+                   help="Skip Kabsch RSSD (faster).")
+    p.add_argument("--skip_training", action="store_true",
+                   help="Run LUNA in test-only mode (requires --load_checkpoint).")
+    p.add_argument("--load_checkpoint", default=None,
+                   help="Path to a LUNA .ckpt — only used with --skip_training.")
     p.add_argument(
-        "--class_stratified_distance", action="store_true",
-        help="Switch the DistanceRegression loss from all-pairs Pearson to "
-             "per-cell-class Pearson averaged across classes. Use this when "
-             "the inference UMAP diagnostic shows the embedding has "
-             "collapsed to a cell-type classifier (i.e. global Spearman is "
-             "decent but the mean of per-class median Spearmans is near zero).",
-    )
-    p.add_argument(
-        "--k_default", type=int, default=None,
-        help="k for the GT spatial kNN graph (SupCon positives). Defaults "
-             "to the config value (10). Try 30 or 50 in laminar tissues to "
-             "force the model to encode tangential position instead of just "
-             "depth-band membership.",
-    )
-    p.add_argument(
-        "--no_coord_regression", action="store_true",
-        help="Disable the direct 2-D coordinate-regression head (Procrustes-"
-             "aligned MSE on top of the metric embedding). On by default — "
-             "use this flag to ablate.",
-    )
-    p.add_argument(
-        "--metric_embed_dim", type=int, default=None,
-        help="Override model.metric_head.embed_dim. Default (from config) "
-             "is 32. Only used when --objective contrastive.",
-    )
-    p.add_argument(
-        "--objective", default=None, choices=("flow_matching", "contrastive"),
-        help="Override training.objective. Default (from config): "
-             "'flow_matching' — LUNA-style ODE generative model that "
-             "denoises Gaussian samples directly into 2-D coords. "
-             "Pass 'contrastive' to ablate against the SupCon + coord-head "
-             "approach. Inference automatically dispatches on objective.",
+        "--extra_override", action="append", default=None, metavar="KEY=VALUE",
+        help="Extra Hydra override(s) passed straight through to LUNA. "
+             "Repeat the flag for multiple. Example: "
+             "--extra_override train.lr=1e-4 --extra_override model.layers=12",
     )
     args = p.parse_args()
+
+    if args.wandb_online and args.no_wandb:
+        p.error("--wandb_online and --no_wandb are mutually exclusive.")
+    wandb_mode = "online" if args.wandb_online else "disabled"
 
     run_benchmark(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
-        config_path=args.config,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         seed=args.seed,
-        device=args.device,
-        wandb=False if args.no_wandb else None,
+        wandb_mode=wandb_mode,
         wandb_run_name=args.wandb_run_name,
-        val_fraction=args.val_fraction,
         contact_percentile=args.contact_percentile,
         compute_rssd=not args.skip_rssd,
-        n_top_hvg=args.n_top_hvg,
-        normalize=not args.no_normalize,
-        scale=not args.no_scale,
         skip_training=args.skip_training,
         load_checkpoint=args.load_checkpoint,
-        class_stratified_distance=(
-            True if args.class_stratified_distance else None
-        ),
-        k_default=args.k_default,
-        coord_regression=(False if args.no_coord_regression else None),
-        metric_embed_dim=args.metric_embed_dim,
-        objective=args.objective,
+        extra_overrides=args.extra_override,
     )
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

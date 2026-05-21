@@ -1,0 +1,35 @@
+# @package _global_
+general:
+    name : 'MERFISH_mouse_cortex' # name of the experiment
+    mode : 'train_and_test' # mode of the experiment, train_and_test, test_only
+
+distribute:
+    gpus_per_node: 1 # Index of GPUs for training (assume one node per machine)
+
+dataset:
+    dataset_name: 'merfish_mouse_cortex' # name of the dataset
+    gene_columns_start: 0
+    gene_columns_end: 254
+    train_data_path: /data/merfish_mouse_cortex_train.csv # path to the training dataset
+    test_data_path: /data/merfish_mouse_cortex_test.csv # path to the test dataset 
+    validation_data_path: null # path to the validation dataset
+    maximum_graph_size: # Configuration for maximum graph sizes during different stages (optional)
+        train: null   # No downsampling; Set maximum size of the graph sampled during training to accommodate GPU memory constraints.
+        test: null   # No downsampling; recommended to test on the full graph. Set to 'null' to use the full graph.
+        validation: null # No downsampling; use the full graph if a validation dataset is available. Set to 'null' to use the full graph.
+
+    
+
+train:
+    n_epochs: 1000 # Number of epochs
+    batch_size: 6 # Batch size for training, increase according to the GPU memory
+    lr: 5e-4 # Learning rate, we recommend 1e-4 or 5e-4 for most of the datasets
+
+test:
+    save_dir: './' # Path to save the inference results.
+    checkpoints_parent_dir: null # only for 'test_only' mode, path to the checkpoint to test.
+    checkpoint_name: all # Name of the checkpoint to be used for testing
+
+validation:
+    if_validate: False # If True, enable validation. Set the path to the validation dataset in the dataset section.
+    save_model_every_n_epochs: 250 # For the case that if_validate is false, save models. The frequency of saving model. 0 to disable.
