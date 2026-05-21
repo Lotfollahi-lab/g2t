@@ -164,17 +164,26 @@ class _RuntimeTracker:
 # ---------------------------------------------------------------------------
 
 
-_ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
-# IMPORTANT: ``run_luna_on_*`` scripts always invoke the EXTERNAL LUNA
-# checkout — this is the immutable baseline we compare scgg against.
-# The vendored copy under scgg/src/ IS scgg (a LUNA copy we'll edit);
-# it's invoked by the scgg-side benchmark scripts
-# (``run_scgg.py`` and its future siblings). Do NOT
-# repoint this at scgg/src/ — that would make the baseline drift as
-# we modify scgg internals.
-_DEFAULT_LUNA_REPO = Path(
+# ---------------------------------------------------------------------------
+# Engine-specific configuration. This is the ONLY block that differs
+# between run_luna_train.py and its sister run_scgg_train.py — the rest
+# of the file is byte-identical between the two. Treat them as two
+# separate methods (LUNA baseline vs scgg, where scgg currently is a
+# copy of LUNA we will modify forward). Keep this top-of-file
+# tractable so future engine swaps are a small targeted diff.
+# ---------------------------------------------------------------------------
+
+ENGINE_NAME = "luna"               # used in output dir subpath
+ENGINE_DISPLAY = "LUNA"            # human-readable, used in log lines + plot titles
+ENGINE_OUTPUT_SUBDIR = "luna_model"  # <artifacts_root>/<dataset>/<this>/<TS>/
+# The default repo for the LUNA model code. The luna variant points at
+# the external (pristine) LUNA checkout; the scgg variant points at
+# the vendored LUNA copy under scgg/src/.
+_ENGINE_REPO_DEFAULT = Path(
     "/nfs/team361/sb75/scgg-reproducibility/analysis/benchmarking/luna"
 )
+
+_ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
 
 _EPOCH_RE = re.compile(r"epoch=(\d+)")
 
@@ -211,6 +220,152 @@ def _section_label_from_filename(path: Path) -> str:
         if stem.endswith(suf):
             return stem[: -len(suf)]
     return stem
+
+
+# ---------------------------------------------------------------------------
+# Pred-vs-truth plotting (self-contained — no scgg.evaluation dep so
+# this script runs in the LUNA env where the scgg package isn't
+# installed). Inlined deliberately so the two run_*_train.py scripts
+# stay byte-identical in their helpers as they diverge in the engine
+# they invoke.
+# ---------------------------------------------------------------------------
+
+
+def _umeyama_align(
+    src: np.ndarray, dst: np.ndarray, allow_reflection: bool = True,
+) -> np.ndarray:
+    """Best similarity transform (rotate + scale + translate, plus
+    optional reflection) mapping ``src`` onto ``dst``. Visual A/B
+    aid only — the loss is rotation-invariant so the prediction
+    frame may differ from GT even when structure is correct.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    finite = np.isfinite(src).all(axis=1) & np.isfinite(dst).all(axis=1)
+    if finite.sum() < 3:
+        return src.astype(np.float32)
+    a = src[finite]
+    b = dst[finite]
+    mu_a, mu_b = a.mean(axis=0), b.mean(axis=0)
+    ac, bc = a - mu_a, b - mu_b
+    var_a = (ac ** 2).sum() / a.shape[0]
+    if var_a < 1e-12:
+        return src.astype(np.float32)
+    cov = (bc.T @ ac) / a.shape[0]
+    U, S, Vt = np.linalg.svd(cov)
+    d = np.eye(cov.shape[0])
+    if not allow_reflection and np.linalg.det(U @ Vt) < 0:
+        d[-1, -1] = -1
+    R = U @ d @ Vt
+    s = (S * np.diag(d)).sum() / var_a
+    t = mu_b - s * R @ mu_a
+    return ((s * (src @ R.T)) + t).astype(np.float32)
+
+
+def _palette_for(cats: List[str], scheme: str = "glasbey") -> list:
+    """RGB(A) colors for ``cats``. Prefers ``colorcet.glasbey`` (high
+    distinctness — LUNA's paper figures use it); falls back to
+    matplotlib's tab20 if colorcet is missing."""
+    import matplotlib.pyplot as plt
+    n = max(len(cats), 1)
+    if scheme == "glasbey":
+        try:
+            import colorcet as cc  # type: ignore
+            return list(cc.glasbey[:n])
+        except ImportError:
+            logger.info(
+                "colorcet not installed; falling back to tab20. "
+                "Install with: pip install colorcet"
+            )
+    cmap = plt.get_cmap("tab20", n)
+    return [cmap(i) for i in range(n)]
+
+
+def _plot_pred_vs_truth(
+    coords_true: np.ndarray,
+    coords_pred: np.ndarray,
+    cell_class: Optional[np.ndarray],
+    out_path: Path,
+    title_prefix: str = "",
+    method_label: str = "prediction",
+    align_for_plot: bool = True,
+    spot_size: Optional[float] = None,
+    palette: str = "glasbey",
+) -> None:
+    """Side-by-side scatter of ground truth vs prediction.
+
+    Inlined from scgg.evaluation.visualization.plot_pred_vs_truth so
+    this script has no scgg-package dependency. If you change the plot
+    here, mirror the change in the sister run_*_train.py script (and
+    in scgg.evaluation.visualization if you want the package helper
+    to stay in sync).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    coords_true = np.asarray(coords_true, dtype=np.float64)
+    coords_pred = np.asarray(coords_pred, dtype=np.float64)
+    if coords_true.shape != coords_pred.shape:
+        raise ValueError(
+            f"coords_true and coords_pred shape mismatch: "
+            f"{coords_true.shape} vs {coords_pred.shape}"
+        )
+    n = coords_true.shape[0]
+    if spot_size is None:
+        spot_size = max(1.0, min(20.0, 1500.0 / np.sqrt(max(n, 1))))
+
+    coords_pred_plot = (
+        _umeyama_align(coords_pred, coords_true, allow_reflection=True)
+        if align_for_plot else coords_pred
+    )
+    aligned_suffix = " (aligned)" if align_for_plot else ""
+
+    if cell_class is not None:
+        cell_class = np.asarray(cell_class).astype(str)
+        cats = sorted(set(cell_class))
+        colors = _palette_for(cats, scheme=palette)
+        cat_to_color = dict(zip(cats, colors))
+        point_colors = [cat_to_color[c] for c in cell_class]
+    else:
+        cats = []
+        cat_to_color = {}
+        point_colors = "#666666"
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    for ax, xy, title in (
+        (axes[0], coords_true, f"{title_prefix}Ground truth"),
+        (axes[1], coords_pred_plot, f"{title_prefix}{method_label}{aligned_suffix}"),
+    ):
+        ax.scatter(xy[:, 0], xy[:, 1], c=point_colors, s=spot_size, linewidths=0)
+        ax.set_title(title)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#999")
+
+    if cats:
+        n_cats = len(cats)
+        ncol = min(max(1, (n_cats + 3) // 4), 6)
+        patches = [
+            Patch(facecolor=cat_to_color[c], label=str(c)) for c in cats
+        ]
+        fig.legend(
+            handles=patches, loc="lower center",
+            bbox_to_anchor=(0.5, 0.0), ncol=ncol,
+            frameon=False, fontsize="small",
+        )
+        n_rows = (n_cats + ncol - 1) // ncol
+        bottom = min(0.30, 0.05 + 0.04 * n_rows)
+        fig.tight_layout(rect=(0, bottom, 1, 1))
+    else:
+        fig.tight_layout()
+
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -565,16 +720,8 @@ def _evaluate_predictions(
     section. Plotting failures are logged but never crash the eval
     loop — metrics always get computed.
     """
-    plot_pred_vs_truth = None
     if plots_dir is not None:
         plots_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            from scgg.evaluation.visualization import plot_pred_vs_truth
-        except ImportError as e:
-            logger.warning(
-                f"  scgg.evaluation.visualization unavailable ({e}); "
-                f"skipping plots."
-            )
 
     rows: List[Dict[str, float]] = []
     for label, (pred, true) in sections.items():
@@ -594,19 +741,19 @@ def _evaluate_predictions(
             f"  {label:32s}  n={coords_true.shape[0]:>5d}  "
             f"spr_median={med:.4f}  spr_mean={mean:.4f}"
         )
-        if plot_pred_vs_truth is not None:
+        if plots_dir is not None:
             cell_class = (
                 true["cell_class"].astype(str).to_numpy()
                 if "cell_class" in true.columns else None
             )
             try:
-                plot_pred_vs_truth(
+                _plot_pred_vs_truth(
                     coords_true=coords_true,
                     coords_pred=coords_pred,
                     cell_class=cell_class,
                     out_path=plots_dir / f"{label}.svg",
                     title_prefix=f"{label}  |  ",
-                    method_label="LUNA prediction",
+                    method_label=f"{ENGINE_DISPLAY} prediction",
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"  plot failed for {label}: {e}")
@@ -625,7 +772,7 @@ def run_benchmark(
     batch_size: int = 6,
     lr: Optional[float] = None,
     seed: int = 0,
-    luna_repo: str = str(_DEFAULT_LUNA_REPO),
+    luna_repo: str = str(_ENGINE_REPO_DEFAULT),
     run_name: str = "MERFISH_mouse_cortex",
     log2_normalize: bool = False,
     wandb_mode: str = "disabled",
@@ -665,7 +812,7 @@ def run_benchmark(
             base = Path(train_csv).resolve().parent.name or "luna_paper_csvs"
         else:
             base = Path(data_dir).name
-        out = _ARTIFACTS_ROOT / base / "luna_model" / run_ts
+        out = _ARTIFACTS_ROOT / base / ENGINE_OUTPUT_SUBDIR / run_ts
     else:
         out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1069,8 +1216,8 @@ def main() -> int:
              "'online' to match LUNA's upstream default.",
     )
     p.add_argument(
-        "--luna_repo", default=str(_DEFAULT_LUNA_REPO),
-        help=f"Path to the LUNA repository. Default: {_DEFAULT_LUNA_REPO}",
+        "--luna_repo", default=str(_ENGINE_REPO_DEFAULT),
+        help=f"Path to the LUNA repository. Default: {_ENGINE_REPO_DEFAULT}",
     )
     # Two argparse names for the same Hydra `general.name` value:
     # `--wandb_run_name` to match run_scgg.py's CLI surface (so users

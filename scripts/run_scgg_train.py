@@ -1,39 +1,45 @@
-"""LUNA-on-cortex benchmark, scGG entry point.
+#!/usr/bin/env python
+"""
+Train scgg on a silver h5ad directory (LUNA paper Figure 3 split when
+``--data_dir`` points at the MERFISH mouse cortex silver tree, but any
+``*_train.h5ad`` / ``*_test.h5ad`` silver layout works).
 
-This script preserves the historical scGG CLI (``--data_dir``,
-``--wandb_run_name``, ``--output_dir``, ...) but the actual model,
-training loop, loss, and sampling are now LUNA's, vendored verbatim
-under ``scgg/src/{models,utils,metrics,datasets,configs}``.
+Sister script of ``scgg/scripts/run_luna_train.py`` — byte-identical
+except for the engine-specific configuration block at the top of the
+file. scgg currently runs the **vendored copy of LUNA** under
+``scgg/src/`` (which we will start modifying forward), while
+``run_luna_train.py`` invokes the **external (pristine) LUNA checkout**
+as the immutable baseline. Treat them as two separate methods to be
+benchmarked against each other.
 
-Flow on a normal invocation::
+Input is a silver h5ad directory (``--data_dir``); the h5ad's ``.X``
+is written to LUNA's CSV format as-is.
 
-    python scripts/run_scgg.py \\
-        --data_dir /nfs/team361/sb75/DATASETS/silver/mmc_luna \\
-        --wandb_run_name scgg_luna_baseline
+Pipeline
+--------
+  1. Discover ``*_train.h5ad`` (training) and ``*_test.h5ad`` (held
+     out for inference) under ``--data_dir``. Layout produced by
+     ``build_h5ad_from_luna_csv.py``; works for any dataset (cortex,
+     ABC, CNS, ...).
+  2. Convert per-section h5ads to LUNA's expected CSV layout
+     (gene columns first, then ``coord_X`` / ``coord_Y`` /
+     ``cell_section`` / ``cell_class``).
+  3. Invoke the vendored scgg/src/ engine in ``general.mode=train_only``;
+     ``run_scgg_inference.py`` evaluates checkpoints in ``test_only``
+     mode on the held-out test data.
+  4. After training, pin the latest checkpoint to ``best_model.ckpt``.
 
-    1. Discover h5ad files under --data_dir, splitting on filename
-       suffix: ``*_train.h5ad`` -> training, ``*_test.h5ad`` -> held
-       out for inference. Layout produced by
-       ``build_h5ad_from_luna_csv.py``; works for any dataset (cortex,
-       ABC, CNS, ...).
-    2. Materialise LUNA-format train.csv + test.csv under the run dir.
-    3. Invoke the vendored LUNA (``scgg/src/main.py``) as a subprocess
-       with Hydra overrides — same Python interpreter, same env.
-    4. Read LUNA's ``metadata_pred.csv`` / ``metadata_true.csv`` per slice.
-    5. Compute per-slice + aggregate metrics via
-       ``scgg.evaluation.luna_metrics``.
-    6. Write ``per_slice_metrics.csv``, ``aggregate_metrics.json``,
-       ``config.yaml``, ``benchmark.log`` — same filenames as the
-       previous scGG run, so downstream tooling and notebooks keep
-       working.
+Output layout
+-------------
+``--output_dir`` defaults to
+``/nfs/team361/sb75/scgg-reproducibility/artifacts/<data_dir.name>/scgg_model/<YYYYMMDD_HHMMSS>/``.
 
-Removed CLI flags that referred to deleted scGG abstractions
-(``--objective``, ``--metric_embed_dim``, ``--no_coord_regression``,
-``--class_stratified_distance``, ``--k_default``, ``--n_top_hvg``,
-``--no_normalize``, ``--no_scale``, ``--config``, ``--device``,
-``--val_fraction``). Passing any of these will now produce a clear
-``unrecognized arguments`` error from argparse — that's the signal that
-LUNA is the engine now.
+Usage
+-----
+    source /nfs/team361/sb75/.venvs/scgg/bin/activate
+    python scripts/run_scgg_train.py \
+        --data_dir /nfs/team361/sb75/DATASETS/silver/mmc_luna \
+        --epochs 1000 --batch_size 6
 """
 
 from __future__ import annotations
@@ -53,8 +59,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import yaml
 
-logger = logging.getLogger("scgg.luna_cortex_benchmark")
+logger = logging.getLogger("scgg_train")
 
 
 # ---------------------------------------------------------------------------
@@ -65,9 +72,25 @@ logger = logging.getLogger("scgg.luna_cortex_benchmark")
 class _RuntimeTracker:
     """Records phase wall-clock durations and writes them to a CSV.
 
-    Mirror of the same class in ``run_luna.py`` so the two scripts
-    emit identically-shaped ``runtime.csv`` files (handy for A/B
-    comparisons between baseline LUNA and scgg).
+    Use as::
+
+        tracker = _RuntimeTracker()
+        out_csv = out_dir / "runtime.csv"
+
+        tracker.start("csv_build")
+        ...do csv build...
+        tracker.end("csv_build", out_csv)
+
+        tracker.start("training")
+        ...invoke LUNA...
+        tracker.end("training", out_csv)
+
+        ...etc.
+
+    ``end()`` flushes the running CSV after each phase, so even if a
+    later phase crashes the CSV is up to date. The CSV always includes
+    a final ``total`` row so a glance at the last line tells you how
+    long the whole run took so far.
     """
 
     def __init__(self):
@@ -97,6 +120,9 @@ class _RuntimeTracker:
 
     @contextmanager
     def phase(self, name: str, flush_to: Optional[Path] = None):
+        """Alternative context-manager API for new code; equivalent
+        to ``start`` + ``end`` with automatic re-raise on exceptions.
+        """
         self.start(name)
         try:
             yield
@@ -120,35 +146,46 @@ class _RuntimeTracker:
 
 
 # ---------------------------------------------------------------------------
-# Paths
+# Defaults
 # ---------------------------------------------------------------------------
 
-# Root of the scgg repo (this file lives in scgg/scripts/).
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-# LUNA vendored under scgg/src/. `main.py`, `models/`, `utils/`, etc.
-# all live here. The subprocess cwd we set below must be this dir so
-# Hydra resolves ``configs/`` and LUNA's top-level imports
-# (``from models.X import ...``) work.
-_VENDORED_LUNA_SRC = _REPO_ROOT / "src"
 
-# Default artifacts root (NFS on the cluster). Overridable via
-# --output_dir; if not set and not on NFS we still fall back to this
-# path, mirroring the prior behaviour.
+# ---------------------------------------------------------------------------
+# Engine-specific configuration. This is the ONLY block that differs
+# between run_luna_train.py and its sister run_scgg_train.py — the rest
+# of the file is byte-identical between the two. Treat them as two
+# separate methods (LUNA baseline vs scgg, where scgg currently is a
+# copy of LUNA we will modify forward). Keep this top-of-file
+# tractable so future engine swaps are a small targeted diff.
+# ---------------------------------------------------------------------------
+
+ENGINE_NAME = "scgg"               # used in output dir subpath
+ENGINE_DISPLAY = "scgg"            # human-readable, used in log lines + plot titles
+ENGINE_OUTPUT_SUBDIR = "scgg_model"  # <artifacts_root>/<dataset>/<this>/<TS>/
+# The default repo for the LUNA model code. The luna variant points at
+# the external (pristine) LUNA checkout; the scgg variant points at
+# the vendored LUNA copy under scgg/src/.
+_ENGINE_REPO_DEFAULT = Path(__file__).resolve().parent.parent / "src"
+
 _ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
 
-# LUNA's PyTorch-Lightning checkpoint filename pattern: ``epoch=NNN.ckpt``.
 _EPOCH_RE = re.compile(r"epoch=(\d+)")
 
 
 # ---------------------------------------------------------------------------
-# h5ad discovery + LUNA-format CSV materialisation
+# Silver-h5ad discovery
 # ---------------------------------------------------------------------------
 #
-# Silver layout produced by ``build_h5ad_from_luna_csv.py``:
-#   <silver_dir>/<section>_train.h5ad     <- training cells
-#   <silver_dir>/<section>_test.h5ad      <- held-out test cells
-# Discovery here is suffix-based — works for any dataset, no
-# cortex-specific filename regex needed.
+# The silver layout produced by ``build_h5ad_from_luna_csv.py`` is:
+#   <silver_dir>/<section_label>_train.h5ad   <- training cells
+#   <silver_dir>/<section_label>_test.h5ad    <- held-out test cells
+#
+# Discovery is suffix-based, so it works for any dataset (cortex, ABC,
+# CNS, ...) without dataset-specific filename regexes. The section
+# label inside each h5ad is whatever obs['cell_section'] says (which
+# build_h5ad_from_luna_csv preserves verbatim from the source CSV);
+# we fall back to the filename stem with the suffix stripped if
+# obs['cell_section'] is missing or non-uniform.
 
 
 def _discover_split_files(silver_dir: Path, split: str) -> List[Path]:
@@ -159,8 +196,9 @@ def _discover_split_files(silver_dir: Path, split: str) -> List[Path]:
 
 
 def _section_label_from_filename(path: Path) -> str:
-    """Filename-stem fallback for section label. Strips ``_train`` /
-    ``_test``."""
+    """Filename-stem fallback for the section label. Strip the
+    ``_train`` / ``_test`` suffix and return the rest.
+    """
     stem = path.stem
     for suf in ("_train", "_test"):
         if stem.endswith(suf):
@@ -168,31 +206,180 @@ def _section_label_from_filename(path: Path) -> str:
     return stem
 
 
+# ---------------------------------------------------------------------------
+# Pred-vs-truth plotting (self-contained — no scgg.evaluation dep so
+# this script runs in the LUNA env where the scgg package isn't
+# installed). Inlined deliberately so the two run_*_train.py scripts
+# stay byte-identical in their helpers as they diverge in the engine
+# they invoke.
+# ---------------------------------------------------------------------------
+
+
+def _umeyama_align(
+    src: np.ndarray, dst: np.ndarray, allow_reflection: bool = True,
+) -> np.ndarray:
+    """Best similarity transform (rotate + scale + translate, plus
+    optional reflection) mapping ``src`` onto ``dst``. Visual A/B
+    aid only — the loss is rotation-invariant so the prediction
+    frame may differ from GT even when structure is correct.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    finite = np.isfinite(src).all(axis=1) & np.isfinite(dst).all(axis=1)
+    if finite.sum() < 3:
+        return src.astype(np.float32)
+    a = src[finite]
+    b = dst[finite]
+    mu_a, mu_b = a.mean(axis=0), b.mean(axis=0)
+    ac, bc = a - mu_a, b - mu_b
+    var_a = (ac ** 2).sum() / a.shape[0]
+    if var_a < 1e-12:
+        return src.astype(np.float32)
+    cov = (bc.T @ ac) / a.shape[0]
+    U, S, Vt = np.linalg.svd(cov)
+    d = np.eye(cov.shape[0])
+    if not allow_reflection and np.linalg.det(U @ Vt) < 0:
+        d[-1, -1] = -1
+    R = U @ d @ Vt
+    s = (S * np.diag(d)).sum() / var_a
+    t = mu_b - s * R @ mu_a
+    return ((s * (src @ R.T)) + t).astype(np.float32)
+
+
+def _palette_for(cats: List[str], scheme: str = "glasbey") -> list:
+    """RGB(A) colors for ``cats``. Prefers ``colorcet.glasbey`` (high
+    distinctness — LUNA's paper figures use it); falls back to
+    matplotlib's tab20 if colorcet is missing."""
+    import matplotlib.pyplot as plt
+    n = max(len(cats), 1)
+    if scheme == "glasbey":
+        try:
+            import colorcet as cc  # type: ignore
+            return list(cc.glasbey[:n])
+        except ImportError:
+            logger.info(
+                "colorcet not installed; falling back to tab20. "
+                "Install with: pip install colorcet"
+            )
+    cmap = plt.get_cmap("tab20", n)
+    return [cmap(i) for i in range(n)]
+
+
+def _plot_pred_vs_truth(
+    coords_true: np.ndarray,
+    coords_pred: np.ndarray,
+    cell_class: Optional[np.ndarray],
+    out_path: Path,
+    title_prefix: str = "",
+    method_label: str = "prediction",
+    align_for_plot: bool = True,
+    spot_size: Optional[float] = None,
+    palette: str = "glasbey",
+) -> None:
+    """Side-by-side scatter of ground truth vs prediction.
+
+    Inlined from scgg.evaluation.visualization.plot_pred_vs_truth so
+    this script has no scgg-package dependency. If you change the plot
+    here, mirror the change in the sister run_*_train.py script (and
+    in scgg.evaluation.visualization if you want the package helper
+    to stay in sync).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    coords_true = np.asarray(coords_true, dtype=np.float64)
+    coords_pred = np.asarray(coords_pred, dtype=np.float64)
+    if coords_true.shape != coords_pred.shape:
+        raise ValueError(
+            f"coords_true and coords_pred shape mismatch: "
+            f"{coords_true.shape} vs {coords_pred.shape}"
+        )
+    n = coords_true.shape[0]
+    if spot_size is None:
+        spot_size = max(1.0, min(20.0, 1500.0 / np.sqrt(max(n, 1))))
+
+    coords_pred_plot = (
+        _umeyama_align(coords_pred, coords_true, allow_reflection=True)
+        if align_for_plot else coords_pred
+    )
+    aligned_suffix = " (aligned)" if align_for_plot else ""
+
+    if cell_class is not None:
+        cell_class = np.asarray(cell_class).astype(str)
+        cats = sorted(set(cell_class))
+        colors = _palette_for(cats, scheme=palette)
+        cat_to_color = dict(zip(cats, colors))
+        point_colors = [cat_to_color[c] for c in cell_class]
+    else:
+        cats = []
+        cat_to_color = {}
+        point_colors = "#666666"
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    for ax, xy, title in (
+        (axes[0], coords_true, f"{title_prefix}Ground truth"),
+        (axes[1], coords_pred_plot, f"{title_prefix}{method_label}{aligned_suffix}"),
+    ):
+        ax.scatter(xy[:, 0], xy[:, 1], c=point_colors, s=spot_size, linewidths=0)
+        ax.set_title(title)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#999")
+
+    if cats:
+        n_cats = len(cats)
+        ncol = min(max(1, (n_cats + 3) // 4), 6)
+        patches = [
+            Patch(facecolor=cat_to_color[c], label=str(c)) for c in cats
+        ]
+        fig.legend(
+            handles=patches, loc="lower center",
+            bbox_to_anchor=(0.5, 0.0), ncol=ncol,
+            frameon=False, fontsize="small",
+        )
+        n_rows = (n_cats + ncol - 1) // ncol
+        bottom = min(0.30, 0.05 + 0.04 * n_rows)
+        fig.tight_layout(rect=(0, bottom, 1, 1))
+    else:
+        fig.tight_layout()
+
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Build LUNA-format CSVs from per-slice h5ads
+# ---------------------------------------------------------------------------
+
+
 def _build_luna_csv(
     files: List[Path],
     out_csv: Path,
     log2_normalize: bool = False,
 ) -> Dict[str, object]:
-    """Concatenate per-section h5ads into one LUNA-format CSV.
+    """Concatenate per-section h5ads into one CSV in LUNA's input format.
 
-    Each file in ``files`` is one section. The section label comes from
-    the h5ad's ``obs['cell_section']`` (must be uniform per file); if
-    missing or non-uniform, falls back to the filename stem with the
-    ``_train`` / ``_test`` suffix stripped.
+    Each file in ``files`` is one section. The section label comes
+    from the h5ad's ``obs['cell_section']`` (must be uniform per
+    file); if missing or non-uniform we fall back to the filename
+    stem with the ``_train`` / ``_test`` suffix stripped.
 
-    LUNA expects: gene columns first (positions ``0..n_genes-1``), then
-    ``coord_X``, ``coord_Y``, ``cell_section``, ``cell_class``. Index =
-    original cell barcode.
+    LUNA expects:
+      * gene columns first (positions ``0..n_genes-1``)
+      * then ``coord_X``, ``coord_Y``, ``cell_section``, ``cell_class``
+      * index = original cell barcode
 
-    No log2 normalisation by default — LUNA's published CSVs are
-    non-integer per-cell-normalised counts in the same magnitude range
-    as raw counts (max ~250). Set ``log2_normalize=True`` only for
-    ablations.
-
-    Within-section row order is reconstructed from each cell's
-    ``_bronze_row_pos`` (stamped by ``build_h5ad_from_luna_csv.py``)
-    so LUNA's unstable ``sort_values("cell_section")`` produces the
-    same post-sort ordering as it would on the bronze CSV.
+    Expression normalization: the default is **no transformation** because
+    LUNA's published CSVs are non-integer per-cell-normalized counts in
+    the same magnitude range as raw counts (max ~250). Applying log2(x+1)
+    on top compresses the input to [0, 8] and the model fails to learn —
+    we verified this with ``compare_luna_csv_vs_h5ad.py``. Set
+    ``log2_normalize=True`` only for ablations.
     """
     import anndata as ad
     import scipy.sparse as sp
@@ -203,14 +390,22 @@ def _build_luna_csv(
     if out_csv.exists():
         out_csv.unlink()
 
+    # Collect per-section DataFrames into memory so we can sort all of
+    # them together by `_bronze_row_pos` before writing. Reconstructing
+    # bronze's exact pre-sort row order is the only way to make LUNA's
+    # unstable `sort_values("cell_section")` produce identical post-sort
+    # output for both bronze-direct and h5ad-derived inputs.
     per_section_dfs: List[pd.DataFrame] = []
-    has_bronze_pos = True
+    has_bronze_pos = True  # gets set to False if any h5ad is missing it
 
     for path in files:
         adata = ad.read_h5ad(path)
         X = adata.X
         if sp.issparse(X):
             X = X.toarray()
+        # Preserve the h5ad's native precision (float64 after the
+        # build_h5ad_from_luna_csv float64 fix). Casting to float32
+        # here would introduce LSB rounding on top of LUNA's `.float()`.
         X = np.asarray(X, dtype=np.float64)
         if log2_normalize:
             X = np.log2(X + 1.0)
@@ -223,8 +418,10 @@ def _build_luna_csv(
                 f"{len(gene_names)} genes, got {adata.n_vars}"
             )
 
-        # Section label: prefer obs['cell_section'] (preserved by
-        # build_h5ad_from_luna_csv); fall back to filename stem.
+        # Section label: prefer obs['cell_section'] (preserved verbatim
+        # by build_h5ad_from_luna_csv from the source CSV); fall back
+        # to the filename stem if obs is missing the column or has
+        # heterogeneous values.
         if "cell_section" in adata.obs.columns:
             uniq = adata.obs["cell_section"].astype(str).unique()
             if len(uniq) == 1:
@@ -252,6 +449,23 @@ def _build_luna_csv(
                 adata.obs["coord_Y"].to_numpy(dtype=np.float64),
             ])
 
+        # ----- Within-section cell ordering -----------------------------
+        # LUNA's data_module calls `sort_values("cell_section")` with the
+        # default unstable `kind="quicksort"`. For equal-section rows,
+        # the post-sort order depends on the pre-sort INPUT order. The
+        # bronze CSV has sections INTERLEAVED across its rows; if we
+        # write our fresh CSV with sections CONTIGUOUS (which is what
+        # _build_luna_csv naturally produces), pandas' unstable sort
+        # gives a different post-sort within-section ordering than it
+        # gives for bronze. Result: 99.98% of rows mismatch.
+        #
+        # Fix: stamp every cell with its original bronze CSV row
+        # position (`_bronze_row_pos`, written by
+        # `build_h5ad_from_luna_csv.py`), then below — AFTER we've
+        # collected every section — we sort ALL rows by
+        # `_bronze_row_pos`. This reconstructs bronze's exact pre-sort
+        # row order; LUNA's `sort_values` then produces bit-identical
+        # output on both inputs.
         if "cell_id" in adata.obs.columns:
             cell_ids = adata.obs["cell_id"].to_numpy()
         else:
@@ -260,24 +474,33 @@ def _build_luna_csv(
         if "_bronze_row_pos" in adata.obs.columns:
             bronze_row_pos = adata.obs["_bronze_row_pos"].to_numpy()
         else:
+            # Legacy silver that didn't store _bronze_row_pos. We can't
+            # reconstruct bronze's order; fall back to cell_id sort
+            # (a poor approximation; LUNA-on-h5ad will NOT match
+            # LUNA-on-bronze in this case, only approximately).
             has_bronze_pos = False
             order = np.argsort(cell_ids, kind="stable")
             X = X[order]
             xy = xy[order]
             cell_class = cell_class[order]
             cell_ids = cell_ids[order]
-            bronze_row_pos = cell_ids
+            bronze_row_pos = cell_ids  # any monotone proxy; unused later
 
         df = pd.DataFrame(X, columns=gene_names)
         df["coord_X"] = xy[:, 0]
         df["coord_Y"] = xy[:, 1]
         df["cell_section"] = section_label
         df["cell_class"] = cell_class
-        # LUNA's data_module does `torch.tensor(input_data.index)`,
-        # which crashes on string IDs (e.g. CNS scRNA cell barcodes).
-        # Use cell_ids as the index only when they parse as numeric;
-        # otherwise fall back to integer row positions, preserving the
-        # original strings in a separate column.
+        # Use the original bronze cell_id as the CSV index (not 0..N-1)
+        # so LUNA's `cell_ID = torch.tensor(input_data.index)` matches
+        # bronze when the cell_ids are integer-typed (MERFISH cortex).
+        # For datasets where cell_ids are strings (CNS scRNA cell
+        # barcodes), torch.tensor on a string index raises
+        # `ValueError: too many dimensions 'str'`, taking the whole
+        # data_module init down. Detect that case up front and fall
+        # back to integer row positions for the index, keeping the
+        # original strings as a separate metadata column so callers
+        # can still round-trip them downstream if they need to.
         try:
             df.index = pd.to_numeric(cell_ids)
         except (ValueError, TypeError):
@@ -290,26 +513,45 @@ def _build_luna_csv(
             df["cell_id_orig"] = cell_ids.astype(str)
             df.index = np.arange(len(df), dtype=np.int64)
         df.index.name = "cell_id"
+        # Carry _bronze_row_pos through; we'll drop it before writing.
         df["_bronze_row_pos"] = bronze_row_pos
+
         per_section_dfs.append(df)
         logger.info(f"    collected {len(df):>6,} cells from {section_label}")
 
+    # ----- Concatenate, reorder to bronze row order, write -------------
     if not per_section_dfs:
         raise RuntimeError("no sections collected — no h5ads matched the file list")
 
     big_df = pd.concat(per_section_dfs, axis=0)
+
     if has_bronze_pos:
+        # Sort by _bronze_row_pos ASC (stable) to replay bronze CSV row
+        # order EXACTLY. After this, the fresh CSV is identical to
+        # bronze at the row level (modulo metadata columns we don't
+        # carry forward).
         big_df = big_df.sort_values("_bronze_row_pos", kind="stable")
     else:
         logger.warning(
-            "  no _bronze_row_pos in any h5ad — rebuild silver with the latest "
-            "build_h5ad_from_luna_csv.py to enable bit-identical LUNA-on-h5ad "
-            "≡ LUNA-on-bronze."
+            "  no _bronze_row_pos found in any h5ad — rebuilt this silver "
+            "with the latest build_h5ad_from_luna_csv.py to enable "
+            "bit-identical LUNA-on-h5ad ≡ LUNA-on-bronze. Writing fresh "
+            "CSV with sections contiguous (cell_id-ascending within); "
+            "LUNA's unstable sort_values will produce a DIFFERENT "
+            "within-section order than for the bronze CSV."
         )
+
+    # Drop the helper column before writing.
     big_df = big_df.drop(columns=["_bronze_row_pos"])
+
+    # Single write with header — replaces the per-section chunked append
+    # logic. `float_format="%.17g"` gives lossless float64 round-trip.
     big_df.to_csv(out_csv, header=True, float_format="%.17g")
     rows_total = len(big_df)
-    logger.info(f"  wrote {rows_total:,} cells total to {out_csv}")
+    logger.info(
+        f"  wrote {rows_total:,} cells total to {out_csv} "
+        f"({'bronze-row-pos sorted' if has_bronze_pos else 'cell_id sorted, sections contiguous (LEGACY)'})"
+    )
 
     return {
         "n_rows": rows_total,
@@ -319,32 +561,44 @@ def _build_luna_csv(
 
 
 # ---------------------------------------------------------------------------
-# LUNA invocation
+# Invoke LUNA in-process (same env, same Python via sys.executable)
 # ---------------------------------------------------------------------------
 
 
-def _invoke_luna(overrides: List[str], log_path: Path) -> int:
-    """Run vendored LUNA's main.py with Hydra overrides.
+def _invoke_luna(
+    luna_repo: Path,
+    overrides: List[str],
+    log_path: Path,
+    mode: str = "train_and_test",
+) -> int:
+    """Run LUNA via our monkey-patching launcher (``_luna_runner.py``),
+    in the same Python env.
 
-    Uses the same Python interpreter (``sys.executable``), so the
-    subprocess inherits the active virtualenv (must have torch,
-    pytorch-lightning, hydra-core, torch-geometric,
-    linear-attention-transformer installed).
+    The launcher imports LUNA's modules from ``luna_repo`` and patches
+    ``DataModule.__init__`` to load only the splits the requested
+    ``mode`` actually needs. That's how ``mode=train_only`` skips the
+    test CSV entirely (LUNA's stock ``main.py`` always loads both).
 
-    ``cwd`` is set to the vendored LUNA root (``scgg/src/``) so
-      * Hydra resolves ``configs/`` relative to ``main.py``;
-      * LUNA's top-level absolute imports (``from models.X import ...``)
-        find their packages on ``sys.path[0]``.
+    External LUNA files stay pristine; every change lives in the
+    launcher process.
     """
-    main_py = _VENDORED_LUNA_SRC / "main.py"
+    luna_repo = luna_repo.resolve()
+    main_py = luna_repo / "main.py"
     if not main_py.exists():
-        raise FileNotFoundError(
-            f"vendored LUNA entry point missing: {main_py}. "
-            f"Did the LUNA copy under scgg/src/ get clobbered?"
-        )
+        raise FileNotFoundError(f"LUNA main.py not found: {main_py}")
 
-    cmd = [sys.executable, str(main_py), *overrides]
-    logger.info("Invoking LUNA:")
+    runner = Path(__file__).resolve().parent / "_luna_runner.py"
+    if not runner.exists():
+        raise FileNotFoundError(f"_luna_runner.py launcher missing: {runner}")
+
+    cmd = [
+        sys.executable, str(runner),
+        "--luna_repo", str(luna_repo),
+        "--mode", mode,
+    ]
+    for o in overrides:
+        cmd += ["--override", o]
+    logger.info(f"Invoking LUNA via launcher (mode={mode}):")
     for arg in cmd:
         logger.info(f"    {arg}")
 
@@ -352,8 +606,7 @@ def _invoke_luna(overrides: List[str], log_path: Path) -> int:
     t0 = time.time()
     with open(log_path, "wb") as f:
         proc = subprocess.run(
-            cmd, cwd=str(_VENDORED_LUNA_SRC), stdout=f, stderr=subprocess.STDOUT,
-            check=False,
+            cmd, stdout=f, stderr=subprocess.STDOUT, check=False,
         )
     elapsed = (time.time() - t0) / 60.0
     logger.info(
@@ -362,28 +615,48 @@ def _invoke_luna(overrides: List[str], log_path: Path) -> int:
     )
     if proc.returncode != 0 and log_path.exists():
         with open(log_path) as f:
-            tail = f.read().splitlines()[-60:]
+            tail = f.read().splitlines()[-50:]
         for line in tail:
             logger.error(f"  | {line}")
     return proc.returncode
 
 
 # ---------------------------------------------------------------------------
-# Read LUNA predictions + run scgg.evaluation.luna_metrics
+# Checkpoint discovery
+# ---------------------------------------------------------------------------
+
+
+def _find_latest_checkpoint(luna_run_dir: Path) -> Optional[Path]:
+    """Latest-epoch checkpoint under ``{run_dir}/checkpoints/``."""
+    ckpt_dir = luna_run_dir / "checkpoints"
+    if not ckpt_dir.exists():
+        return None
+    candidates: List[Tuple[int, Path]] = []
+    for p in ckpt_dir.glob("*.ckpt"):
+        m = _EPOCH_RE.search(p.name)
+        if m:
+            candidates.append((int(m.group(1)), p))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[-1][1]
+
+
+# ---------------------------------------------------------------------------
+# Read LUNA test outputs + compute per-slice metrics
 # ---------------------------------------------------------------------------
 
 
 def _read_luna_predictions(
     test_save_dir: Path,
-) -> Dict[str, Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
-    """Return ``{section_label: (coords_pred, coords_true, cell_class)}``."""
+) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]:
+    """Return {section_label: (pred_df, true_df)} from LUNA outputs."""
     pred_files = list(test_save_dir.rglob("metadata_pred.csv"))
     if not pred_files:
         raise FileNotFoundError(
             f"No metadata_pred.csv under {test_save_dir} — did LUNA finish?"
         )
-
-    out: Dict[str, Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]] = {}
+    out: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
     for pred_path in sorted(pred_files):
         true_path = pred_path.parent / "metadata_true.csv"
         if not true_path.exists():
@@ -391,96 +664,272 @@ def _read_luna_predictions(
             continue
         pred = pd.read_csv(pred_path, index_col=0)
         true = pd.read_csv(true_path, index_col=0)
-        # Align on index — LUNA writes them in matching order, but be defensive.
         if not pred.index.equals(true.index):
             common = pred.index.intersection(true.index)
             pred = pred.loc[common]
             true = true.loc[common]
-
-        coords_pred = pred[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
-        coords_true = true[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
-        cell_class = None
-        if "cell_class" in true.columns:
-            cell_class = true["cell_class"].astype(str).to_numpy()
-        out[pred_path.parent.name] = (coords_pred, coords_true, cell_class)
+        out[pred_path.parent.name] = (pred, true)
     return out
 
 
+def _per_cell_spearman_median(
+    coords_true: np.ndarray, coords_pred: np.ndarray,
+) -> Tuple[float, float]:
+    """LUNA's headline metric: median & mean of per-cell Spearman of
+    pairwise-distance rows. Self-contained — no scgg deps."""
+    from scipy.spatial.distance import cdist
+    from scipy.stats import spearmanr
+
+    dt = cdist(coords_true, coords_true)
+    dp = cdist(coords_pred, coords_pred)
+    rhos: List[float] = []
+    n = coords_true.shape[0]
+    for i in range(n):
+        r, _ = spearmanr(dt[i], dp[i])
+        if r is not None and not np.isnan(r):
+            rhos.append(float(r))
+    if not rhos:
+        return float("nan"), float("nan")
+    return float(np.median(rhos)), float(np.mean(rhos))
+
+
+def _evaluate_predictions(
+    sections: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]],
+    plots_dir: Optional[Path] = None,
+) -> List[Dict[str, float]]:
+    """Compute per-section Spearman; return one row per section.
+
+    When ``plots_dir`` is given, also writes a GT-vs-prediction side-
+    by-side scatter to ``plots_dir/<label>.svg`` for each evaluated
+    section. Plotting failures are logged but never crash the eval
+    loop — metrics always get computed.
+    """
+    if plots_dir is not None:
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: List[Dict[str, float]] = []
+    for label, (pred, true) in sections.items():
+        coords_pred = pred[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+        coords_true = true[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+        if len(coords_true) < 10:
+            logger.info(f"  {label}: only {len(coords_true)} cells; skipping")
+            continue
+        med, mean = _per_cell_spearman_median(coords_true, coords_pred)
+        rows.append({
+            "section_label": label,
+            "n_cells": int(coords_true.shape[0]),
+            "spearman_per_cell_median": med,
+            "spearman_per_cell_mean": mean,
+        })
+        logger.info(
+            f"  {label:32s}  n={coords_true.shape[0]:>5d}  "
+            f"spr_median={med:.4f}  spr_mean={mean:.4f}"
+        )
+        if plots_dir is not None:
+            cell_class = (
+                true["cell_class"].astype(str).to_numpy()
+                if "cell_class" in true.columns else None
+            )
+            try:
+                _plot_pred_vs_truth(
+                    coords_true=coords_true,
+                    coords_pred=coords_pred,
+                    cell_class=cell_class,
+                    out_path=plots_dir / f"{label}.svg",
+                    title_prefix=f"{label}  |  ",
+                    method_label=f"{ENGINE_DISPLAY} prediction",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"  plot failed for {label}: {e}")
+    return rows
+
+
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Orchestration
 # ---------------------------------------------------------------------------
 
 
 def run_benchmark(
-    data_dir: str,
+    data_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
     epochs: int = 1000,
     batch_size: int = 6,
     lr: Optional[float] = None,
     seed: int = 0,
+    luna_repo: str = str(_ENGINE_REPO_DEFAULT),
+    run_name: str = "MERFISH_mouse_cortex",
+    log2_normalize: bool = False,
     wandb_mode: str = "disabled",
-    wandb_run_name: Optional[str] = None,
-    contact_percentile: float = 0.01,
-    compute_rssd: bool = True,
+    extra_overrides: Optional[List[str]] = None,
+    train_csv: Optional[str] = None,
+    test_csv: Optional[str] = None,
+    n_genes: Optional[int] = None,
     skip_training: bool = False,
     load_checkpoint: Optional[str] = None,
-    log2_normalize: bool = False,
-    extra_overrides: Optional[List[str]] = None,
     make_plots: bool = False,
 ) -> Dict[str, float]:
-    """Train vendored LUNA on ``*_train.h5ad`` files, evaluate on
-    ``*_test.h5ad`` files, under a single silver directory.
+    """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
-    Returns the aggregated metrics dict (same shape as
-    ``scgg.evaluation.luna_metrics.aggregate_slices``).
+    Args mirror scgg/scripts/run_scgg.py:run_benchmark
+    where applicable. LUNA-specific extras (``luna_repo``, ``run_name``,
+    ``log2_normalize``, ``extra_overrides``) replace the scgg
+    loss-shaping knobs that don't apply here.
+
+    Returns a dict with the headline ``spearman_mean_of_medians`` metric.
     """
-    # Defer the scgg import so the script can show ``--help`` even when
-    # the scgg env isn't activated.
-    from scgg.evaluation.luna_metrics import aggregate_slices, evaluate_slice
-    if make_plots:
-        from scgg.evaluation.visualization import plot_pred_vs_truth
+    # Validate args: either we build CSVs from silver h5ads (data_dir),
+    # or the caller supplies pre-built CSVs (train_csv + test_csv).
+    use_prebuilt = train_csv is not None and test_csv is not None
+    if not use_prebuilt and data_dir is None:
+        raise ValueError(
+            "Either --data_dir (build CSVs from silver h5ads) or both "
+            "--train_csv and --test_csv (use pre-built LUNA CSVs) must "
+            "be provided."
+        )
+    if (train_csv is None) != (test_csv is None):
+        raise ValueError("--train_csv and --test_csv must be passed together.")
 
-    data_path = Path(data_dir)
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_dir is None:
-        out_dir = _ARTIFACTS_ROOT / data_path.name / "model" / run_ts
+        if use_prebuilt:
+            # Derive a sensible default from the train CSV's parent dir name.
+            base = Path(train_csv).resolve().parent.name or "luna_paper_csvs"
+        else:
+            base = Path(data_dir).name
+        out = _ARTIFACTS_ROOT / base / ENGINE_OUTPUT_SUBDIR / run_ts
     else:
-        out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+        out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(out_dir / "benchmark.log", mode="w"),
+            logging.FileHandler(out / "train.log", mode="w"),
         ],
         force=True,
     )
     logger.info(f"Run timestamp: {run_ts}")
-    logger.info(f"Output dir:    {out_dir}")
-    logger.info(f"Vendored LUNA: {_VENDORED_LUNA_SRC}")
+    logger.info(f"Output dir:    {out}")
 
-    # Phase timing — flushed to runtime.csv after each phase so a
-    # crash mid-run still leaves a useful CSV behind.
-    tracker = _RuntimeTracker()
-    runtime_csv = out_dir / "runtime.csv"
+    luna_repo_p = Path(luna_repo)
+    if not luna_repo_p.exists():
+        raise FileNotFoundError(f"LUNA repo not found: {luna_repo_p}")
 
-    # ---- 1. Materialise LUNA-format CSVs from the silver h5ads ---------
-    tracker.start("csv_build")
-    work = out_dir / "work"
+    work = out / "work"
     work.mkdir(parents=True, exist_ok=True)
-    train_csv = work / "train.csv"
-    test_csv = work / "test.csv"
 
-    if train_csv.exists() and test_csv.exists() and not skip_training:
-        logger.info("LUNA CSVs already exist under work/; reusing")
-        head = pd.read_csv(train_csv, nrows=1, index_col=0)
-        n_genes = len(head.columns) - 4  # coord_X, coord_Y, cell_section, cell_class
+    # Phase timing — flushed to <out>/runtime.csv at the end of each
+    # phase so a crash mid-run still leaves a useful CSV behind.
+    tracker = _RuntimeTracker()
+    runtime_csv = out / "runtime.csv"
+
+    tracker.start("csv_build")
+    if use_prebuilt:
+        # ---- Pre-built CSV path: use LUNA's preprocessed files directly.
+        # This is the bit-exact paper-reproduction path; no h5ad → CSV
+        # conversion. Symlink them into work/ so LUNA's run dir is
+        # self-contained, and so a later inference script can resolve
+        # train.csv from a deterministic relative path.
+        src_train = Path(train_csv).resolve()
+        src_test = Path(test_csv).resolve()
+        if not src_train.exists():
+            raise FileNotFoundError(f"--train_csv not found: {src_train}")
+        if not src_test.exists():
+            raise FileNotFoundError(f"--test_csv not found: {src_test}")
+        train_csv_path = work / "train.csv"
+        test_csv_path = work / "test.csv"
+        for link, target in [(train_csv_path, src_train), (test_csv_path, src_test)]:
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            try:
+                link.symlink_to(target)
+            except OSError:
+                # Filesystems that disallow symlinks: fall through to direct path.
+                pass
+        # Use the symlink if it materialized; otherwise the source path.
+        train_csv_path = train_csv_path if train_csv_path.exists() else src_train
+        test_csv_path = test_csv_path if test_csv_path.exists() else src_test
+        logger.info(f"Using pre-built train CSV: {src_train}")
+        logger.info(f"Using pre-built test  CSV: {src_test}")
+
+        # n_genes: trust user override if passed; otherwise infer by
+        # finding where the metadata block starts. LUNA's CSV convention
+        # is "gene columns first, then metadata" — but in practice their
+        # preprocessed CSVs include MORE metadata than the standard four
+        # (e.g., `cell_name`, `class`, `mouse`, `sample_id` are present
+        # in addition to coord_X / coord_Y / cell_class / cell_section).
+        # If we include any of those in the gene block, torch fails with
+        # "can't convert np.ndarray of type numpy.object_" because some
+        # of them carry string values.
+        #
+        # We use TWO complementary signals to locate the boundary and
+        # take whichever appears earlier:
+        #   (a) NAME-based: lowest index of any known metadata column
+        #       name. Catches numeric-typed metadata (coord_X / coord_Y
+        #       are floats — dtype check wouldn't see them).
+        #   (b) DTYPE-based: lowest index of a non-numeric column.
+        #       Catches metadata columns we didn't anticipate by name
+        #       (e.g., `cell_name` with too-big-for-int64 cell IDs that
+        #       parse as strings).
+        _METADATA_NAMES = (
+            # standard positions
+            "coord_X", "coord_Y", "x", "y",
+            "cell_section", "section", "region", "slice",
+            "cell_class", "cell_type", "class", "subclass", "type",
+            # additional metadata commonly present in LUNA's CSVs
+            "cell_name", "cell_id", "cell_barcode", "barcode",
+            "mouse", "animal", "donor",
+            "sample", "sample_id", "batch", "experiment", "cluster",
+        )
+        if n_genes is None:
+            head_data = pd.read_csv(src_train, nrows=20, index_col=0)
+            cols = list(head_data.columns)
+
+            # (a) name-based
+            meta_positions_by_name = [
+                cols.index(name) for name in _METADATA_NAMES if name in cols
+            ]
+            name_based = min(meta_positions_by_name) if meta_positions_by_name else None
+
+            # (b) dtype-based
+            dtype_based = None
+            for i, c in enumerate(cols):
+                if not pd.api.types.is_numeric_dtype(head_data[c]):
+                    dtype_based = i
+                    break
+
+            candidates = [v for v in (name_based, dtype_based) if v is not None]
+            if not candidates:
+                raise ValueError(
+                    f"Could not locate the gene/metadata boundary in "
+                    f"{src_train}. None of {_METADATA_NAMES} found in "
+                    f"the header, and all columns parse as numeric. "
+                    f"Pass --n_genes explicitly."
+                )
+            n_genes = min(candidates)
+            if n_genes <= 0:
+                raise ValueError(
+                    f"Inferred n_genes={n_genes} from {src_train} but "
+                    f"that means there are no gene columns before the "
+                    f"first metadata column ({cols[n_genes]!r}). "
+                    f"The CSV layout looks wrong."
+                )
+            logger.info(
+                f"n_genes inferred = {n_genes}  "
+                f"(boundary at column {cols[n_genes]!r}; "
+                f"name-based={name_based}, dtype-based={dtype_based}; "
+                f"CSV has {len(cols)} total columns)"
+            )
+        else:
+            logger.info(f"n_genes (explicit) = {n_genes}")
     else:
-        # Suffix-based split: any *_train.h5ad is for training,
-        # *_test.h5ad is held out for inference. Works for any silver
-        # dir produced by build_h5ad_from_luna_csv.
+        # ---- Silver h5ad path: build CSVs ourselves -----------------------
+        # Suffix-based split: any *_train.h5ad in the silver dir is a
+        # training file, *_test.h5ad is held out for inference. Works
+        # for any dataset that was produced by build_h5ad_from_luna_csv.
+        data_path = Path(data_dir)
         train_files = _discover_split_files(data_path, "train")
         test_files = _discover_split_files(data_path, "test")
         logger.info(
@@ -494,33 +943,77 @@ def run_benchmark(
                 f"Did you run build_h5ad_from_luna_csv.py to populate "
                 f"this silver dir?"
             )
-        logger.info(f"Writing train CSV -> {train_csv}")
-        train_stats = _build_luna_csv(train_files, train_csv, log2_normalize)
-        logger.info(f"Writing test CSV  -> {test_csv}")
-        test_stats = _build_luna_csv(test_files, test_csv, log2_normalize)
-        n_genes = int(train_stats["n_genes"])
+
+        train_csv_path = work / "train.csv"
+        test_csv_path = work / "test.csv"
+        if train_csv_path.exists() and test_csv_path.exists():
+            logger.info("LUNA CSVs already exist under work/; reusing")
+            head = pd.read_csv(train_csv_path, nrows=1, index_col=0)
+            n_genes = len(head.columns) - 4
+        else:
+            logger.info(f"Writing train CSV -> {train_csv_path}")
+            train_stats = _build_luna_csv(
+                train_files, train_csv_path, log2_normalize=log2_normalize,
+            )
+            logger.info(
+                f"  train: {train_stats['n_rows']:,} rows, "
+                f"{train_stats['n_genes']} genes, "
+                f"{train_stats['n_sections']} sections"
+            )
+            logger.info(f"Writing test CSV  -> {test_csv_path}")
+            test_stats = _build_luna_csv(
+                test_files, test_csv_path, log2_normalize=log2_normalize,
+            )
+            logger.info(
+                f"  test : {test_stats['n_rows']:,} rows, "
+                f"{test_stats['n_genes']} genes, "
+                f"{test_stats['n_sections']} sections"
+            )
+            n_genes = int(train_stats["n_genes"])
+
+    # Reuse the path-variables for the rest of the function.
+    train_csv = train_csv_path  # noqa: F811  (intentional rebinding for downstream f-strings)
+    test_csv = test_csv_path
     tracker.end("csv_build", flush_to=runtime_csv)
 
-    # ---- 2. Build Hydra overrides + invoke LUNA -------------------------
-    luna_run_dir = out_dir / "luna_run"
+    # ---- 3. Invoke LUNA train_and_test ---------------------------------
+    luna_run_dir = out / "luna_run"
     luna_run_dir.mkdir(parents=True, exist_ok=True)
     test_save_dir = luna_run_dir / "test_results"
     test_save_dir.mkdir(parents=True, exist_ok=True)
 
+    # NOTE on hyperparameters: the defaults below are bit-identical to
+    # LUNA's published MERFISH cortex config (configs/experiment/
+    # MERFISH_mouse_cortex.yaml on the upstream LUNA repo):
+    #
+    #   train.n_epochs         = 1000   (experiment override)
+    #   train.batch_size       = 6      (experiment override)
+    #   train.lr               = 5e-4   (LUNA train default, we don't touch)
+    #   train.weight_decay     = 1e-12  (LUNA train default, we don't touch)
+    #   general.seed           = 0      (LUNA general default, we now match)
+    #   general.mode           = train_and_test
+    #   validation.if_validate = False  (LUNA experiment default)
+    #   validation.save_model_every_n_epochs = 250  (LUNA experiment default)
+    #
+    # Only deliberate departure: general.wandb defaults to "disabled" here
+    # (LUNA defaults to "online", which crashes if the host isn't logged
+    # in). Override via --wandb_mode if you want LUNA to log to wandb.
+    # Single-quote path values so Hydra's override parser tolerates any
+    # `=` (or other special chars) in the path tree. Critical for paths
+    # containing LUNA's `epoch=N.ckpt` checkpoint filenames; harmless for
+    # the rest.
     def _h(v: object) -> str:
-        # Hydra single-quote escape — required for paths that contain '='
-        # (e.g. LUNA's epoch=N.ckpt filenames).
         return f"'{v}'"
 
-    run_name = wandb_run_name or "scgg_luna_benchmark"
-    # Vendored scgg/src/main.py supports `train_only` natively (we
-    # added it in this repo); paired with the data_module patch that
-    # skips the unused split, training never touches the test CSV.
+    # Decoupled by default: train-only mode in train script, test-only
+    # in the inference wrapper. The launcher
+    # (``scripts/_luna_runner.py``) patches LUNA's DataModule so the
+    # unused split's CSV is never loaded — critical for datasets where
+    # one of the CSVs would crash the data_module (e.g. CNS scRNA
+    # cells with string IDs).
     mode = "test_only" if skip_training else "train_only"
-
     overrides = [
         f"general.name={run_name}",
-        f"general.mode={mode}",
         f"general.seed={seed}",
         f"general.wandb={wandb_mode}",
         f"dataset.train_data_path={_h(train_csv.resolve())}",
@@ -537,109 +1030,115 @@ def run_benchmark(
     if skip_training:
         if load_checkpoint is None:
             raise ValueError(
-                "--skip_training requires --load_checkpoint to point at a "
+                "skip_training=True requires load_checkpoint to point at a "
                 "LUNA-format .ckpt path."
             )
         ckpt_path = Path(load_checkpoint).resolve()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"--load_checkpoint not found: {ckpt_path}")
         overrides.append(f"test.checkpoints_parent_dir={_h(ckpt_path.parent)}")
         overrides.append(f"test.checkpoints_name_list=[{_h(ckpt_path.name)}]")
     if extra_overrides:
         overrides.extend(extra_overrides)
 
-    log_path = out_dir / "luna_stdout.log"
+    log_path = out / "luna_stdout.log"
     tracker.start("training")
     try:
-        rc = _invoke_luna(overrides, log_path)
+        rc = _invoke_luna(luna_repo_p, overrides, log_path, mode=mode)
     finally:
         tracker.end("training", flush_to=runtime_csv)
     if rc != 0:
         raise RuntimeError(f"LUNA training failed (exit {rc}). See {log_path}")
 
-    # ---- 3. Read LUNA predictions, run scgg.evaluation.luna_metrics ----
+    # ---- 4. Pin a stable "best_model.ckpt" reference -------------------
+    final_ckpt = _find_latest_checkpoint(luna_run_dir)
+    if final_ckpt is not None:
+        stable_link = out / "best_model.ckpt"
+        if stable_link.exists() or stable_link.is_symlink():
+            stable_link.unlink()
+        try:
+            stable_link.symlink_to(final_ckpt.relative_to(out))
+        except (OSError, ValueError):
+            stable_link = out / "best_model.path"
+            stable_link.write_text(str(final_ckpt.resolve()))
+        logger.info(f"Best checkpoint: {final_ckpt}  (pinned at {stable_link})")
+    else:
+        logger.warning("No checkpoint found under luna_run/checkpoints/")
+
+    # ---- 5. Evaluate predictions ---------------------------------------
     # Train mode (mode == "train_only") writes a checkpoint but no
-    # predictions, so nothing to score — run inference_scgg / the
-    # inference wrapper against the checkpoint to compute test metrics.
+    # predictions, so there's nothing to evaluate. Inference mode
+    # (mode == "test_only") and the legacy combined mode both produce
+    # `metadata_pred.csv` files we can score against ground truth.
     per_slice: List[Dict[str, float]] = []
     if mode != "train_only":
         tracker.start("evaluation")
-        logger.info(f"Reading LUNA predictions from {test_save_dir}")
         sections = _read_luna_predictions(test_save_dir)
-        logger.info(f"Found predictions for {len(sections)} slices")
-
-        plots_dir = (out_dir / "plots") if make_plots else None
-        if plots_dir is not None:
-            plots_dir.mkdir(parents=True, exist_ok=True)
-
-        for label, (coords_pred, coords_true, cell_class) in sections.items():
-            if coords_true.shape[0] < 10:
-                logger.info(f"  skipping {label} (n<10)")
-                continue
-            row = evaluate_slice(
-                coords_true, coords_pred, cell_class,
-                contact_percentile=contact_percentile,
-                compute_rssd=compute_rssd,
-                rssd_projection="pca",
-            )
-            row["section_label"] = label
-            per_slice.append(row)
-            logger.info(
-                f"  {label:30s}  "
-                f"spr_median={row['spearman_per_cell_median']:.4f}  "
-                f"spr_mean={row['spearman_per_cell_mean']:.4f}  "
-                f"prec={row['precision']:.4f}  "
-                f"rssd={row.get('absolute_rssd', float('nan')):.2f}"
-            )
-            if plots_dir is not None:
-                try:
-                    plot_pred_vs_truth(
-                        coords_true=coords_true,
-                        coords_pred=coords_pred,
-                        cell_class=cell_class,
-                        out_path=plots_dir / f"{label}.svg",
-                        title_prefix=f"{label}  |  ",
-                        method_label="scgg prediction",
-                    )
-                except Exception as e:  # noqa: BLE001 — plotting must never crash eval
-                    logger.warning(f"  plot failed for {label}: {e}")
-
+        plots_dir = (out / "plots") if make_plots else None
+        per_slice = _evaluate_predictions(sections, plots_dir=plots_dir)
         tracker.end("evaluation", flush_to=runtime_csv)
     else:
         logger.info(
             "mode=train_only: skipping evaluation phase (no predictions "
-            "were written). Run `run_scgg_inference.py --checkpoint ...` "
+            "were written). Run `run_luna_inference.py --checkpoint ...` "
             "against the saved checkpoint to score on the test split."
         )
 
-    # ---- 4. Aggregate + write outputs ----------------------------------
-    tracker.start("write_artifacts")
-    agg = aggregate_slices(per_slice)
-    headline = agg.get("spearman_mean_of_medians", float("nan"))
-    luna_reported = 0.448
-    logger.info("=" * 72)
-    logger.info("LUNA Figure 3 reproduction — aggregated metrics across test slices")
-    logger.info("=" * 72)
-    for k, v in agg.items():
-        logger.info(f"  {k:34s} = {v}")
-    logger.info("-" * 72)
-    logger.info(
-        f"Headline (LUNA-equivalent mean-of-per-slice-median Spearman): "
-        f"{headline:.4f}   |   LUNA paper: {luna_reported:.4f}"
-    )
-    if not np.isnan(headline):
-        delta = (headline - luna_reported) * 100
-        logger.info(f"Delta vs LUNA: {delta:+.2f} percentage points")
+    headline = float("nan")
+    if per_slice:
+        medians = [r["spearman_per_cell_median"] for r in per_slice
+                   if not np.isnan(r["spearman_per_cell_median"])]
+        if medians:
+            headline = float(np.mean(medians))
 
-    fieldnames = sorted({k for r in per_slice for k in r.keys()})
-    with open(out_dir / "per_slice_metrics.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in per_slice:
-            w.writerow(r)
-    with open(out_dir / "aggregate_metrics.json", "w") as f:
+    luna_paper = 0.448
+    logger.info("=" * 72)
+    logger.info("LUNA (this run) — aggregated metrics across test slices")
+    logger.info("=" * 72)
+    logger.info(f"  spearman_mean_of_medians (n={len(per_slice)} slices) = {headline:.4f}")
+    logger.info(f"  LUNA paper headline                                   = {luna_paper:.4f}")
+    if not np.isnan(headline):
+        logger.info(f"  Delta vs LUNA paper                                  = "
+                    f"{(headline - luna_paper) * 100:+.2f} pp")
+
+    # ---- 6. Write artifacts (mirror scgg's training script) ------------
+    tracker.start("write_artifacts")
+    if per_slice:
+        fieldnames = sorted({k for r in per_slice for k in r.keys()})
+        with open(out / "per_slice_metrics.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for r in per_slice:
+                w.writerow(r)
+    agg = {"spearman_mean_of_medians": headline, "n_test_slices": len(per_slice)}
+    with open(out / "aggregate_metrics.json", "w") as f:
         json.dump(agg, f, indent=2, default=str)
+
+    cfg_snap = {
+        "method": "LUNA",
+        "run_timestamp": run_ts,
+        "data_source": "prebuilt_csv" if use_prebuilt else "silver_h5ad",
+        "data_dir": (str(data_dir) if not use_prebuilt else None),
+        "train_csv": str(train_csv),
+        "test_csv": str(test_csv),
+        "n_genes": n_genes,
+        "luna_repo": str(luna_repo_p),
+        "run_name": run_name,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "seed": seed,
+        "log2_normalize": log2_normalize if not use_prebuilt else None,
+        "extra_overrides": extra_overrides or [],
+        "luna_run_dir": str(luna_run_dir),
+        "test_save_dir": str(test_save_dir),
+        "best_checkpoint": str(final_ckpt) if final_ckpt else None,
+    }
+    with open(out / "config.yaml", "w") as f:
+        yaml.safe_dump(cfg_snap, f, sort_keys=False)
     tracker.end("write_artifacts", flush_to=runtime_csv)
 
-    logger.info(f"Wrote results to {out_dir}")
+    logger.info(f"Wrote LUNA training artifacts to {out}")
     return agg
 
 
@@ -648,90 +1147,133 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> int:
     p = argparse.ArgumentParser(
-        description=(
-            "Train the vendored LUNA model (under scgg/src/) on the "
-            "*_train.h5ad files of any silver directory and evaluate "
-            "on the *_test.h5ad files. Defaults reproduce the LUNA "
-            "Figure 3 cortex benchmark when --data_dir points at the "
-            "mmc_luna silver dir, but any dataset built by "
-            "build_h5ad_from_luna_csv works."
-        ),
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--data_dir", required=True,
-        help="Path to a per-section h5ad silver directory. The script "
-             "discovers *_train.h5ad (for training) and *_test.h5ad "
-             "(held out for inference) under it.",
+        "--data_dir", default=None,
+        help="Per-slice silver h5ad directory (LUNA cortex split). "
+             "Mouse 1 => train, Mouse 2 => test. Either this OR "
+             "(--train_csv + --test_csv) must be provided.",
+    )
+    p.add_argument(
+        "--train_csv", default=None,
+        help="Pre-built LUNA-format train CSV (e.g., LUNA's published "
+             "MERFISH_mouse_cortex_train.csv from their Google Drive: "
+             "https://drive.google.com/drive/folders/1vWxVUSuQzRDF1o9Vw_cnm-wbEYw_e1Gu"
+             "). Skips the h5ad → CSV conversion step entirely. "
+             "Required (with --test_csv) for bit-exact LUNA-paper "
+             "reproduction.",
+    )
+    p.add_argument(
+        "--test_csv", default=None,
+        help="Pre-built LUNA-format test CSV. Pair with --train_csv.",
+    )
+    p.add_argument(
+        "--n_genes", type=int, default=None,
+        help="Number of gene columns in the pre-built CSVs. Auto-inferred "
+             "from the CSV header (n_columns - 4 metadata) when omitted.",
     )
     p.add_argument(
         "--output_dir", default=None,
-        help="Where to write LUNA checkpoints + per-slice / aggregate "
-             "metrics. Default: "
-             "/nfs/team361/sb75/scgg-reproducibility/artifacts/<data_dir_name>/"
-             "model/<YYYYMMDD_HHMMSS>/.",
+        help="Where to write LUNA's outputs + per-slice metrics. Default: "
+             "/nfs/team361/sb75/scgg-reproducibility/artifacts/"
+             "<data_dir_name>/luna_model/<YYYYMMDD_HHMMSS>/.",
     )
     p.add_argument("--epochs", type=int, default=1000,
-                   help="LUNA train.n_epochs (default 1000 — matches paper).")
+                   help="train.n_epochs override (LUNA paper default: 1000).")
     p.add_argument("--batch_size", type=int, default=6,
-                   help="LUNA train.batch_size (number of SECTIONS per "
-                        "gradient step; default 6 — matches paper).")
+                   help="train.batch_size override (LUNA paper default: 6).")
     p.add_argument("--lr", type=float, default=None,
-                   help="LUNA train.lr (default unset → LUNA default 5e-4).")
+                   help="Optional train.lr override. LUNA's published "
+                        "default for the cortex experiment is 5e-4 (used "
+                        "when this flag is not passed).")
     p.add_argument("--seed", type=int, default=0,
-                   help="LUNA general.seed (default 0 — matches paper).")
-    p.add_argument("--no_wandb", action="store_true",
-                   help="Set LUNA's general.wandb=disabled (default).")
-    p.add_argument("--wandb_online", action="store_true",
-                   help="Set LUNA's general.wandb=online — requires "
-                        "`wandb login` on the host.")
-    p.add_argument("--wandb_run_name", default=None,
-                   help="Becomes LUNA's general.name (drives the wandb "
-                        "run name and the LUNA run-dir basename).")
-    p.add_argument("--contact_percentile", type=float, default=0.01,
-                   help="Percentile for LUNA's contact F1 metric "
-                        "(scgg.evaluation.luna_metrics).")
-    p.add_argument("--skip_rssd", action="store_true",
-                   help="Skip Kabsch RSSD (faster).")
-    p.add_argument("--skip_training", action="store_true",
-                   help="Run LUNA in test-only mode (requires --load_checkpoint).")
-    p.add_argument("--load_checkpoint", default=None,
-                   help="Path to a LUNA .ckpt — only used with --skip_training.")
+                   help="general.seed override. Default 0 matches LUNA's "
+                        "published config (configs/general/default.yaml).")
+    p.add_argument(
+        "--wandb_mode", default="disabled",
+        choices=("disabled", "online", "offline", "dryrun"),
+        help="general.wandb override. Default 'disabled' to avoid LUNA "
+             "crashing when the host isn't logged into WandB. Pass "
+             "'online' to match LUNA's upstream default.",
+    )
+    p.add_argument(
+        "--luna_repo", default=str(_ENGINE_REPO_DEFAULT),
+        help=f"Path to the LUNA repository. Default: {_ENGINE_REPO_DEFAULT}",
+    )
+    # Two argparse names for the same Hydra `general.name` value:
+    # `--wandb_run_name` to match run_scgg.py's CLI surface (so users
+    # can flip between the two scripts without rewriting their command
+    # lines), and `--run_name` kept as an alias because earlier
+    # invocations and docs reference it.
+    p.add_argument(
+        "--wandb_run_name", "--run_name",
+        dest="wandb_run_name",
+        default="MERFISH_mouse_cortex",
+        help="Sets general.name in LUNA's Hydra config (drives the "
+             "wandb run name and LUNA's output dir basename). "
+             "Aliases: --run_name.",
+    )
+    # By default we write raw counts (LUNA's published CSVs are
+    # non-integer per-cell-normalized values in the same magnitude
+    # range as raw counts, NOT log-transformed — verified with
+    # `compare_luna_csv_vs_h5ad.py`). `--log2_normalize` opts in to the
+    # old behavior for ablation.
+    p.add_argument(
+        "--log2_normalize", action="store_true",
+        help="Apply log2(x+1) when writing the LUNA CSVs. OFF by default "
+             "since LUNA's published CSVs are not log-transformed; "
+             "training on log-compressed inputs collapses to ~0 Spearman.",
+    )
+    p.add_argument(
+        "--luna_override", action="append", default=[],
+        help="Extra Hydra overrides, e.g. '--luna_override train.lr=1e-4'. "
+             "Repeatable.",
+    )
+    p.add_argument(
+        "--skip_training", action="store_true",
+        help="Run LUNA in test-only mode against a previously trained "
+             "checkpoint (requires --load_checkpoint). Used internally "
+             "by inference_luna.py.",
+    )
+    p.add_argument(
+        "--load_checkpoint", default=None,
+        help="Path to a LUNA .ckpt — only used with --skip_training.",
+    )
     p.add_argument(
         "--plots", action="store_true",
         help="Write per-section ground-truth-vs-prediction comparison "
              "plots (svg) into <out_dir>/plots/. OFF by default during "
-             "training; ON by default in inference_scgg.py.",
-    )
-    p.add_argument(
-        "--extra_override", action="append", default=None, metavar="KEY=VALUE",
-        help="Extra Hydra override(s) passed straight through to LUNA. "
-             "Repeat the flag for multiple. Example: "
-             "--extra_override train.lr=1e-4 --extra_override model.layers=12",
+             "training; ON by default in inference_luna.py.",
     )
     args = p.parse_args()
 
-    if args.wandb_online and args.no_wandb:
-        p.error("--wandb_online and --no_wandb are mutually exclusive.")
-    wandb_mode = "online" if args.wandb_online else "disabled"
-
-    run_benchmark(
-        data_dir=args.data_dir,
-        output_dir=args.output_dir,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        seed=args.seed,
-        wandb_mode=wandb_mode,
-        wandb_run_name=args.wandb_run_name,
-        contact_percentile=args.contact_percentile,
-        compute_rssd=not args.skip_rssd,
-        skip_training=args.skip_training,
-        load_checkpoint=args.load_checkpoint,
-        extra_overrides=args.extra_override,
-        make_plots=args.plots,
-    )
+    try:
+        run_benchmark(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            luna_repo=args.luna_repo,
+            run_name=args.wandb_run_name,
+            log2_normalize=args.log2_normalize,
+            wandb_mode=args.wandb_mode,
+            extra_overrides=args.luna_override,
+            train_csv=args.train_csv,
+            test_csv=args.test_csv,
+            n_genes=args.n_genes,
+            skip_training=args.skip_training,
+            load_checkpoint=args.load_checkpoint,
+            make_plots=args.plots,
+        )
+    except Exception:
+        logger.exception("LUNA training failed")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

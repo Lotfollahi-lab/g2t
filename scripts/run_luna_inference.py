@@ -57,7 +57,7 @@ def main():
     p.add_argument(
         "--output_dir", default=None,
         help="Where to write per-slice metrics, runtime.csv, etc. "
-             "Default: <ARTIFACTS_ROOT>/<data_dir_name>/luna_inference/<TS>/.",
+             "Default: <ARTIFACTS_ROOT>/<data_dir_name>/<ENGINE_OUTPUT_SUBDIR>/<TS>/  (defaults: luna_model/...).",
     )
     p.add_argument("--seed", type=int, default=0,
                    help="LUNA general.seed (default 0 — matches paper).")
@@ -74,9 +74,9 @@ def main():
                    choices=("disabled", "online", "offline", "dryrun"),
                    help="LUNA general.wandb (default 'disabled').")
     p.add_argument(
-        "--luna_repo", default=str(run_luna_train._DEFAULT_LUNA_REPO),
+        "--luna_repo", default=str(run_luna_train._ENGINE_REPO_DEFAULT),
         help=f"Path to the external LUNA repo. Default: "
-             f"{run_luna_train._DEFAULT_LUNA_REPO}",
+             f"{run_luna_train._ENGINE_REPO_DEFAULT}",
     )
     p.add_argument(
         "--luna_override", action="append", default=[],

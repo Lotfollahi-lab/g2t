@@ -1,10 +1,10 @@
 """Run inference with a previously-trained scgg (vendored LUNA) checkpoint.
 
-Thin wrapper around ``run_scgg_train.run_benchmark`` with
-``skip_training=True``. Uses the vendored LUNA under
-``scgg/src/`` — the modifiable copy we'll edit forward from the
-baseline. Pair this with ``inference_luna.py`` (which uses the
-external LUNA) for A/B comparisons.
+Thin wrapper around ``run_scgg_train.run_benchmark`` with ``skip_training=True``,
+so the underlying pipeline (silver-h5ad discovery, CSV materialisation,
+Hydra invocation, per-slice evaluation, runtime tracking) is shared
+verbatim with the training script — nothing about how predictions are
+computed or scored drifts between train and inference.
 
 Reads the silver dir's ``*_test.h5ad`` files and runs LUNA's
 ``general.mode=test_only`` against the supplied ``.ckpt``. Writes the
@@ -24,9 +24,12 @@ import argparse
 import sys
 from pathlib import Path
 
-# Reuse the full pipeline from run_scgg_train.py.
+# Reuse the full pipeline from run_scgg_train.py — engine constants
+# at the top of that script point at the vendored LUNA under
+# scgg/src/, so this thin wrapper inherits the right engine
+# automatically.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import run_scgg_train  # noqa: E402
+import run_scgg_train  # noqa: E402  (local-script import, intentional)
 
 
 def main():
@@ -35,10 +38,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--data_dir", required=True,
+        "--data_dir", default=None,
         help="Silver dir containing *_test.h5ad files for evaluation. "
-             "(*_train.h5ad files in the same dir are needed to size "
-             "LUNA's data_module — rows are NOT trained on.)",
+             "Use this OR (--train_csv + --test_csv).",
+    )
+    p.add_argument(
+        "--train_csv", default=None,
+        help="Pre-built LUNA-format train CSV (only used to satisfy "
+             "LUNA's data_module wiring; rows are NOT trained on).",
+    )
+    p.add_argument(
+        "--test_csv", default=None,
+        help="Pre-built LUNA-format test CSV. Pair with --train_csv.",
     )
     p.add_argument(
         "--checkpoint", required=True,
@@ -47,24 +58,30 @@ def main():
     p.add_argument(
         "--output_dir", default=None,
         help="Where to write per-slice metrics, runtime.csv, etc. "
-             "Default: <ARTIFACTS_ROOT>/<data_dir_name>/model/<TS>/.",
+             "Default: <ARTIFACTS_ROOT>/<data_dir_name>/<ENGINE_OUTPUT_SUBDIR>/<TS>/  (defaults: scgg_model/...).",
     )
     p.add_argument("--seed", type=int, default=0,
-                   help="LUNA general.seed (default 0).")
-    p.add_argument("--wandb_run_name", default="scgg_inference",
-                   help="LUNA general.name (drives wandb run name + run-dir basename).")
-    p.add_argument("--no_wandb", action="store_true",
-                   help="Set LUNA's general.wandb=disabled (default).")
-    p.add_argument("--wandb_online", action="store_true",
-                   help="Set LUNA's general.wandb=online — requires "
-                        "`wandb login` on the host.")
-    p.add_argument("--contact_percentile", type=float, default=0.01,
-                   help="Percentile for LUNA's contact F1 metric.")
-    p.add_argument("--skip_rssd", action="store_true",
-                   help="Skip Kabsch RSSD (faster).")
+                   help="LUNA general.seed (default 0 — matches paper).")
+    p.add_argument("--n_genes", type=int, default=None,
+                   help="Explicit gene-column count. Default: inferred "
+                        "from CSV header.")
     p.add_argument(
-        "--extra_override", action="append", default=None, metavar="KEY=VALUE",
-        help="Extra Hydra override(s) passed through to LUNA. Repeatable.",
+        "--wandb_run_name", "--run_name",
+        dest="wandb_run_name",
+        default="MERFISH_LUNA_inference",
+        help="Sets general.name in LUNA's Hydra config. Aliases: --run_name.",
+    )
+    p.add_argument("--wandb_mode", default="disabled",
+                   choices=("disabled", "online", "offline", "dryrun"),
+                   help="LUNA general.wandb (default 'disabled').")
+    p.add_argument(
+        "--luna_repo", default=str(run_scgg_train._ENGINE_REPO_DEFAULT),
+        help=f"Path to the external LUNA repo. Default: "
+             f"{run_scgg_train._ENGINE_REPO_DEFAULT}",
+    )
+    p.add_argument(
+        "--luna_override", action="append", default=[],
+        help="Extra Hydra overrides. Repeatable.",
     )
     p.add_argument(
         "--no_plots", action="store_true",
@@ -73,26 +90,26 @@ def main():
     )
     args = p.parse_args()
 
-    if args.wandb_online and args.no_wandb:
-        p.error("--wandb_online and --no_wandb are mutually exclusive.")
-    wandb_mode = "online" if args.wandb_online else "disabled"
-
+    # Inference uses run_benchmark in skip-training mode. epochs/batch_size
+    # are ignored by LUNA when mode=test_only but the API still wants them.
     try:
         run_scgg_train.run_benchmark(
             data_dir=args.data_dir,
+            train_csv=args.train_csv,
+            test_csv=args.test_csv,
+            n_genes=args.n_genes,
             output_dir=args.output_dir,
             seed=args.seed,
-            wandb_mode=wandb_mode,
-            wandb_run_name=args.wandb_run_name,
-            contact_percentile=args.contact_percentile,
-            compute_rssd=not args.skip_rssd,
+            luna_repo=args.luna_repo,
+            run_name=args.wandb_run_name,
+            wandb_mode=args.wandb_mode,
+            extra_overrides=args.luna_override,
             skip_training=True,
             load_checkpoint=args.checkpoint,
-            extra_overrides=args.extra_override,
             make_plots=not args.no_plots,
         )
     except Exception:
-        run_scgg_train.logger.exception("scgg inference failed")
+        run_scgg_train.logger.exception("LUNA inference failed")
         return 1
     return 0
 
