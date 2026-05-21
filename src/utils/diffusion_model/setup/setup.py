@@ -123,10 +123,13 @@ def setup_model(
     Returns:
     model: Initialized model based on the provided configuration.
     """
-    if cfg.general.mode == "train_and_test":
-        pass
-    else:
-        # Set up for testing only
+    # Only load from checkpoint when we're actually testing. Train
+    # paths (`train_and_test` AND our scgg-added `train_only`) start
+    # from a fresh model — calling get_resume(... checkpoint_path=None)
+    # blows up inside torch.load. The upstream LUNA code used an
+    # inverted `if/else` here that bit us as soon as we added a third
+    # mode; switching to a positive check makes future modes safe.
+    if cfg.general.mode == "test_only":
         cfg, _ = get_resume(cfg, dataset_infos, checkpoint_path)
 
     # Initialize the model
