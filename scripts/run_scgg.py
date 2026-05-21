@@ -46,6 +46,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -54,6 +55,68 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("scgg.luna_cortex_benchmark")
+
+
+# ---------------------------------------------------------------------------
+# Runtime tracking
+# ---------------------------------------------------------------------------
+
+
+class _RuntimeTracker:
+    """Records phase wall-clock durations and writes them to a CSV.
+
+    Mirror of the same class in ``run_luna.py`` so the two scripts
+    emit identically-shaped ``runtime.csv`` files (handy for A/B
+    comparisons between baseline LUNA and scgg).
+    """
+
+    def __init__(self):
+        self.phases: List[Dict[str, object]] = []
+        self.overall_t0 = time.time()
+        self._open: Dict[str, float] = {}
+
+    def start(self, name: str) -> None:
+        self._open[name] = time.time()
+        logger.info(f"[runtime] start phase: {name}")
+
+    def end(self, name: str, flush_to: Optional[Path] = None) -> None:
+        t0 = self._open.pop(name, None)
+        if t0 is None:
+            logger.warning(f"[runtime] end({name!r}) called without a matching start; skipping")
+            return
+        t1 = time.time()
+        self.phases.append({
+            "phase": name,
+            "start": datetime.fromtimestamp(t0).isoformat(timespec="seconds"),
+            "end": datetime.fromtimestamp(t1).isoformat(timespec="seconds"),
+            "duration_s": round(t1 - t0, 3),
+        })
+        logger.info(f"[runtime] end   phase: {name}  ({t1 - t0:.1f}s)")
+        if flush_to is not None:
+            self.write_csv(flush_to)
+
+    @contextmanager
+    def phase(self, name: str, flush_to: Optional[Path] = None):
+        self.start(name)
+        try:
+            yield
+        finally:
+            self.end(name, flush_to=flush_to)
+
+    def write_csv(self, out_path: Path) -> None:
+        rows = list(self.phases)
+        rows.append({
+            "phase": "total",
+            "start": datetime.fromtimestamp(self.overall_t0).isoformat(timespec="seconds"),
+            "end": datetime.now().isoformat(timespec="seconds"),
+            "duration_s": round(time.time() - self.overall_t0, 3),
+        })
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["phase", "start", "end", "duration_s"])
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +443,13 @@ def run_benchmark(
     logger.info(f"Output dir:    {out_dir}")
     logger.info(f"Vendored LUNA: {_VENDORED_LUNA_SRC}")
 
+    # Phase timing — flushed to runtime.csv after each phase so a
+    # crash mid-run still leaves a useful CSV behind.
+    tracker = _RuntimeTracker()
+    runtime_csv = out_dir / "runtime.csv"
+
     # ---- 1. Materialise LUNA-format CSVs from the silver h5ads ---------
+    tracker.start("csv_build")
     work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
     train_csv = work / "train.csv"
@@ -412,6 +481,7 @@ def run_benchmark(
         logger.info(f"Writing test CSV  -> {test_csv}")
         test_stats = _build_luna_csv(test_files, test_csv, log2_normalize)
         n_genes = int(train_stats["n_genes"])
+    tracker.end("csv_build", flush_to=runtime_csv)
 
     # ---- 2. Build Hydra overrides + invoke LUNA -------------------------
     luna_run_dir = out_dir / "luna_run"
@@ -456,11 +526,16 @@ def run_benchmark(
         overrides.extend(extra_overrides)
 
     log_path = out_dir / "luna_stdout.log"
-    rc = _invoke_luna(overrides, log_path)
+    tracker.start("training")
+    try:
+        rc = _invoke_luna(overrides, log_path)
+    finally:
+        tracker.end("training", flush_to=runtime_csv)
     if rc != 0:
         raise RuntimeError(f"LUNA training failed (exit {rc}). See {log_path}")
 
     # ---- 3. Read LUNA predictions, run scgg.evaluation.luna_metrics ----
+    tracker.start("evaluation")
     logger.info(f"Reading LUNA predictions from {test_save_dir}")
     sections = _read_luna_predictions(test_save_dir)
     logger.info(f"Found predictions for {len(sections)} slices")
@@ -486,7 +561,10 @@ def run_benchmark(
             f"rssd={row.get('absolute_rssd', float('nan')):.2f}"
         )
 
+    tracker.end("evaluation", flush_to=runtime_csv)
+
     # ---- 4. Aggregate + write outputs ----------------------------------
+    tracker.start("write_artifacts")
     agg = aggregate_slices(per_slice)
     headline = agg.get("spearman_mean_of_medians", float("nan"))
     luna_reported = 0.448
@@ -512,6 +590,7 @@ def run_benchmark(
             w.writerow(r)
     with open(out_dir / "aggregate_metrics.json", "w") as f:
         json.dump(agg, f, indent=2, default=str)
+    tracker.end("write_artifacts", flush_to=runtime_csv)
 
     logger.info(f"Wrote results to {out_dir}")
     return agg

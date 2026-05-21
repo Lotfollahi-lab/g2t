@@ -66,6 +66,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -75,6 +76,87 @@ import pandas as pd
 import yaml
 
 logger = logging.getLogger("luna_train")
+
+
+# ---------------------------------------------------------------------------
+# Runtime tracking
+# ---------------------------------------------------------------------------
+
+
+class _RuntimeTracker:
+    """Records phase wall-clock durations and writes them to a CSV.
+
+    Use as::
+
+        tracker = _RuntimeTracker()
+        out_csv = out_dir / "runtime.csv"
+
+        tracker.start("csv_build")
+        ...do csv build...
+        tracker.end("csv_build", out_csv)
+
+        tracker.start("training")
+        ...invoke LUNA...
+        tracker.end("training", out_csv)
+
+        ...etc.
+
+    ``end()`` flushes the running CSV after each phase, so even if a
+    later phase crashes the CSV is up to date. The CSV always includes
+    a final ``total`` row so a glance at the last line tells you how
+    long the whole run took so far.
+    """
+
+    def __init__(self):
+        self.phases: List[Dict[str, object]] = []
+        self.overall_t0 = time.time()
+        self._open: Dict[str, float] = {}
+
+    def start(self, name: str) -> None:
+        self._open[name] = time.time()
+        logger.info(f"[runtime] start phase: {name}")
+
+    def end(self, name: str, flush_to: Optional[Path] = None) -> None:
+        t0 = self._open.pop(name, None)
+        if t0 is None:
+            logger.warning(f"[runtime] end({name!r}) called without a matching start; skipping")
+            return
+        t1 = time.time()
+        self.phases.append({
+            "phase": name,
+            "start": datetime.fromtimestamp(t0).isoformat(timespec="seconds"),
+            "end": datetime.fromtimestamp(t1).isoformat(timespec="seconds"),
+            "duration_s": round(t1 - t0, 3),
+        })
+        logger.info(f"[runtime] end   phase: {name}  ({t1 - t0:.1f}s)")
+        if flush_to is not None:
+            self.write_csv(flush_to)
+
+    @contextmanager
+    def phase(self, name: str, flush_to: Optional[Path] = None):
+        """Alternative context-manager API for new code; equivalent
+        to ``start`` + ``end`` with automatic re-raise on exceptions.
+        """
+        self.start(name)
+        try:
+            yield
+        finally:
+            self.end(name, flush_to=flush_to)
+
+    def write_csv(self, out_path: Path) -> None:
+        rows = list(self.phases)
+        rows.append({
+            "phase": "total",
+            "start": datetime.fromtimestamp(self.overall_t0).isoformat(timespec="seconds"),
+            "end": datetime.now().isoformat(timespec="seconds"),
+            "duration_s": round(time.time() - self.overall_t0, 3),
+        })
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["phase", "start", "end", "duration_s"])
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +619,12 @@ def run_benchmark(
     work = out / "work"
     work.mkdir(parents=True, exist_ok=True)
 
+    # Phase timing — flushed to <out>/runtime.csv at the end of each
+    # phase so a crash mid-run still leaves a useful CSV behind.
+    tracker = _RuntimeTracker()
+    runtime_csv = out / "runtime.csv"
+
+    tracker.start("csv_build")
     if use_prebuilt:
         # ---- Pre-built CSV path: use LUNA's preprocessed files directly.
         # This is the bit-exact paper-reproduction path; no h5ad → CSV
@@ -685,6 +773,7 @@ def run_benchmark(
     # Reuse the path-variables for the rest of the function.
     train_csv = train_csv_path  # noqa: F811  (intentional rebinding for downstream f-strings)
     test_csv = test_csv_path
+    tracker.end("csv_build", flush_to=runtime_csv)
 
     # ---- 3. Invoke LUNA train_and_test ---------------------------------
     luna_run_dir = out / "luna_run"
@@ -735,7 +824,11 @@ def run_benchmark(
         overrides.extend(extra_overrides)
 
     log_path = out / "luna_stdout.log"
-    rc = _invoke_luna(luna_repo_p, overrides, log_path)
+    tracker.start("training")
+    try:
+        rc = _invoke_luna(luna_repo_p, overrides, log_path)
+    finally:
+        tracker.end("training", flush_to=runtime_csv)
     if rc != 0:
         raise RuntimeError(f"LUNA training failed (exit {rc}). See {log_path}")
 
@@ -755,8 +848,10 @@ def run_benchmark(
         logger.warning("No checkpoint found under luna_run/checkpoints/")
 
     # ---- 5. Evaluate predictions ---------------------------------------
+    tracker.start("evaluation")
     sections = _read_luna_predictions(test_save_dir)
     per_slice = _evaluate_predictions(sections)
+    tracker.end("evaluation", flush_to=runtime_csv)
 
     headline = float("nan")
     if per_slice:
@@ -776,6 +871,7 @@ def run_benchmark(
                     f"{(headline - luna_paper) * 100:+.2f} pp")
 
     # ---- 6. Write artifacts (mirror scgg's training script) ------------
+    tracker.start("write_artifacts")
     if per_slice:
         fieldnames = sorted({k for r in per_slice for k in r.keys()})
         with open(out / "per_slice_metrics.csv", "w", newline="") as f:
@@ -809,6 +905,7 @@ def run_benchmark(
     }
     with open(out / "config.yaml", "w") as f:
         yaml.safe_dump(cfg_snap, f, sort_keys=False)
+    tracker.end("write_artifacts", flush_to=runtime_csv)
 
     logger.info(f"Wrote LUNA training artifacts to {out}")
     return agg
