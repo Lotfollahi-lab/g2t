@@ -52,8 +52,21 @@ py-modules = ["main", "diffusion_model"]
 #                             `utils`, `metrics`, `datasets`, `configs`
 #                             (LUNA's own import style, kept unchanged
 #                             so we track upstream).
+#
+# `namespaces = true` is critical: LUNA does NOT ship __init__.py files
+# in several places (datasets/, utils/diffusion_model/,
+# utils/diffusion_model/diffusion/), making them PEP-420 implicit
+# namespace packages. With the setuptools default (find_packages,
+# which requires __init__.py), those dirs and everything beneath them
+# are silently dropped from the editable install — at import time you
+# get `ModuleNotFoundError: No module named 'utils.data'` inside the
+# vendored LUNA tree, because the strict-editable finder only exposes
+# packages that were discovered at install time. find_namespace
+# (= `namespaces = true`) makes setuptools include implicit-namespace
+# packages too, so every dotted name in the LUNA source tree resolves.
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = true
 include = [
     "scgg", "scgg.*",
     "models", "models.*",
