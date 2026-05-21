@@ -274,6 +274,19 @@ def build_from_csvs(
         if "cell_section" not in df.columns:
             raise ValueError(f"no 'cell_section' column in {csv_path}")
 
+        # CRITICAL for round-trip equivalence with LUNA: stamp each cell
+        # with its ORIGINAL ROW POSITION in this bronze CSV (0..len(df)-1).
+        # LUNA's data_module does `sort_values("cell_section")` with the
+        # default unstable `kind="quicksort"`. For equal cell_section
+        # values, the post-sort within-section ordering depends on the
+        # PRE-SORT input order. If our h5ad-derived fresh CSV (which
+        # writes sections contiguously) hits sort_values, it produces
+        # a DIFFERENT within-section ordering than the bronze CSV (which
+        # has sections interleaved). To make LUNA-on-h5ad ≡ LUNA-on-bronze,
+        # `_build_luna_csv` must replay bronze's exact row order — and
+        # this column is how it knows.
+        df["_bronze_row_pos"] = np.arange(len(df), dtype=np.int64)
+
         for section_label, sec_df in df.groupby(
             df["cell_section"].astype(str)
         ):

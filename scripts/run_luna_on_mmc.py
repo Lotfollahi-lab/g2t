@@ -142,13 +142,19 @@ def _build_luna_csv(
     import anndata as ad
     import scipy.sparse as sp
 
-    rows_total = 0
     gene_names: Optional[List[str]] = None
-    first = True
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     if out_csv.exists():
         out_csv.unlink()
+
+    # Collect per-section DataFrames into memory so we can sort all of
+    # them together by `_bronze_row_pos` before writing. Reconstructing
+    # bronze's exact pre-sort row order is the only way to make LUNA's
+    # unstable `sort_values("cell_section")` produce identical post-sort
+    # output for both bronze-direct and h5ad-derived inputs.
+    per_section_dfs: List[pd.DataFrame] = []
+    has_bronze_pos = True  # gets set to False if any h5ad is missing it
 
     for mouse, slice_id, path in files:
         adata = ad.read_h5ad(path)
@@ -185,55 +191,91 @@ def _build_luna_csv(
             ])
 
         # ----- Within-section cell ordering -----------------------------
-        # CRITICAL: LUNA's data_module calls `sort_values("cell_section")`
-        # which uses pandas' default `kind="quicksort"` — NOT stable.
-        # Within rows sharing the same `cell_section` value, the output
-        # ordering depends on the input ordering. To produce a fresh
-        # CSV that LUNA processes BITWISE IDENTICALLY to the bronze
-        # CSV (so model training is reproducible across the two input
-        # paths), the within-section row order must match bronze's.
+        # LUNA's data_module calls `sort_values("cell_section")` with the
+        # default unstable `kind="quicksort"`. For equal-section rows,
+        # the post-sort order depends on the pre-sort INPUT order. The
+        # bronze CSV has sections INTERLEAVED across its rows; if we
+        # write our fresh CSV with sections CONTIGUOUS (which is what
+        # _build_luna_csv naturally produces), pandas' unstable sort
+        # gives a different post-sort within-section ordering than it
+        # gives for bronze. Result: 99.98% of rows mismatch.
         #
-        # Empirically, LUNA's published bronze CSVs are sorted by
-        # `cell_id` ASCENDING within each section (verified across
-        # mouse1_slice1, mouse2_slice99, mouse2_slice119, etc.). We
-        # mirror that here. `cell_id` is preserved by
-        # `build_h5ad_from_luna_csv.py` as `adata.obs["cell_id"]`.
+        # Fix: stamp every cell with its original bronze CSV row
+        # position (`_bronze_row_pos`, written by
+        # `build_h5ad_from_luna_csv.py`), then below — AFTER we've
+        # collected every section — we sort ALL rows by
+        # `_bronze_row_pos`. This reconstructs bronze's exact pre-sort
+        # row order; LUNA's `sort_values` then produces bit-identical
+        # output on both inputs.
         if "cell_id" in adata.obs.columns:
             cell_ids = adata.obs["cell_id"].to_numpy()
-            sort_order = np.argsort(cell_ids, kind="stable")
-            X = X[sort_order]
-            xy = xy[sort_order]
-            cell_class = cell_class[sort_order]
-            cell_ids_sorted = cell_ids[sort_order]
         else:
-            # Fall back: no cell_id available in the h5ad. Keep current
-            # adata order and emit per-slice 0..N-1 ids (legacy path).
-            cell_ids_sorted = np.arange(len(X))
+            cell_ids = np.arange(len(X))
+
+        if "_bronze_row_pos" in adata.obs.columns:
+            bronze_row_pos = adata.obs["_bronze_row_pos"].to_numpy()
+        else:
+            # Legacy silver that didn't store _bronze_row_pos. We can't
+            # reconstruct bronze's order; fall back to cell_id sort
+            # (a poor approximation; LUNA-on-h5ad will NOT match
+            # LUNA-on-bronze in this case, only approximately).
+            has_bronze_pos = False
+            order = np.argsort(cell_ids, kind="stable")
+            X = X[order]
+            xy = xy[order]
+            cell_class = cell_class[order]
+            cell_ids = cell_ids[order]
+            bronze_row_pos = cell_ids  # any monotone proxy; unused later
 
         df = pd.DataFrame(X, columns=gene_names)
         df["coord_X"] = xy[:, 0]
         df["coord_Y"] = xy[:, 1]
         df["cell_section"] = section_label
         df["cell_class"] = cell_class
-        # Write the ORIGINAL bronze cell_id as the index (not 0..N-1).
-        # This makes the fresh CSV's index column match bronze's exactly,
-        # so the `cell_ID` tensor LUNA constructs in its data_module is
-        # also identical (bookkeeping match, not just training match).
-        df.index = cell_ids_sorted
+        # Use the original bronze cell_id as the index (not 0..N-1) so
+        # LUNA's `cell_ID = torch.tensor(input_data.index)` matches
+        # bronze too (bookkeeping match).
+        df.index = cell_ids
         df.index.name = "cell_id"
+        # Carry _bronze_row_pos through; we'll drop it before writing.
+        df["_bronze_row_pos"] = bronze_row_pos
 
-        # `float_format="%.17g"` writes up to 17 significant digits
-        # (shortest unambiguous float64 representation). This is the
-        # safest setting across pandas versions — float_format=None
-        # uses str() which is lossless in modern pandas (>=1.0) but
-        # can be 6-digit truncated in older versions. With %.17g we
-        # guarantee the round-trip is lossless:
-        #   bronze CSV → h5ad (float64) → fresh CSV (17g) → LUNA's
-        #   pandas (float64) → torch.float() (same float32 cast)
-        df.to_csv(out_csv, mode="a", header=first, float_format="%.17g")
-        rows_total += len(df)
-        first = False
-        logger.info(f"    wrote {len(df):>6,} cells from {section_label}")
+        per_section_dfs.append(df)
+        logger.info(f"    collected {len(df):>6,} cells from {section_label}")
+
+    # ----- Concatenate, reorder to bronze row order, write -------------
+    if not per_section_dfs:
+        raise RuntimeError("no sections collected — no h5ads matched the file list")
+
+    big_df = pd.concat(per_section_dfs, axis=0)
+
+    if has_bronze_pos:
+        # Sort by _bronze_row_pos ASC (stable) to replay bronze CSV row
+        # order EXACTLY. After this, the fresh CSV is identical to
+        # bronze at the row level (modulo metadata columns we don't
+        # carry forward).
+        big_df = big_df.sort_values("_bronze_row_pos", kind="stable")
+    else:
+        logger.warning(
+            "  no _bronze_row_pos found in any h5ad — rebuilt this silver "
+            "with the latest build_h5ad_from_luna_csv.py to enable "
+            "bit-identical LUNA-on-h5ad ≡ LUNA-on-bronze. Writing fresh "
+            "CSV with sections contiguous (cell_id-ascending within); "
+            "LUNA's unstable sort_values will produce a DIFFERENT "
+            "within-section order than for the bronze CSV."
+        )
+
+    # Drop the helper column before writing.
+    big_df = big_df.drop(columns=["_bronze_row_pos"])
+
+    # Single write with header — replaces the per-section chunked append
+    # logic. `float_format="%.17g"` gives lossless float64 round-trip.
+    big_df.to_csv(out_csv, header=True, float_format="%.17g")
+    rows_total = len(big_df)
+    logger.info(
+        f"  wrote {rows_total:,} cells total to {out_csv} "
+        f"({'bronze-row-pos sorted' if has_bronze_pos else 'cell_id sorted, sections contiguous (LEGACY)'})"
+    )
 
     return {
         "n_rows": rows_total,
