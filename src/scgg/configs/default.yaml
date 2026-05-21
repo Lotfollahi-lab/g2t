@@ -256,6 +256,20 @@ training:
   epochs: 1000               # LUNA default: 1000
   batch_size: 8192           # cells per mini-batch (within a slice)
   sections_per_epoch: null
+  # SECTIONS_PER_STEP: how many sections (slices) contribute to one
+  # gradient step. LUNA uses 6 (`train.batch_size: 6` in their
+  # MERFISH_mouse_cortex.yaml). Set to 1 to ablate to
+  # one-section-per-step.
+  sections_per_step: 6
+  # PARALLEL_BATCHING: when True (LUNA-equivalent), pad N=sections_per_step
+  # sections into (B, max_N, *) tensors and run one forward + backward
+  # per step — this is exactly what LUNA does via `to_dense_batch +
+  # node_mask`. When False, fall back to sequential gradient
+  # accumulation (math-equivalent but ~N× slower on GPU). Requires
+  # objective=flow_matching and a velocity_net that handles (B, N, *)
+  # input + mask (luna_model.LunaTransformerNet does; older nets do
+  # not). Set False to fall back to the legacy accumulation path.
+  parallel_batching: true
   lr: 5.0e-4                 # LUNA default: 5e-4
   weight_decay: 1.0e-12      # LUNA default: 1e-12 (essentially OFF;
                              # our prior 1e-4 was 1e8x more aggressive)

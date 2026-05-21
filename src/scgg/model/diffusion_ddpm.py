@@ -123,40 +123,65 @@ class DDPMNoiseModel(nn.Module):
     # ---- Forward (apply noise) -----------------------------------------
 
     def apply_noise(
-        self, x_0: torch.Tensor
+        self,
+        x_0: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample a per-slice t and return the noised z_t.
+        """Sample a per-section t and return the noised z_t.
 
         Args:
-            x_0: ``(n_cells, spatial_dim)`` clean target positions
-                (already mean-centred is recommended).
+            x_0: ``(n_cells, spatial_dim)`` for single-section, or
+                ``(B, n_cells, spatial_dim)`` for parallel-batched.
+            mask: ``(B, n_cells)`` bool, True for valid cells. Only
+                used when ``x_0`` is batched.
 
         Returns:
-            z_t: ``(n_cells, spatial_dim)`` noised positions.
-            t_per_cell: ``(n_cells,)`` broadcast t_float in (0, 1].
-            t_int: scalar tensor, the sampled integer timestep.
+            z_t: same shape as ``x_0`` (noised positions).
+            t_per_cell: ``(n_cells,)`` or ``(B, n_cells)`` broadcast
+                t_float in (0, 1].
+            t_int: ``(1,)`` or ``(B,)`` integer timesteps actually
+                sampled (one per section).
         """
-        device = x_0.device
-        n_cells = x_0.shape[0]
+        was_unbatched = x_0.dim() == 2
+        if was_unbatched:
+            x_0 = x_0.unsqueeze(0)                                    # (1, N, D)
+            if mask is not None:
+                mask = mask.unsqueeze(0)
 
-        # Per-SLICE t: one integer in [1, T] for all cells in this slice.
+        B, N, D = x_0.shape
+        device = x_0.device
+
+        # Per-SECTION t (one integer in [1, T] per batch element).
+        # LUNA: `t_int = torch.randint(1, T+1, size=(bs, 1), ...)`
         t_int = torch.randint(
-            1, self.max_diffusion_steps + 1, size=(1,), device=device
+            1, self.max_diffusion_steps + 1, size=(B,), device=device
         )
 
-        # α̅, σ̅ at this t. Each is a (1,) scalar.
-        a = self.get_alpha_bar(t_int)
-        s = self.get_sigma_bar(t_int)
+        # α̅, σ̅ per section, shaped for broadcast with (B, N, D).
+        a = self.get_alpha_bar(t_int).view(B, 1, 1)
+        s = self.get_sigma_bar(t_int).view(B, 1, 1)
 
-        # Noise with mean removed (preserves translation equivariance).
+        # Noise per section, mean-removed within each section (masked).
         noise = torch.randn_like(x_0)
-        noise = noise - noise.mean(dim=0, keepdim=True)
+        if mask is not None:
+            m = mask.to(noise.dtype).unsqueeze(-1)                    # (B, N, 1)
+            noise = noise * m
+            valid = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+            noise_mean = noise.sum(dim=1, keepdim=True) / valid
+            noise = (noise - noise_mean) * m
+        else:
+            noise = noise - noise.mean(dim=1, keepdim=True)
 
-        # z_t = α̅ · x_0 + σ̅ · ε  (broadcasts (1,) × (n, 2) → (n, 2))
+        # z_t = α̅ · x_0 + σ̅ · ε
         z_t = a * x_0 + s * noise
 
-        t_float = t_int.float() / float(self.max_diffusion_steps)      # (1,)
-        t_per_cell = t_float.expand(n_cells)                            # (n,)
+        t_float = t_int.float() / float(self.max_diffusion_steps)     # (B,)
+        t_per_cell = t_float.unsqueeze(-1).expand(B, N)               # (B, N)
+
+        if was_unbatched:
+            z_t = z_t.squeeze(0)
+            t_per_cell = t_per_cell.squeeze(0)
+            # t_int kept as (1,) for backward compat
         return z_t, t_per_cell, t_int
 
     # ---- Initial noise (used at sampling start) -----------------------
@@ -174,49 +199,75 @@ class DDPMNoiseModel(nn.Module):
     @torch.no_grad()
     def sample_zs_from_zt_and_pred(
         self,
-        z_t: torch.Tensor,                # (n, spatial_dim)
-        x_0_pred: torch.Tensor,           # (n, spatial_dim)
-        t_int: torch.Tensor,              # scalar
-        s_int: torch.Tensor,              # scalar
+        z_t: torch.Tensor,                # (N, D) OR (B, N, D)
+        x_0_pred: torch.Tensor,           # same shape as z_t
+        t_int: torch.Tensor,              # scalar OR (B,)
+        s_int: torch.Tensor,              # scalar OR (B,) — same shape as t_int
+        mask: Optional[torch.Tensor] = None,  # (B, N) bool — batched only
     ) -> torch.Tensor:
         """Sample z_s ~ p(z_s | z_t, x_0_pred). Direct port of LUNA's
         ``sample_zs_from_zt_and_pred``, with mean-removal on the noise.
+        Supports both single-section (legacy) and parallel-batched
+        (LUNA-equivalent) inputs.
         """
-        device = z_t.device
+        was_unbatched = z_t.dim() == 2
+        if was_unbatched:
+            z_t = z_t.unsqueeze(0)
+            x_0_pred = x_0_pred.unsqueeze(0)
+            if mask is not None:
+                mask = mask.unsqueeze(0)
+            # t_int / s_int might be scalar or (1,); make them (1,)
+            if t_int.dim() == 0:
+                t_int = t_int.unsqueeze(0)
+            if s_int.dim() == 0:
+                s_int = s_int.unsqueeze(0)
 
-        # log α̅ at t and s.
-        log_a_t = self.get_log_alpha_bar(t_int)
-        log_a_s = self.get_log_alpha_bar(s_int)
+        B, N, D = z_t.shape
+
+        # log α̅ at t and s — shape (B,) → (B, 1, 1) for broadcast.
+        log_a_t = self.get_log_alpha_bar(t_int).view(B, 1, 1)
+        log_a_s = self.get_log_alpha_bar(s_int).view(B, 1, 1)
 
         # α̅_t / α̅_s, and its square (LUNA's `get_alpha_pos_ts(_sq)`).
         alpha_ts = torch.exp(log_a_t - log_a_s)
         alpha_ts_sq = torch.exp(2.0 * log_a_t - 2.0 * log_a_s)
 
         # σ²_s / σ²_t = exp(log σ²_s - log σ²_t).
-        # σ²_t := -expm1(2 log α̅_t).
         s2_s = -torch.expm1(2.0 * log_a_s).clamp(min=1e-30)
         s2_t = -torch.expm1(2.0 * log_a_t).clamp(min=1e-30)
         sigma_sq_ratio = torch.exp(torch.log(s2_s) - torch.log(s2_t))
 
         # μ = z_t_prefactor · z_t + positions_prefactor · x_0_pred.
         z_t_prefactor = alpha_ts * sigma_sq_ratio
-        a_s = self.get_alpha_bar(s_int)
+        a_s = self.get_alpha_bar(s_int).view(B, 1, 1)
         positions_prefactor = a_s * (1.0 - alpha_ts_sq * sigma_sq_ratio)
         mu = z_t_prefactor * z_t + positions_prefactor * x_0_pred
 
-        # Noise term: scale = √((σ̅_t - σ̅_s · α̅²_{t,s}) · σ²_s/σ²_t).
-        # LUNA's exact arithmetic; see noise_model.py:411-417.
-        sigma_bar_t = self.get_sigma_bar(t_int)
-        sigma_bar_s = self.get_sigma_bar(s_int)
+        # Noise term scale per section.
+        sigma_bar_t = self.get_sigma_bar(t_int).view(B, 1, 1)
+        sigma_bar_s = self.get_sigma_bar(s_int).view(B, 1, 1)
         sigma2_t_s = (sigma_bar_t - sigma_bar_s * alpha_ts_sq).clamp(min=0.0)
         noise_prefactor_sq = sigma2_t_s * sigma_sq_ratio
         noise_prefactor = torch.sqrt(noise_prefactor_sq.clamp(min=0.0))
 
-        # Fresh noise, mean-removed.
+        # Fresh noise per section, mean-removed (masked).
         noise = torch.randn_like(z_t)
-        noise = noise - noise.mean(dim=0, keepdim=True)
+        if mask is not None:
+            m = mask.to(noise.dtype).unsqueeze(-1)
+            noise = noise * m
+            valid = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+            noise_mean = noise.sum(dim=1, keepdim=True) / valid
+            noise = (noise - noise_mean) * m
+        else:
+            noise = noise - noise.mean(dim=1, keepdim=True)
 
         z_s = mu + noise_prefactor * noise
+        if mask is not None:
+            # zero padding (cosmetic — caller centers anyway)
+            z_s = z_s * mask.to(z_s.dtype).unsqueeze(-1)
+
+        if was_unbatched:
+            z_s = z_s.squeeze(0)
         return z_s
 
 
@@ -263,8 +314,21 @@ class DiffusionDDPM(nn.Module):
         self.pairwise_dist_max_cells = int(pairwise_dist_max_cells)
 
     @staticmethod
-    def _center(x: torch.Tensor) -> torch.Tensor:
-        return x - x.mean(dim=0, keepdim=True)
+    def _center(x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Subtract the per-section mean. Works on (N, D) or (B, N, D).
+        When `mask` is given (only with (B, N, D)), only counts valid
+        cells in the mean and zeros out padding cells in the output.
+        """
+        if x.dim() == 2:
+            return x - x.mean(dim=0, keepdim=True)
+        # (B, N, D)
+        if mask is None:
+            return x - x.mean(dim=1, keepdim=True)
+        m = mask.to(x.dtype).unsqueeze(-1)
+        x = x * m
+        valid = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+        mean = x.sum(dim=1, keepdim=True) / valid
+        return (x - mean) * m
 
     # ---- Training step ------------------------------------------------
 
@@ -274,56 +338,86 @@ class DiffusionDDPM(nn.Module):
         cell_embed: torch.Tensor,
         section_embed: Optional[torch.Tensor] = None,
         k_target: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
-        """One training step of LUNA's DDPM."""
+        """One training step of LUNA's DDPM.
+
+        Supports both single-section ``z_1: (N, D)`` and
+        parallel-batched ``z_1: (B, N, D)`` inputs. In the batched
+        path, ``mask: (B, N)`` is required and isolates each section
+        from the others — equivalent to LUNA's ``to_dense_batch +
+        node_mask`` setup. Loss is the mean over sections of each
+        section's masked pairwise-distance MSE — matches LUNA's
+        ``metrics.loss_function.LossFunction.compute_loss``.
+        """
+        was_unbatched = z_1.dim() == 2
+        if was_unbatched:
+            z_1 = z_1.unsqueeze(0)
+            cell_embed = cell_embed.unsqueeze(0)
+            if mask is not None:
+                mask = mask.unsqueeze(0)
+
+        B, N, D = z_1.shape
         device = z_1.device
-        n_cells = z_1.shape[0]
 
-        # Centre targets (matches LUNA's `center_positions` inside `.mask()`).
+        # Centre targets per section (masked).
         if self.translation_equivariant:
-            z_1 = self._center(z_1)
+            z_1 = self._center(z_1, mask=mask)
 
-        # Forward noising: z_t = α̅ · z_1 + σ̅ · ε.
-        z_t, t_per_cell, t_int = self.noise_model.apply_noise(z_1)
+        # Forward noising: z_t = α̅ · z_1 + σ̅ · ε, one t per section.
+        z_t, t_per_cell, t_int = self.noise_model.apply_noise(z_1, mask=mask)
         if self.translation_equivariant:
-            z_t = self._center(z_t)
+            z_t = self._center(z_t, mask=mask)
 
-        # Predict x_0 from z_t.
+        # Predict x_0. velocity_net handles batched input + mask.
         x_0_pred = self.velocity_net(
-            z_t, t_per_cell, cell_embed, section_embed, k_target
+            z_t, t_per_cell, cell_embed, section_embed, k_target, mask=mask,
         )
         if self.translation_equivariant:
-            x_0_pred = self._center(x_0_pred)
+            x_0_pred = self._center(x_0_pred, mask=mask)
 
-        # Subsample for memory if needed (LUNA itself doesn't subsample;
-        # cortex slices < 8k fit easily without subsampling).
-        if (
-            self.pairwise_dist_max_cells > 0
-            and n_cells > self.pairwise_dist_max_cells
-        ):
-            idx = torch.randperm(n_cells, device=device)[
-                : self.pairwise_dist_max_cells
-            ]
-            x_pred_sub = x_0_pred[idx]
-            z_1_sub = z_1[idx]
+        # Per-section pairwise-distance MSE, then mean across sections.
+        # Uses batched cdist (B, N, N) with mask_2d to restrict the loss
+        # to real-real pairs only (real-padding and padding-padding pairs
+        # are excluded from both numerator and denominator).
+        d_pred = torch.cdist(x_0_pred, x_0_pred, p=2.0)               # (B, N, N)
+        d_true = torch.cdist(z_1, z_1, p=2.0)                         # (B, N, N)
+        sq_err = (d_pred - d_true) ** 2                                # (B, N, N)
+
+        if mask is not None:
+            # mask_2d[b, i, j] = mask[b, i] AND mask[b, j]
+            m1 = mask.unsqueeze(2)                                    # (B, N, 1)
+            m2 = mask.unsqueeze(1)                                    # (B, 1, N)
+            mask_2d = (m1 & m2).to(sq_err.dtype)                      # (B, N, N)
+            sq_err = sq_err * mask_2d
+            valid_pairs = mask_2d.sum(dim=(1, 2)).clamp_min(1.0)      # (B,)
+            loss_per_section = sq_err.sum(dim=(1, 2)) / valid_pairs   # (B,)
         else:
-            x_pred_sub = x_0_pred
-            z_1_sub = z_1
+            loss_per_section = sq_err.mean(dim=(1, 2))                # (B,)
 
-        d_pred = torch.cdist(x_pred_sub, x_pred_sub, p=2.0)
-        d_true = torch.cdist(z_1_sub, z_1_sub, p=2.0)
-        loss = torch.mean((d_pred - d_true) ** 2)
+        # LUNA: `mse_loss = torch.mean(stacked_losses)` — mean across sections.
+        loss = loss_per_section.mean()
+
+        # Diagnostics — average across sections.
+        if mask is not None:
+            m1d = mask.to(z_1.dtype).unsqueeze(-1)
+            z_1_norm_per_cell = z_1.norm(dim=-1) * mask.to(z_1.dtype)
+            x_norm_per_cell = x_0_pred.norm(dim=-1) * mask.to(x_0_pred.dtype)
+            valid = mask.to(z_1.dtype).sum().clamp_min(1.0)
+            u_norm = (z_1_norm_per_cell.sum() / valid).item()
+            x_hat_0_norm = (x_norm_per_cell.sum() / valid).item()
+        else:
+            u_norm = z_1.norm(dim=-1).mean().item()
+            x_hat_0_norm = x_0_pred.norm(dim=-1).mean().item()
 
         metrics = {
             "fm_loss": loss.item(),
             "fm_pairwise_dist_mse": loss.item(),
             "fm_velocity_mse": 0.0,
             "v_norm": 0.0,
-            "u_norm": (
-                z_1.std(dim=0).mean().item() * math.sqrt(self.spatial_dim)
-            ),
-            "x_hat_0_norm": x_0_pred.norm(dim=-1).mean().item(),
-            "t_int": int(t_int.item()),
+            "u_norm": u_norm,
+            "x_hat_0_norm": x_hat_0_norm,
+            "t_int": float(t_int.float().mean().item()),
         }
         return loss, metrics
 
@@ -337,41 +431,65 @@ class DiffusionDDPM(nn.Module):
         k_target: Optional[torch.Tensor] = None,
         n_steps: Optional[int] = None,   # ignored — uses noise_model.T
         solver: Optional[str] = None,    # ignored — DDPM reverse is the path
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """LUNA-style stochastic reverse process. Iterate T=1000 steps
         from t=T down to t=1, each step predicting x_0 and sampling
         z_{t-1} from N(μ, σ² I). Final z_0 is the prediction.
+
+        Supports both single-section ``cell_embed: (N, d)`` and
+        parallel-batched ``cell_embed: (B, N, d)`` inputs. In the
+        batched path, ``mask: (B, N)`` isolates each section from the
+        others — equivalent to LUNA's ``to_dense_batch + node_mask``.
         """
         device = cell_embed.device
-        n_cells = cell_embed.shape[0]
         T = self.noise_model.max_diffusion_steps
 
-        # Start from z_T ~ N(0, I), mean-removed.
-        z_t = self.noise_model.sample_limit_dist(n_cells, self.spatial_dim, device)
+        was_unbatched = cell_embed.dim() == 2
+        if was_unbatched:
+            n_cells = cell_embed.shape[0]
+            z_t = self.noise_model.sample_limit_dist(n_cells, self.spatial_dim, device)
+        else:
+            B, N, _ = cell_embed.shape
+            # Per-section initial noise z_T ~ N(0, I), mean-removed (masked).
+            z_t = torch.randn(B, N, self.spatial_dim, device=device)
+            if mask is not None:
+                m = mask.to(z_t.dtype).unsqueeze(-1)
+                z_t = z_t * m
+                valid = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+                z_t = (z_t - z_t.sum(dim=1, keepdim=True) / valid) * m
+            else:
+                z_t = z_t - z_t.mean(dim=1, keepdim=True)
 
         for t in range(T, 0, -1):
             s = t - 1
-            t_int = torch.tensor(t, dtype=torch.long, device=device)
-            s_int = torch.tensor(s, dtype=torch.long, device=device)
+            if was_unbatched:
+                t_int = torch.tensor(t, dtype=torch.long, device=device)
+                s_int = torch.tensor(s, dtype=torch.long, device=device)
+                t_per_cell = (t_int.float() / float(T)).expand(z_t.shape[0])
+            else:
+                t_int = torch.full((B,), t, dtype=torch.long, device=device)
+                s_int = torch.full((B,), s, dtype=torch.long, device=device)
+                t_per_cell = (t_int.float() / float(T)).unsqueeze(-1).expand(B, N)
 
             # Predict x_0 from the current z_t.
-            t_per_cell = (t_int.float() / float(T)).expand(n_cells)
             x_0_pred = self.velocity_net(
-                z_t, t_per_cell, cell_embed, section_embed, k_target
+                z_t, t_per_cell, cell_embed, section_embed, k_target,
+                mask=mask if not was_unbatched else None,
             )
             if self.translation_equivariant:
-                x_0_pred = self._center(x_0_pred)
+                x_0_pred = self._center(x_0_pred, mask=None if was_unbatched else mask)
 
-            # Sample z_{t-1} ~ N(μ, σ² I). Matches LUNA's loop: the
-            # call is unconditional. At s=0, the math collapses to
+            # Sample z_{t-1} ~ N(μ, σ² I). At s=0, the math collapses to
             # z_{0} = x_0_pred (the position prefactor goes to 1, noise
             # scale goes to 0) — see the σ_sq_ratio computation, which
             # produces ~0 at s=0 because σ²_s = -expm1(0) = 0.
             z_t = self.noise_model.sample_zs_from_zt_and_pred(
-                z_t, x_0_pred, t_int, s_int
+                z_t, x_0_pred, t_int, s_int,
+                mask=mask if not was_unbatched else None,
             )
 
             if self.translation_equivariant:
-                z_t = self._center(z_t)
+                z_t = self._center(z_t, mask=None if was_unbatched else mask)
 
         return z_t

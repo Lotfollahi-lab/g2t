@@ -118,8 +118,10 @@ class _LinearAttention(nn.Module):
         self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
         self.to_out = nn.Linear(dim, dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, D)
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # x: (B, N, D),  mask: (B, N) bool — True for valid cells
         B, N, D = x.shape
         H, Hd = self.heads, self.head_dim
 
@@ -129,6 +131,17 @@ class _LinearAttention(nn.Module):
         # Positive feature map.
         q = F.elu(q) + 1.0
         k = F.elu(k) + 1.0
+
+        # Mask padding cells out of the K^T·V and K^T·1 reductions so
+        # they don't contribute to any query's output. Q at padding
+        # positions still produces an output; we mask that downstream
+        # at the caller. The result is that padding cells in batch
+        # element b never affect real cells in batch element b' (or
+        # any other real cell).
+        if mask is not None:
+            m = mask.to(k.dtype).unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
+            k = k * m
+            v = v * m
 
         # K^T · V  →  (B, H, Hd, Hd). The "key-value summary" reused
         # across all queries — this is where linear attention's
@@ -173,8 +186,10 @@ class _LinearAttentionBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.dropout(self.attn(self.norm1(x)))
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = x + self.dropout(self.attn(self.norm1(x), mask=mask))
         x = x + self.dropout(self.ff(self.norm2(x)))
         return x
 
@@ -196,13 +211,23 @@ class PositionsMLP(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, pos: torch.Tensor) -> torch.Tensor:
-        # pos: (n, spatial_dim)
-        norm = torch.norm(pos, dim=-1, keepdim=True)             # (n, 1)
-        new_norm = self.mlp(norm)                                 # (n, 1)
+    def forward(
+        self, pos: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # pos: (B, N, spatial_dim), mask: (B, N) bool or None
+        norm = torch.norm(pos, dim=-1, keepdim=True)             # (B, N, 1)
+        new_norm = self.mlp(norm)                                 # (B, N, 1)
         new_pos = pos * new_norm / (norm + self.eps)
-        # Translation equivariance: subtract the slice centroid.
-        new_pos = new_pos - new_pos.mean(dim=0, keepdim=True)
+        # Translation equivariance: subtract the slice centroid,
+        # masked so padding cells don't bias the mean.
+        if mask is not None:
+            m = mask.to(new_pos.dtype).unsqueeze(-1)              # (B, N, 1)
+            new_pos = new_pos * m
+            valid_count = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean_pos = new_pos.sum(dim=1, keepdim=True) / valid_count
+            new_pos = (new_pos - mean_pos) * m                    # re-mask
+        else:
+            new_pos = new_pos - new_pos.mean(dim=1, keepdim=True)
         return new_pos
 
 
@@ -221,10 +246,17 @@ class PositionNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(1))
         self.eps = eps
 
-    def forward(self, pos: torch.Tensor) -> torch.Tensor:
-        # pos: (n, spatial_dim)
-        norm = torch.norm(pos, dim=-1, keepdim=True)             # (n, 1)
-        mean_norm = norm.mean(dim=0, keepdim=True)                # (1, 1)
+    def forward(
+        self, pos: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # pos: (B, N, spatial_dim), mask: (B, N) bool or None
+        norm = torch.norm(pos, dim=-1, keepdim=True)             # (B, N, 1)
+        if mask is not None:
+            m = mask.to(norm.dtype).unsqueeze(-1)
+            valid_count = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean_norm = (norm * m).sum(dim=1, keepdim=True) / valid_count
+        else:
+            mean_norm = norm.mean(dim=1, keepdim=True)            # (B, 1, 1)
         return self.weight * pos / (mean_norm + self.eps)
 
 
@@ -307,31 +339,35 @@ class _LunaSelfAttention(nn.Module):
 
     def forward(
         self,
-        node_features: torch.Tensor,   # (n, node_dim)
-        time_features: torch.Tensor,   # (n, time_dim) -- already broadcast per cell
-        positions: torch.Tensor,       # (n, spatial_dim)
+        node_features: torch.Tensor,   # (B, N, node_dim)
+        time_features: torch.Tensor,   # (B, N, time_dim) -- broadcast per cell
+        positions: torch.Tensor,       # (B, N, spatial_dim)
+        mask: Optional[torch.Tensor] = None,  # (B, N) bool
     ):
         # 1. Direction of position → delta
         norm = torch.norm(positions, dim=-1, keepdim=True).clamp_min(1e-7)
-        direction = positions / norm                       # (n, spatial_dim)
-        delta = self.pos_dir_mlp(direction)                # (n, delta_dim)
+        direction = positions / norm                        # (B, N, spatial_dim)
+        delta = self.pos_dir_mlp(direction)                 # (B, N, delta_dim)
 
         # 2. Concat + project (mirrors LUNA's `transform_node_features`).
-        node_lin = self.lin_node(node_features)            # (n, node_dim)
+        node_lin = self.lin_node(node_features)             # (B, N, node_dim)
         concat = torch.cat([node_lin, delta, time_features], dim=-1)
-        h = self.concat_proj(concat)                       # (n, node_dim)
+        h = self.concat_proj(concat)                        # (B, N, node_dim)
 
-        # 3. LinearAttentionTransformer over the n_cells sequence.
-        # Expects (batch, seq_len, dim) so add a batch dim.
-        h = h.unsqueeze(0)                                  # (1, n, node_dim)
-        attn_out = self.attention(h)                        # (1, n, node_dim)
-        attn_out = attn_out.squeeze(0)                     # (n, node_dim)
+        # 3. Linear-attention transformer block. Mask isolates each
+        # batch element so padding cells don't leak into real cells'
+        # attention (and across-section attention doesn't happen).
+        attn_out = self.attention(h, mask=mask)             # (B, N, node_dim)
 
         # 4. Fresh position from attended features.
-        new_pos = self.feat_to_pos(attn_out)               # (n, spatial_dim)
+        new_pos = self.feat_to_pos(attn_out)                # (B, N, spatial_dim)
+        if mask is not None:
+            # Zero out padding cells' positions so they don't propagate
+            # into downstream PositionNorm / mean computations.
+            new_pos = new_pos * mask.to(new_pos.dtype).unsqueeze(-1)
 
         # Time update.
-        new_time = self.time_update(time_features)         # (n, time_dim)
+        new_time = self.time_update(time_features)          # (B, N, time_dim)
 
         return attn_out, new_time, new_pos
 
@@ -398,18 +434,25 @@ class _LunaTransformerLayer(nn.Module):
         # they flow through the stack.
         self.pos_norm = PositionNorm(eps=1e-8)
 
-    def forward(self, node_features, time_features, positions):
+    def forward(self, node_features, time_features, positions, mask=None):
+        # All tensors are (B, N, *). mask is (B, N) bool or None.
         # Attention with position+time conditioning.
         attn_node, attn_time, new_pos = self.attn(
-            node_features, time_features, positions
+            node_features, time_features, positions, mask=mask
         )
 
         # Position: LUNA replaces the old position with the
         # attention-derived one, then applies PositionNorm. No residual
         # connection on the position stream.
-        new_pos = self.pos_norm(new_pos)
-        # Final mean subtraction for translation equivariance.
-        new_pos = new_pos - new_pos.mean(dim=0, keepdim=True)
+        new_pos = self.pos_norm(new_pos, mask=mask)
+        # Final mean subtraction for translation equivariance (masked).
+        if mask is not None:
+            m = mask.to(new_pos.dtype).unsqueeze(-1)
+            valid_count = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean_pos = (new_pos * m).sum(dim=1, keepdim=True) / valid_count
+            new_pos = (new_pos - mean_pos) * m
+        else:
+            new_pos = new_pos - new_pos.mean(dim=1, keepdim=True)
 
         # Node stream: residual + LN + FFN + residual + LN
         node = self.norm_node_1(node_features + attn_node)
@@ -566,32 +609,59 @@ class LunaTransformerNet(nn.Module):
 
     def forward(
         self,
-        z_t: torch.Tensor,                         # (n, spatial_dim)
-        t: torch.Tensor,                           # (n,) flow time in [0, 1]
-        cell_embed: torch.Tensor,                  # (n, cell_embed_dim)
+        z_t: torch.Tensor,                         # (N, D) OR (B, N, D)
+        t: torch.Tensor,                           # (N,) or (B, N)
+        cell_embed: torch.Tensor,                  # (N, C) or (B, N, C)
         section_embed: Optional[torch.Tensor] = None,  # ignored
         k_target: Optional[torch.Tensor] = None,       # ignored
+        mask: Optional[torch.Tensor] = None,           # (B, N) bool, only with batched input
     ) -> torch.Tensor:
-        n = z_t.shape[0]
+        """Predict x_0 from noisy z_t.
+
+        Accepts both single-section input (``z_t.dim() == 2``) and
+        parallel-batched input (``z_t.dim() == 3``). In the batched
+        path, ``mask`` must be provided to isolate sections from each
+        other (LUNA's `to_dense_batch` + `node_mask` equivalent).
+        """
+        # Normalize input shape to (B, N, *).
+        was_unbatched = z_t.dim() == 2
+        if was_unbatched:
+            z_t = z_t.unsqueeze(0)                                    # (1, N, D)
+            cell_embed = cell_embed.unsqueeze(0)                      # (1, N, C)
+            t = t.unsqueeze(0)                                        # (1, N)
+            if mask is not None:
+                mask = mask.unsqueeze(0)
+
+        B, N = z_t.shape[:2]
 
         # Input projections.
-        node = self.mlp_in_node(cell_embed)                          # (n, node_dim)
-        time = self.mlp_in_time(self.time_embed(t))                  # (n, time_dim)
-        pos = self.mlp_in_pos(z_t)                                   # (n, spatial_dim)
+        node = self.mlp_in_node(cell_embed)                           # (B, N, node_dim)
+        # Time embedding: t shape (B, N) -> sinusoidal (B, N, time_embed_dim)
+        # The sinusoidal embed works on any tensor shape (leading dims preserved).
+        time = self.mlp_in_time(self.time_embed(t))                   # (B, N, time_dim)
+        pos = self.mlp_in_pos(z_t, mask=mask)                         # (B, N, spatial_dim)
 
         # Transformer stack.
         for layer in self.layers:
-            node, time, pos = layer(node, time, pos)
+            node, time, pos = layer(node, time, pos, mask=mask)
 
         # Output stage: norm-modulated position. LUNA's exact recipe.
-        node_out = self.mlp_out_node(node)                           # (n, output_features_dim)
-        norm = torch.norm(pos, dim=-1, keepdim=True)                 # (n, 1)
+        node_out = self.mlp_out_node(node)                            # (B, N, output_features_dim)
+        norm = torch.norm(pos, dim=-1, keepdim=True)                  # (B, N, 1)
         new_norm = self.mlp_out_pos_norm(
             torch.cat([node_out, pos, norm], dim=-1)
-        )                                                              # (n, 1)
+        )                                                              # (B, N, 1)
         new_pos = pos * new_norm / (norm + self.eps)
         # Final translation equivariance — matches LUNA's exact final
-        # step in `models/model.Model.forward`.
-        new_pos = new_pos - new_pos.mean(dim=0, keepdim=True)
+        # step in `models/model.Model.forward`. Masked when batched.
+        if mask is not None:
+            m = mask.to(new_pos.dtype).unsqueeze(-1)
+            valid_count = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean_pos = (new_pos * m).sum(dim=1, keepdim=True) / valid_count
+            new_pos = (new_pos - mean_pos) * m
+        else:
+            new_pos = new_pos - new_pos.mean(dim=1, keepdim=True)
 
+        if was_unbatched:
+            new_pos = new_pos.squeeze(0)
         return new_pos

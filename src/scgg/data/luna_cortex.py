@@ -226,6 +226,22 @@ def _load_split(
                 f"min_cells_per_section={min_cells_per_section}"
             )
             continue
+        # CRITICAL for LUNA-vs-scGG comparability: when the silver was
+        # built from a LUNA bronze CSV via build_h5ad_from_luna_csv,
+        # each h5ad carries `_bronze_row_pos` — the cell's original
+        # row index in the bronze CSV. LUNA's data_module produces a
+        # specific within-section cell ordering after its
+        # `sort_values("cell_section")` pass; that ordering is uniquely
+        # determined by the bronze row order. By sorting each h5ad's
+        # cells by `_bronze_row_pos` here we make scGG's per-section
+        # cell ordering match what LUNA would produce on the bronze
+        # subset for the same section. (Stable sort so the order is
+        # deterministic across runs.)
+        if "_bronze_row_pos" in adata.obs.columns:
+            order = np.argsort(
+                adata.obs["_bronze_row_pos"].to_numpy(), kind="stable"
+            )
+            adata = adata[order].copy()
         adatas.append(adata)
         section_labels.append(f"mouse{mouse}_slice{slice_id}")
         section_counts.append(adata.n_obs)

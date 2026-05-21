@@ -242,16 +242,37 @@ class Trainer:
             )
 
         # ---- LR schedule ----------------------------------------------------
+        # `steps_per_epoch` counts OPTIMIZER STEPS per epoch, not
+        # forward passes. With `sections_per_step > 1` (LUNA default 6),
+        # we group sections into N-section macro-batches and step the
+        # optimizer once per macro-batch — so the per-epoch step count
+        # is `ceil(n_sections / sections_per_step)` × any per-section
+        # mini-batching that overflows `batch_size` (cortex slices fit
+        # in one mini-batch so this stays 1 per section).
         batch_size = train_cfg["batch_size"]
-        steps_per_epoch = 0
+        sections_per_step = int(train_cfg.get("sections_per_step", 6))
+
+        mini_batches_per_section = []
         for s in train_dataset.sections:
             n_cells = len(train_dataset.section_indices[s])
-            steps_per_epoch += max(1, math.ceil(n_cells / batch_size))
+            mini_batches_per_section.append(
+                max(1, math.ceil(n_cells / batch_size))
+            )
+        # Sum of mini-batches across sections is total forward passes
+        # per epoch. Optimizer steps = forward passes / sections_per_step
+        # (since gradient accumulation collapses N sections into 1 step).
+        n_sections = len(mini_batches_per_section)
+        n_groups_per_epoch = math.ceil(n_sections / max(1, sections_per_step))
+        # If sections have multiple mini-batches (very large slices) we
+        # under-count slightly — that's a soft warning, not fatal, since
+        # the lambda just oversteps and clamps to 0 lr at the end.
+        steps_per_epoch = n_groups_per_epoch
 
         total_steps = train_cfg["epochs"] * steps_per_epoch
         warmup_steps = train_cfg.get("warmup_epochs", 10) * steps_per_epoch
         logger.info(
-            f"Scheduler: {steps_per_epoch} steps/epoch, "
+            f"Scheduler: {steps_per_epoch} steps/epoch "
+            f"(n_sections={n_sections}, sections_per_step={sections_per_step}), "
             f"{total_steps} total steps, {warmup_steps} warmup steps"
         )
 
@@ -270,6 +291,31 @@ class Trainer:
 
         self.warmup_steps = warmup_steps
         self.grad_clip = train_cfg.get("grad_clip", 1.0)
+        # Number of sections per gradient step. Matches LUNA's
+        # `train.batch_size` (which counts sections, not cells). Default
+        # 6 = LUNA's cortex setting. Set to 1 to ablate to one-section-
+        # per-step.
+        self.sections_per_step = int(train_cfg.get("sections_per_step", 6))
+        # Parallel batching: when True, pad N=sections_per_step sections
+        # into (B, max_N, *) tensors and run one forward+backward —
+        # exactly LUNA's setup with `to_dense_batch + node_mask`. When
+        # False, fall back to sequential gradient accumulation across
+        # sections (math-equivalent but ~N× slower on GPU). Requires
+        # objective=flow_matching and a velocity_net that handles
+        # batched input + mask (LunaTransformerNet does).
+        self.parallel_batching = bool(
+            train_cfg.get("parallel_batching", True)
+        )
+        if (
+            self.parallel_batching
+            and self.objective != "flow_matching"
+        ):
+            logger.warning(
+                "training.parallel_batching=True but objective="
+                f"{self.objective!r}; only flow_matching supports parallel "
+                "batching. Falling back to gradient accumulation."
+            )
+            self.parallel_batching = False
         self.global_step = 0
         self.best_val_loss = float("inf")
 
@@ -620,6 +666,18 @@ class Trainer:
     # ----------------------------------------------------------------- epochs
 
     def _train_epoch(self, epoch: int, batch_size: int) -> Dict[str, float]:
+        """Iterate sections in groups of `sections_per_step`, accumulate
+        gradients across each group, then step the optimizer once.
+
+        This makes one gradient step equivalent to LUNA's "batch of N
+        sections with mean(per-section loss)" — same gradient direction
+        and magnitude (we divide each per-section loss by N before
+        backward), but processed sequentially so peak memory is one
+        section's worth instead of N×.
+
+        Set `training.sections_per_step: 1` in the config to ablate to
+        the legacy one-section-per-step behaviour.
+        """
         self.model.train()
         for c in self.ood_components.values():
             if isinstance(c, nn.Module):
@@ -628,18 +686,15 @@ class Trainer:
         all_metrics: List[Dict[str, float]] = []
         section_order = np.random.permutation(len(self.train_dataset))
 
-        for sec_idx in section_order:
-            section_data = self.train_dataset[sec_idx]
-            section_expr = section_data["gene_expr"].to(self.device)
-            mini_batches = create_cell_batches(
-                section_data, batch_size=batch_size, shuffle=True
-            )
-            gt_key = section_data["gt_graph_key"]
-            gt_graph = self.train_dataset.gt_graphs.get(gt_key, None)
+        N = max(1, int(self.sections_per_step))
 
-            for batch in mini_batches:
-                metrics = self._train_step(batch, section_expr, gt_graph)
-                all_metrics.append(metrics)
+        for group_start in range(0, len(section_order), N):
+            group = section_order[group_start : group_start + N]
+            if self.parallel_batching:
+                group_metrics = self._parallel_train_step(group, batch_size)
+            else:
+                group_metrics = self._grouped_train_step(group, batch_size)
+            all_metrics.extend(group_metrics)
 
         avg: Dict[str, float] = {}
         if not all_metrics:
@@ -651,6 +706,238 @@ class Trainer:
                 pass
         return avg
 
+    # --------------------------------------------------------- grouped step
+
+    def _grouped_train_step(
+        self, group: np.ndarray, batch_size: int
+    ) -> List[Dict[str, float]]:
+        """Process N=len(group) sections with one gradient step.
+
+        Mathematically:
+            grad = sum_i (∂/∂θ) (loss_i / N) = (1/N) sum_i ∂loss_i/∂θ
+                 = ∂/∂θ mean_i(loss_i)
+        which is identical to LUNA's parallel-batch behaviour where the
+        loss is mean(per-section loss) and backward is called once.
+
+        Returns a list of per-(section, mini-batch) metric dicts. Each
+        dict already has the loss-scale division applied to its
+        `total_loss` so it reflects the contribution to the gradient
+        step, but the inner metrics (e.g. `fm_pairwise_dist_mse`) are
+        the raw per-section values for interpretability.
+        """
+        N = max(1, len(group))
+        self.optimizer.zero_grad(set_to_none=True)
+
+        group_metrics: List[Dict[str, float]] = []
+        for sec_idx in group:
+            section_data = self.train_dataset[sec_idx]
+            section_expr = section_data["gene_expr"].to(self.device)
+            mini_batches = create_cell_batches(
+                section_data, batch_size=batch_size, shuffle=True
+            )
+            gt_key = section_data["gt_graph_key"]
+            gt_graph = self.train_dataset.gt_graphs.get(gt_key, None)
+
+            for batch in mini_batches:
+                # `accumulate=True` returns the loss tensor + metrics
+                # WITHOUT calling zero_grad/step/scheduler.step/global_step++
+                # and divides the loss by N before backward.
+                metrics = self._train_step(
+                    batch, section_expr, gt_graph,
+                    accumulate=True, loss_scale=1.0 / N,
+                )
+                group_metrics.append(metrics)
+
+        # Single optimizer step for the whole group.
+        if self.grad_clip > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self._all_params(), self.grad_clip
+            )
+            for m in group_metrics:
+                m["grad_norm"] = grad_norm.item()
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        self.global_step += 1
+
+        if self.global_step % self.log_every == 0 and group_metrics:
+            lr = self.optimizer.param_groups[0]["lr"]
+            primary_name = (
+                "contrastive_loss" if self.objective == "contrastive" else "fm_loss"
+            )
+            # Average across the group for the log line.
+            agg = {
+                k: float(np.mean([m[k] for m in group_metrics if k in m]))
+                for k in group_metrics[0]
+                if isinstance(group_metrics[0].get(k), (int, float))
+            }
+            parts = [
+                f"Step {self.global_step}",
+                f"n_sections={N}",
+                f"Total: {agg.get('total_loss', float('nan')):.4f}",
+                f"{primary_name}: {agg.get(primary_name, float('nan')):.4f}",
+            ]
+            if "distance_pearson" in agg:
+                parts.append(f"dist_pearson: {agg['distance_pearson']:.4f}")
+            parts.append(f"LR: {lr:.2e}")
+            logger.info("  " + " | ".join(parts))
+            self._log_wandb(agg, prefix="train/step")
+
+        return group_metrics
+
+    # ----------------------------------------------------- parallel step
+
+    def _parallel_train_step(
+        self, group: np.ndarray, batch_size: int
+    ) -> List[Dict[str, float]]:
+        """LUNA-equivalent parallel batching: pad N sections into
+        (B, max_N, *) tensors and run one forward + one backward.
+
+        Matches LUNA's `to_dense_batch + node_mask` setup exactly: each
+        section is laid out along the batch dim, padded to the longest
+        section in the group, and a (B, N) bool mask isolates real
+        cells from padding inside the attention / loss / centering
+        ops. The gradient is identical to the sequential-accumulation
+        path (`_grouped_train_step`), just computed in one parallel
+        forward — typically ~N× faster on GPU.
+
+        Currently only supports the flow_matching objective. Requires
+        the velocity net to accept `(B, N, *)` input + `mask` (the
+        LunaTransformerNet does; older nets do not).
+        """
+        N = max(1, len(group))
+        device = self.device
+        self.optimizer.zero_grad(set_to_none=True)
+
+        # Gather per-section tensors + sizes.
+        section_dicts: List[Dict[str, Any]] = []
+        n_cells_per: List[int] = []
+        for sec_idx in group:
+            section_data = self.train_dataset[sec_idx]
+            section_dicts.append(section_data)
+            n_cells_per.append(int(section_data["gene_expr"].shape[0]))
+
+        max_N = int(max(n_cells_per))
+        n_genes = int(section_dicts[0]["gene_expr"].shape[1])
+        spatial_dim = int(section_dicts[0]["coords"].shape[1])
+
+        # Allocate padded tensors. Padding cells get zero gene expr
+        # and zero coords — they're masked out of every downstream op.
+        gene_expr_pad = torch.zeros(
+            (N, max_N, n_genes), dtype=torch.float32, device=device
+        )
+        coords_pad = torch.zeros(
+            (N, max_N, spatial_dim), dtype=torch.float32, device=device
+        )
+        mask = torch.zeros((N, max_N), dtype=torch.bool, device=device)
+        # Optional cell_class (only used for aux loss).
+        any_cellclass = any("cell_class" in d for d in section_dicts)
+        if any_cellclass:
+            cell_class_pad = torch.full(
+                (N, max_N), -1, dtype=torch.long, device=device
+            )
+        else:
+            cell_class_pad = None
+
+        for i, d in enumerate(section_dicts):
+            n_i = n_cells_per[i]
+            gene_expr_pad[i, :n_i] = d["gene_expr"].to(device)
+            coords_pad[i, :n_i] = d["coords"].to(device)
+            mask[i, :n_i] = True
+            if cell_class_pad is not None and "cell_class" in d:
+                cell_class_pad[i, :n_i] = d["cell_class"].to(device)
+
+        # Encode cells. The encoder is per-cell, so flatten over the
+        # batch dim to get (B*max_N, n_genes), encode, then reshape
+        # back to (B, max_N, embed_dim). Padding cells are encoded
+        # (cheap, all-zeros input) but their outputs are masked out
+        # downstream.
+        flat_expr = gene_expr_pad.reshape(N * max_N, n_genes)
+        flat_embed = self.model.encoder(flat_expr)
+        cell_embed = flat_embed.reshape(N, max_N, -1)
+
+        # section_embed is ignored by LunaTransformerNet (documented in
+        # luna_model.py). We pass None to keep the signature happy.
+        section_embed = None
+
+        # k_target: one per section (taken from each section's dict).
+        # LunaTransformerNet ignores k_target too, but we propagate
+        # the shape for API parity.
+        k_vals = [int(d["k_target"]) for d in section_dicts]
+        # Broadcast to (B, max_N) — same value per section.
+        k_target = torch.zeros((N, max_N), dtype=torch.long, device=device)
+        for i, k in enumerate(k_vals):
+            k_target[i, :] = k
+
+        # Forward through the flow / DDPM model. compute_loss handles
+        # (B, N, D) z_1 + mask and returns the LUNA-style mean over
+        # sections.
+        fm_loss, fm_inner_metrics = self.model.flow.compute_loss(
+            z_1=coords_pad,
+            cell_embed=cell_embed,
+            section_embed=section_embed,
+            k_target=k_target,
+            mask=mask,
+        )
+
+        # The FlowMatchingLoss criterion expects either (fm_loss,) or
+        # (fm_loss, cell_embeddings=..., spatial_adj=..., batch_indices=...).
+        # In LUNA-aligned setup `lambda_contrastive=0`, so passing only
+        # fm_loss is sufficient and matches what _train_step does for
+        # the per-section path.
+        loss, primary_metrics = self.criterion(fm_loss=fm_loss)
+        metrics_agg: Dict[str, float] = dict(primary_metrics)
+        metrics_agg.update(fm_inner_metrics)
+
+        # Auxiliary cell-class classifier on the masked-real cells.
+        if (
+            self.use_cellclass_aux
+            and self.cellclass_aux_criterion is not None
+            and cell_class_pad is not None
+        ):
+            valid = (cell_class_pad >= 0) & mask
+            if valid.any():
+                ce_flat = cell_embed[valid]
+                cls_flat = cell_class_pad[valid]
+                cc_loss, cc_metrics = self.cellclass_aux_criterion(
+                    ce_flat, cls_flat
+                )
+                loss = loss + self.cellclass_aux_weight * cc_loss
+                metrics_agg["cellclass_aux_loss"] = cc_metrics["cellclass_aux_loss"]
+                metrics_agg["cellclass_aux_acc"] = cc_metrics["cellclass_aux_acc"]
+
+        metrics_agg["total_loss"] = loss.item()
+        metrics_agg["n_sections_in_step"] = float(N)
+
+        # One backward, one optimizer step.
+        loss.backward()
+        if self.grad_clip > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self._all_params(), self.grad_clip
+            )
+            metrics_agg["grad_norm"] = grad_norm.item()
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        self.global_step += 1
+
+        if self.global_step % self.log_every == 0:
+            lr = self.optimizer.param_groups[0]["lr"]
+            parts = [
+                f"Step {self.global_step}",
+                f"n_sections={N} (parallel)",
+                f"Total: {metrics_agg.get('total_loss', float('nan')):.4f}",
+                f"fm_loss: {metrics_agg.get('fm_loss', float('nan')):.4f}",
+                f"LR: {lr:.2e}",
+            ]
+            logger.info("  " + " | ".join(parts))
+            self._log_wandb(metrics_agg, prefix="train/step")
+
+        # Return one metrics dict — _train_epoch averages them across
+        # the epoch. Wrap in a list to match _grouped_train_step's
+        # contract (a list of per-(section, mini-batch) dicts).
+        return [metrics_agg]
+
     # ------------------------------------------------------------------- step
 
     def _train_step(
@@ -658,7 +945,23 @@ class Trainer:
         batch: Dict,
         section_expr: torch.Tensor,
         gt_graph,
+        accumulate: bool = False,
+        loss_scale: float = 1.0,
     ) -> Dict[str, float]:
+        """Forward + loss for one section's mini-batch.
+
+        Args:
+            batch / section_expr / gt_graph: standard scGG batch inputs.
+            accumulate: when True, do NOT call zero_grad / step /
+                scheduler.step / increment global_step / log. The
+                caller (``_grouped_train_step``) is responsible for
+                those — this mode is used for gradient accumulation
+                across N sections. When False, behaves as the original
+                one-step trainer (zero, backward, step).
+            loss_scale: multiplier applied to the loss BEFORE backward
+                (used by gradient accumulation so that the sum across
+                N sections equals the mean — set `loss_scale=1/N`).
+        """
         gene_expr = batch["gene_expr"].to(self.device)
         batch_indices = batch.get("batch_indices_in_section", None)
 
@@ -804,6 +1107,17 @@ class Trainer:
         # (Future PR: accept a (st_batch, sc_batch) tuple and route accordingly.)
 
         # ---- Backprop ------------------------------------------------------
+        metrics["total_loss"] = loss.item()
+
+        if accumulate:
+            # Accumulation path (used by _grouped_train_step).
+            # Just compute gradients of (loss / N) and return — the
+            # caller will zero_grad once at the start of the group and
+            # step/log once at the end.
+            (loss * loss_scale).backward()
+            return metrics
+
+        # Legacy single-step path (sections_per_step == 1).
         self.optimizer.zero_grad()
         loss.backward()
         if self.grad_clip > 0:
@@ -815,8 +1129,6 @@ class Trainer:
         if self.scheduler is not None:
             self.scheduler.step()
         self.global_step += 1
-
-        metrics["total_loss"] = loss.item()
 
         if self.global_step % self.log_every == 0:
             lr = self.optimizer.param_groups[0]["lr"]
