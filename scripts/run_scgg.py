@@ -7,12 +7,15 @@ under ``scgg/src/{models,utils,metrics,datasets,configs}``.
 
 Flow on a normal invocation::
 
-    python scripts/run_luna_cortex_benchmark.py \\
+    python scripts/run_scgg.py \\
         --data_dir /nfs/team361/sb75/DATASETS/silver/mmc_luna \\
         --wandb_run_name scgg_luna_baseline
 
-    1. Discover per-slice h5ad files under --data_dir, split by mouse
-       (Mouse 1 -> train, Mouse 2 -> test).
+    1. Discover h5ad files under --data_dir, splitting on filename
+       suffix: ``*_train.h5ad`` -> training, ``*_test.h5ad`` -> held
+       out for inference. Layout produced by
+       ``build_h5ad_from_luna_csv.py``; works for any dataset (cortex,
+       ABC, CNS, ...).
     2. Materialise LUNA-format train.csv + test.csv under the run dir.
     3. Invoke the vendored LUNA (``scgg/src/main.py``) as a subprocess
        with Hydra overrides — same Python interpreter, same env.
@@ -70,11 +73,6 @@ _VENDORED_LUNA_SRC = _REPO_ROOT / "src"
 # path, mirroring the prior behaviour.
 _ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
 
-# Cortex silver-file naming. Accepts both old and new prefixes.
-_SLICE_RE = re.compile(
-    r"^(?:mmc|merfish_mouse_cortex)_mouse(?P<mouse>\d+)_slice(?P<slice>\d+)\.h5ad$"
-)
-
 # LUNA's PyTorch-Lightning checkpoint filename pattern: ``epoch=NNN.ckpt``.
 _EPOCH_RE = re.compile(r"epoch=(\d+)")
 
@@ -82,31 +80,42 @@ _EPOCH_RE = re.compile(r"epoch=(\d+)")
 # ---------------------------------------------------------------------------
 # h5ad discovery + LUNA-format CSV materialisation
 # ---------------------------------------------------------------------------
+#
+# Silver layout produced by ``build_h5ad_from_luna_csv.py``:
+#   <silver_dir>/<section>_train.h5ad     <- training cells
+#   <silver_dir>/<section>_test.h5ad      <- held-out test cells
+# Discovery here is suffix-based — works for any dataset, no
+# cortex-specific filename regex needed.
 
 
-def _enumerate_slice_files(silver_dir: Path) -> List[Tuple[int, int, Path]]:
-    """Return (mouse_id, slice_id, path) tuples for each cortex h5ad."""
-    out: List[Tuple[int, int, Path]] = []
-    for p in sorted(silver_dir.iterdir()):
-        m = _SLICE_RE.match(p.name)
-        if not m:
-            continue
-        out.append((int(m["mouse"]), int(m["slice"]), p))
-    return out
+def _discover_split_files(silver_dir: Path, split: str) -> List[Path]:
+    """Return sorted ``*_{split}.h5ad`` paths under ``silver_dir``."""
+    if split not in ("train", "test"):
+        raise ValueError(f"split must be 'train' or 'test'; got {split!r}")
+    return sorted(silver_dir.glob(f"*_{split}.h5ad"))
 
 
-def _split_by_mouse(
-    files: List[Tuple[int, int, Path]], mouse_id: int,
-) -> List[Tuple[int, int, Path]]:
-    return [f for f in files if f[0] == mouse_id]
+def _section_label_from_filename(path: Path) -> str:
+    """Filename-stem fallback for section label. Strips ``_train`` /
+    ``_test``."""
+    stem = path.stem
+    for suf in ("_train", "_test"):
+        if stem.endswith(suf):
+            return stem[: -len(suf)]
+    return stem
 
 
 def _build_luna_csv(
-    files: List[Tuple[int, int, Path]],
+    files: List[Path],
     out_csv: Path,
     log2_normalize: bool = False,
 ) -> Dict[str, object]:
-    """Concatenate per-slice h5ads into one LUNA-format CSV.
+    """Concatenate per-section h5ads into one LUNA-format CSV.
+
+    Each file in ``files`` is one section. The section label comes from
+    the h5ad's ``obs['cell_section']`` (must be uniform per file); if
+    missing or non-uniform, falls back to the filename stem with the
+    ``_train`` / ``_test`` suffix stripped.
 
     LUNA expects: gene columns first (positions ``0..n_genes-1``), then
     ``coord_X``, ``coord_Y``, ``cell_section``, ``cell_class``. Index =
@@ -120,8 +129,7 @@ def _build_luna_csv(
     Within-section row order is reconstructed from each cell's
     ``_bronze_row_pos`` (stamped by ``build_h5ad_from_luna_csv.py``)
     so LUNA's unstable ``sort_values("cell_section")`` produces the
-    same post-sort ordering as it would on the bronze CSV. This is
-    what makes LUNA-on-h5ad ≡ LUNA-on-bronze for ablations / unit tests.
+    same post-sort ordering as it would on the bronze CSV.
     """
     import anndata as ad
     import scipy.sparse as sp
@@ -135,7 +143,7 @@ def _build_luna_csv(
     per_section_dfs: List[pd.DataFrame] = []
     has_bronze_pos = True
 
-    for mouse, slice_id, path in files:
+    for path in files:
         adata = ad.read_h5ad(path)
         X = adata.X
         if sp.issparse(X):
@@ -152,7 +160,22 @@ def _build_luna_csv(
                 f"{len(gene_names)} genes, got {adata.n_vars}"
             )
 
-        section_label = f"mouse{mouse}_slice{slice_id}"
+        # Section label: prefer obs['cell_section'] (preserved by
+        # build_h5ad_from_luna_csv); fall back to filename stem.
+        if "cell_section" in adata.obs.columns:
+            uniq = adata.obs["cell_section"].astype(str).unique()
+            if len(uniq) == 1:
+                section_label = str(uniq[0])
+            else:
+                section_label = _section_label_from_filename(path)
+                logger.warning(
+                    f"  {path.name}: obs['cell_section'] has "
+                    f"{len(uniq)} distinct values; using filename "
+                    f"label {section_label!r}"
+                )
+        else:
+            section_label = _section_label_from_filename(path)
+
         cell_class = (
             adata.obs["cell_class"].astype(str).values
             if "cell_class" in adata.obs.columns
@@ -326,7 +349,8 @@ def run_benchmark(
     log2_normalize: bool = False,
     extra_overrides: Optional[List[str]] = None,
 ) -> Dict[str, float]:
-    """Train vendored LUNA on Mouse 1, evaluate on Mouse 2.
+    """Train vendored LUNA on ``*_train.h5ad`` files, evaluate on
+    ``*_test.h5ad`` files, under a single silver directory.
 
     Returns the aggregated metrics dict (same shape as
     ``scgg.evaluation.luna_metrics.aggregate_slices``).
@@ -367,17 +391,21 @@ def run_benchmark(
         head = pd.read_csv(train_csv, nrows=1, index_col=0)
         n_genes = len(head.columns) - 4  # coord_X, coord_Y, cell_section, cell_class
     else:
-        files = _enumerate_slice_files(data_path)
-        train_files = _split_by_mouse(files, 1)
-        test_files = _split_by_mouse(files, 2)
+        # Suffix-based split: any *_train.h5ad is for training,
+        # *_test.h5ad is held out for inference. Works for any silver
+        # dir produced by build_h5ad_from_luna_csv.
+        train_files = _discover_split_files(data_path, "train")
+        test_files = _discover_split_files(data_path, "test")
         logger.info(
             f"Silver dir: {data_path} "
-            f"({len(train_files)} train [Mouse 1], {len(test_files)} test [Mouse 2])"
+            f"({len(train_files)} *_train.h5ad, {len(test_files)} *_test.h5ad)"
         )
         if not train_files or not test_files:
             raise FileNotFoundError(
-                f"Need Mouse 1 AND Mouse 2 slices under {data_path}. "
-                f"Found train={len(train_files)}, test={len(test_files)}"
+                f"Need *_train.h5ad AND *_test.h5ad under {data_path}. "
+                f"Found train={len(train_files)}, test={len(test_files)}. "
+                f"Did you run build_h5ad_from_luna_csv.py to populate "
+                f"this silver dir?"
             )
         logger.info(f"Writing train CSV -> {train_csv}")
         train_stats = _build_luna_csv(train_files, train_csv, log2_normalize)
@@ -497,13 +525,19 @@ def run_benchmark(
 def main():
     p = argparse.ArgumentParser(
         description=(
-            "LUNA Figure 3 reproduction. Trains the vendored LUNA model "
-            "(under scgg/src/) on Mouse 1 and evaluates on Mouse 2."
+            "Train the vendored LUNA model (under scgg/src/) on the "
+            "*_train.h5ad files of any silver directory and evaluate "
+            "on the *_test.h5ad files. Defaults reproduce the LUNA "
+            "Figure 3 cortex benchmark when --data_dir points at the "
+            "mmc_luna silver dir, but any dataset built by "
+            "build_h5ad_from_luna_csv works."
         ),
     )
     p.add_argument(
         "--data_dir", required=True,
-        help="Path to per-slice h5ad directory (LUNA cortex split).",
+        help="Path to a per-section h5ad silver directory. The script "
+             "discovers *_train.h5ad (for training) and *_test.h5ad "
+             "(held out for inference) under it.",
     )
     p.add_argument(
         "--output_dir", default=None,

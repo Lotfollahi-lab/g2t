@@ -4,7 +4,7 @@ Compare LUNA's published CSV to the silver h5ad layer for the same section.
 
 The training run that used the LUNA-published CSVs reproduced LUNA's
 Figure 3 numbers; the one that used silver h5ads (with our
-``run_luna_on_mmc.py:_build_luna_csv`` applying ``log2(x+1)``) did not.
+``run_luna.py:_build_luna_csv`` applying ``log2(x+1)``) did not.
 This script pinpoints where the two diverge.
 
 For one matched section (chosen by ``--section``, default
@@ -17,7 +17,7 @@ quantities from both sources and report:
     quantiles). Reported under THREE candidate normalizations of the
     h5ad ``X``:
       - raw counts (``X`` as-is)
-      - log2(x + 1)                    (what run_luna_on_mmc.py applies)
+      - log2(x + 1)                    (what run_luna.py applies)
       - normalize_total(1e4) + log1p   (scgg's choice)
     so it's clear which (if any) matches the CSV's distribution.
   * Coordinate scale: raw ``obsm['spatial']`` vs CSV ``coord_X/Y`` —
