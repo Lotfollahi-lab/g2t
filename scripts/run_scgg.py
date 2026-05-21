@@ -411,6 +411,7 @@ def run_benchmark(
     load_checkpoint: Optional[str] = None,
     log2_normalize: bool = False,
     extra_overrides: Optional[List[str]] = None,
+    make_plots: bool = False,
 ) -> Dict[str, float]:
     """Train vendored LUNA on ``*_train.h5ad`` files, evaluate on
     ``*_test.h5ad`` files, under a single silver directory.
@@ -421,6 +422,8 @@ def run_benchmark(
     # Defer the scgg import so the script can show ``--help`` even when
     # the scgg env isn't activated.
     from scgg.evaluation.luna_metrics import aggregate_slices, evaluate_slice
+    if make_plots:
+        from scgg.evaluation.visualization import plot_pred_vs_truth
 
     data_path = Path(data_dir)
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -540,6 +543,10 @@ def run_benchmark(
     sections = _read_luna_predictions(test_save_dir)
     logger.info(f"Found predictions for {len(sections)} slices")
 
+    plots_dir = (out_dir / "plots") if make_plots else None
+    if plots_dir is not None:
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
     per_slice: List[Dict[str, float]] = []
     for label, (coords_pred, coords_true, cell_class) in sections.items():
         if coords_true.shape[0] < 10:
@@ -560,6 +567,18 @@ def run_benchmark(
             f"prec={row['precision']:.4f}  "
             f"rssd={row.get('absolute_rssd', float('nan')):.2f}"
         )
+        if plots_dir is not None:
+            try:
+                plot_pred_vs_truth(
+                    coords_true=coords_true,
+                    coords_pred=coords_pred,
+                    cell_class=cell_class,
+                    out_path=plots_dir / f"{label}.svg",
+                    title_prefix=f"{label}  |  ",
+                    method_label="scgg prediction",
+                )
+            except Exception as e:  # noqa: BLE001 — plotting must never crash eval
+                logger.warning(f"  plot failed for {label}: {e}")
 
     tracker.end("evaluation", flush_to=runtime_csv)
 
@@ -652,6 +671,12 @@ def main():
     p.add_argument("--load_checkpoint", default=None,
                    help="Path to a LUNA .ckpt — only used with --skip_training.")
     p.add_argument(
+        "--plots", action="store_true",
+        help="Write per-section ground-truth-vs-prediction comparison "
+             "plots (svg) into <out_dir>/plots/. OFF by default during "
+             "training; ON by default in inference_scgg.py.",
+    )
+    p.add_argument(
         "--extra_override", action="append", default=None, metavar="KEY=VALUE",
         help="Extra Hydra override(s) passed straight through to LUNA. "
              "Repeat the flag for multiple. Example: "
@@ -677,6 +702,7 @@ def main():
         skip_training=args.skip_training,
         load_checkpoint=args.load_checkpoint,
         extra_overrides=args.extra_override,
+        make_plots=args.plots,
     )
 
 

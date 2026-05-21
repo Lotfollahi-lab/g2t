@@ -523,8 +523,26 @@ def _per_cell_spearman_median(
 
 def _evaluate_predictions(
     sections: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]],
+    plots_dir: Optional[Path] = None,
 ) -> List[Dict[str, float]]:
-    """Compute per-section Spearman; return one row per section."""
+    """Compute per-section Spearman; return one row per section.
+
+    When ``plots_dir`` is given, also writes a GT-vs-prediction side-
+    by-side scatter to ``plots_dir/<label>.svg`` for each evaluated
+    section. Plotting failures are logged but never crash the eval
+    loop — metrics always get computed.
+    """
+    plot_pred_vs_truth = None
+    if plots_dir is not None:
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            from scgg.evaluation.visualization import plot_pred_vs_truth
+        except ImportError as e:
+            logger.warning(
+                f"  scgg.evaluation.visualization unavailable ({e}); "
+                f"skipping plots."
+            )
+
     rows: List[Dict[str, float]] = []
     for label, (pred, true) in sections.items():
         coords_pred = pred[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
@@ -543,6 +561,22 @@ def _evaluate_predictions(
             f"  {label:32s}  n={coords_true.shape[0]:>5d}  "
             f"spr_median={med:.4f}  spr_mean={mean:.4f}"
         )
+        if plot_pred_vs_truth is not None:
+            cell_class = (
+                true["cell_class"].astype(str).to_numpy()
+                if "cell_class" in true.columns else None
+            )
+            try:
+                plot_pred_vs_truth(
+                    coords_true=coords_true,
+                    coords_pred=coords_pred,
+                    cell_class=cell_class,
+                    out_path=plots_dir / f"{label}.svg",
+                    title_prefix=f"{label}  |  ",
+                    method_label="LUNA prediction",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"  plot failed for {label}: {e}")
     return rows
 
 
@@ -566,6 +600,9 @@ def run_benchmark(
     train_csv: Optional[str] = None,
     test_csv: Optional[str] = None,
     n_genes: Optional[int] = None,
+    skip_training: bool = False,
+    load_checkpoint: Optional[str] = None,
+    make_plots: bool = False,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
@@ -804,9 +841,10 @@ def run_benchmark(
     def _h(v: object) -> str:
         return f"'{v}'"
 
+    mode = "test_only" if skip_training else "train_and_test"
     overrides = [
         f"general.name={run_name}",
-        "general.mode=train_and_test",
+        f"general.mode={mode}",
         f"general.seed={seed}",
         f"general.wandb={wandb_mode}",
         f"dataset.train_data_path={_h(train_csv.resolve())}",
@@ -820,6 +858,17 @@ def run_benchmark(
     ]
     if lr is not None:
         overrides.append(f"train.lr={lr}")
+    if skip_training:
+        if load_checkpoint is None:
+            raise ValueError(
+                "skip_training=True requires load_checkpoint to point at a "
+                "LUNA-format .ckpt path."
+            )
+        ckpt_path = Path(load_checkpoint).resolve()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"--load_checkpoint not found: {ckpt_path}")
+        overrides.append(f"test.checkpoints_parent_dir={_h(ckpt_path.parent)}")
+        overrides.append(f"test.checkpoints_name_list=[{_h(ckpt_path.name)}]")
     if extra_overrides:
         overrides.extend(extra_overrides)
 
@@ -850,7 +899,8 @@ def run_benchmark(
     # ---- 5. Evaluate predictions ---------------------------------------
     tracker.start("evaluation")
     sections = _read_luna_predictions(test_save_dir)
-    per_slice = _evaluate_predictions(sections)
+    plots_dir = (out / "plots") if make_plots else None
+    per_slice = _evaluate_predictions(sections, plots_dir=plots_dir)
     tracker.end("evaluation", flush_to=runtime_csv)
 
     headline = float("nan")
@@ -1001,6 +1051,22 @@ def main() -> int:
         help="Extra Hydra overrides, e.g. '--luna_override train.lr=1e-4'. "
              "Repeatable.",
     )
+    p.add_argument(
+        "--skip_training", action="store_true",
+        help="Run LUNA in test-only mode against a previously trained "
+             "checkpoint (requires --load_checkpoint). Used internally "
+             "by inference_luna.py.",
+    )
+    p.add_argument(
+        "--load_checkpoint", default=None,
+        help="Path to a LUNA .ckpt — only used with --skip_training.",
+    )
+    p.add_argument(
+        "--plots", action="store_true",
+        help="Write per-section ground-truth-vs-prediction comparison "
+             "plots (svg) into <out_dir>/plots/. OFF by default during "
+             "training; ON by default in inference_luna.py.",
+    )
     args = p.parse_args()
 
     try:
@@ -1019,6 +1085,9 @@ def main() -> int:
             train_csv=args.train_csv,
             test_csv=args.test_csv,
             n_genes=args.n_genes,
+            skip_training=args.skip_training,
+            load_checkpoint=args.load_checkpoint,
+            make_plots=args.plots,
         )
     except Exception:
         logger.exception("LUNA training failed")

@@ -272,3 +272,174 @@ def plot_edge_confidence(
         plt.close(fig)
     else:
         return fig
+
+
+# ---------------------------------------------------------------------------
+# Pred vs truth comparison plot (used by inference_luna.py + inference_scgg.py)
+# ---------------------------------------------------------------------------
+
+
+def umeyama_align(
+    src: np.ndarray, dst: np.ndarray, allow_reflection: bool = True,
+) -> np.ndarray:
+    """Best similarity transform (rotate + scale + translate, plus
+    optional reflection) mapping ``src`` onto ``dst``. Returns the
+    transformed ``src``.
+
+    Used as a visual A/B aid before plotting predictions next to GT —
+    the prediction frame may be rotated / scaled differently from GT
+    coordinates even when the spatial structure is correct (the loss
+    is rotation-invariant). Applying Umeyama puts both panels in the
+    same frame so the eye can compare layouts directly.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    finite = np.isfinite(src).all(axis=1) & np.isfinite(dst).all(axis=1)
+    if finite.sum() < 3:
+        return src.astype(np.float32)
+    a = src[finite]
+    b = dst[finite]
+    mu_a, mu_b = a.mean(axis=0), b.mean(axis=0)
+    ac, bc = a - mu_a, b - mu_b
+    var_a = (ac ** 2).sum() / a.shape[0]
+    if var_a < 1e-12:
+        return src.astype(np.float32)
+    cov = (bc.T @ ac) / a.shape[0]
+    U, S, Vt = np.linalg.svd(cov)
+    d = np.eye(cov.shape[0])
+    if not allow_reflection and np.linalg.det(U @ Vt) < 0:
+        d[-1, -1] = -1
+    R = U @ d @ Vt
+    s = (S * np.diag(d)).sum() / var_a
+    t = mu_b - s * R @ mu_a
+    return ((s * (src @ R.T)) + t).astype(np.float32)
+
+
+def _palette_for(cats: List[str], scheme: str = "glasbey") -> list:
+    """Return a list of RGB(A) colors for the given categories.
+
+    Prefers ``colorcet.glasbey`` (high-distinctness, used by LUNA's
+    paper figures); falls back to matplotlib's tab20 if colorcet
+    isn't installed.
+    """
+    if not MPL_AVAILABLE:
+        raise ImportError("matplotlib is required for _palette_for")
+    n = max(len(cats), 1)
+    if scheme == "glasbey":
+        try:
+            import colorcet as cc  # type: ignore
+            return list(cc.glasbey[:n])
+        except ImportError:
+            logger.info(
+                "colorcet not installed; falling back to tab20. "
+                "Install with: pip install colorcet"
+            )
+    cmap = plt.get_cmap("tab20", n)
+    return [cmap(i) for i in range(n)]
+
+
+def plot_pred_vs_truth(
+    coords_true: np.ndarray,
+    coords_pred: np.ndarray,
+    cell_class: Optional[np.ndarray],
+    out_path,
+    title_prefix: str = "",
+    align_for_plot: bool = True,
+    spot_size: Optional[float] = None,
+    palette: str = "glasbey",
+    method_label: str = "prediction",
+) -> None:
+    """Side-by-side scatter of ground-truth vs predicted spatial coords.
+
+    Args:
+        coords_true: (n, 2) ground-truth XY.
+        coords_pred: (n, 2) predicted XY (same row order as coords_true).
+        cell_class: (n,) optional categorical labels for coloring;
+            None falls back to a single neutral color.
+        out_path: where to write the figure (svg / png — inferred from
+            the suffix).
+        title_prefix: prepended to each panel's title (e.g. section name).
+        align_for_plot: if True (default) apply a Umeyama similarity
+            transform to ``coords_pred`` so both panels share a frame.
+            Set False when you want to inspect the raw predicted frame.
+        spot_size: matplotlib ``s=`` for scatter. Auto-scales from
+            n_cells if omitted.
+        palette: ``"glasbey"`` (colorcet, used by LUNA) or any other
+            value to fall back to tab20.
+        method_label: label for the prediction panel
+            (``"LUNA prediction"``, ``"scgg prediction"``, etc.).
+
+    Writes the figure with dpi=150 and closes it. No return value.
+    """
+    if not MPL_AVAILABLE:
+        raise ImportError("matplotlib is required for plot_pred_vs_truth")
+    from pathlib import Path as _Path
+    from matplotlib.patches import Patch
+
+    out_path = _Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    coords_true = np.asarray(coords_true, dtype=np.float64)
+    coords_pred = np.asarray(coords_pred, dtype=np.float64)
+    if coords_true.shape != coords_pred.shape:
+        raise ValueError(
+            f"coords_true and coords_pred shape mismatch: "
+            f"{coords_true.shape} vs {coords_pred.shape}"
+        )
+    n = coords_true.shape[0]
+    if spot_size is None:
+        spot_size = max(1.0, min(20.0, 1500.0 / np.sqrt(max(n, 1))))
+
+    # Optional similarity alignment for visual comparability.
+    coords_pred_plot = (
+        umeyama_align(coords_pred, coords_true, allow_reflection=True)
+        if align_for_plot else coords_pred
+    )
+    aligned_suffix = " (aligned)" if align_for_plot else ""
+
+    # Resolve colors: per-class palette if cell_class is given, else
+    # a single muted grey.
+    if cell_class is not None:
+        cell_class = np.asarray(cell_class).astype(str)
+        cats = sorted(set(cell_class))
+        colors = _palette_for(cats, scheme=palette)
+        cat_to_color = dict(zip(cats, colors))
+        point_colors = [cat_to_color[c] for c in cell_class]
+    else:
+        cats = []
+        cat_to_color = {}
+        point_colors = "#666666"
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    for ax, xy, title in (
+        (axes[0], coords_true, f"{title_prefix}Ground truth"),
+        (axes[1], coords_pred_plot, f"{title_prefix}{method_label}{aligned_suffix}"),
+    ):
+        ax.scatter(xy[:, 0], xy[:, 1], c=point_colors, s=spot_size, linewidths=0)
+        ax.set_title(title)
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#999")
+
+    # Shared legend at the bottom (only when we actually colored by class).
+    if cats:
+        n_cats = len(cats)
+        ncol = min(max(1, (n_cats + 3) // 4), 6)
+        patches = [
+            Patch(facecolor=cat_to_color[c], label=str(c)) for c in cats
+        ]
+        fig.legend(
+            handles=patches, loc="lower center",
+            bbox_to_anchor=(0.5, 0.0), ncol=ncol,
+            frameon=False, fontsize="small",
+        )
+        n_rows = (n_cats + ncol - 1) // ncol
+        bottom = min(0.30, 0.05 + 0.04 * n_rows)
+        fig.tight_layout(rect=(0, bottom, 1, 1))
+    else:
+        fig.tight_layout()
+
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"saved pred-vs-truth plot: {out_path}")

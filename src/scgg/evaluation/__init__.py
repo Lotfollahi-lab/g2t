@@ -13,6 +13,8 @@ from .visualization import (
     plot_graph_comparison,
     plot_flow_trajectory,
     plot_edge_confidence,
+    plot_pred_vs_truth,
+    umeyama_align,
 )
 from .luna_metrics import (
     compute_distance,
@@ -36,6 +38,8 @@ __all__ = [
     "plot_graph_comparison",
     "plot_flow_trajectory",
     "plot_edge_confidence",
+    "plot_pred_vs_truth",
+    "umeyama_align",
     "compute_distance",
     "compute_spearman_correlation",
     "compute_contact",
