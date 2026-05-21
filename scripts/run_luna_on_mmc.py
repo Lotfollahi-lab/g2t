@@ -82,6 +82,13 @@ logger = logging.getLogger("luna_train")
 
 
 _ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
+# IMPORTANT: ``run_luna_on_*`` scripts always invoke the EXTERNAL LUNA
+# checkout — this is the immutable baseline we compare scgg against.
+# The vendored copy under scgg/src/ IS scgg (a LUNA copy we'll edit);
+# it's invoked by the scgg-side benchmark scripts
+# (``run_luna_cortex_benchmark.py`` and its future siblings). Do NOT
+# repoint this at scgg/src/ — that would make the baseline drift as
+# we modify scgg internals.
 _DEFAULT_LUNA_REPO = Path(
     "/nfs/team361/sb75/scgg-reproducibility/analysis/benchmarking/luna"
 )
