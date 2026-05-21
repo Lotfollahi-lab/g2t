@@ -202,12 +202,15 @@ def _build_luna_csv(
         df.index = range(len(df))
         df.index.name = "cell_id"
 
-        # `float_format=None` (default) uses str() which writes enough
-        # digits to round-trip float64 exactly (17 significant digits).
-        # This guarantees: bronze CSV → h5ad (float64) → fresh CSV →
-        # LUNA → same float32 tensor LUNA would build from the bronze
-        # CSV directly. No precision is lost in the round-trip.
-        df.to_csv(out_csv, mode="a", header=first, float_format=None)
+        # `float_format="%.17g"` writes up to 17 significant digits
+        # (shortest unambiguous float64 representation). This is the
+        # safest setting across pandas versions — float_format=None
+        # uses str() which is lossless in modern pandas (>=1.0) but
+        # can be 6-digit truncated in older versions. With %.17g we
+        # guarantee the round-trip is lossless:
+        #   bronze CSV → h5ad (float64) → fresh CSV (17g) → LUNA's
+        #   pandas (float64) → torch.float() (same float32 cast)
+        df.to_csv(out_csv, mode="a", header=first, float_format="%.17g")
         rows_total += len(df)
         first = False
         logger.info(f"    wrote {len(df):>6,} cells from {section_label}")
