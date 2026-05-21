@@ -155,14 +155,9 @@ def _build_luna_csv(
         X = adata.X
         if sp.issparse(X):
             X = X.toarray()
-        # Preserve the h5ad's native precision (float64 if the silver
-        # was built via build_h5ad_from_luna_csv.py with the float64
-        # default). Casting to float32 here would introduce LSB
-        # rounding that, combined with the cast inside LUNA's
-        # data_module (`.float()`), makes h5ad-derived training
-        # diverge slightly from CSV-direct training even when the
-        # source data is identical. Both paths end up at float32
-        # inside LUNA; we just want THAT cast to be the only one.
+        # Preserve the h5ad's native precision (float64 after the
+        # build_h5ad_from_luna_csv float64 fix). Casting to float32
+        # here would introduce LSB rounding on top of LUNA's `.float()`.
         X = np.asarray(X, dtype=np.float64)
         if log2_normalize:
             X = np.log2(X + 1.0)
@@ -189,17 +184,42 @@ def _build_luna_csv(
                 adata.obs["coord_Y"].to_numpy(dtype=np.float64),
             ])
 
+        # ----- Within-section cell ordering -----------------------------
+        # CRITICAL: LUNA's data_module calls `sort_values("cell_section")`
+        # which uses pandas' default `kind="quicksort"` — NOT stable.
+        # Within rows sharing the same `cell_section` value, the output
+        # ordering depends on the input ordering. To produce a fresh
+        # CSV that LUNA processes BITWISE IDENTICALLY to the bronze
+        # CSV (so model training is reproducible across the two input
+        # paths), the within-section row order must match bronze's.
+        #
+        # Empirically, LUNA's published bronze CSVs are sorted by
+        # `cell_id` ASCENDING within each section (verified across
+        # mouse1_slice1, mouse2_slice99, mouse2_slice119, etc.). We
+        # mirror that here. `cell_id` is preserved by
+        # `build_h5ad_from_luna_csv.py` as `adata.obs["cell_id"]`.
+        if "cell_id" in adata.obs.columns:
+            cell_ids = adata.obs["cell_id"].to_numpy()
+            sort_order = np.argsort(cell_ids, kind="stable")
+            X = X[sort_order]
+            xy = xy[sort_order]
+            cell_class = cell_class[sort_order]
+            cell_ids_sorted = cell_ids[sort_order]
+        else:
+            # Fall back: no cell_id available in the h5ad. Keep current
+            # adata order and emit per-slice 0..N-1 ids (legacy path).
+            cell_ids_sorted = np.arange(len(X))
+
         df = pd.DataFrame(X, columns=gene_names)
         df["coord_X"] = xy[:, 0]
         df["coord_Y"] = xy[:, 1]
         df["cell_section"] = section_label
         df["cell_class"] = cell_class
-        # LUNA's DataModule does `cell_ID = torch.tensor(input_data.index)`
-        # which fails with "too many dimensions 'str'" on string-barcode
-        # indices. Use a per-section integer index instead — LUNA preserves
-        # it through to per-section ``metadata_pred.csv`` outputs, so row
-        # order is recoverable downstream.
-        df.index = range(len(df))
+        # Write the ORIGINAL bronze cell_id as the index (not 0..N-1).
+        # This makes the fresh CSV's index column match bronze's exactly,
+        # so the `cell_ID` tensor LUNA constructs in its data_module is
+        # also identical (bookkeeping match, not just training match).
+        df.index = cell_ids_sorted
         df.index.name = "cell_id"
 
         # `float_format="%.17g"` writes up to 17 significant digits
