@@ -273,7 +273,22 @@ def _build_luna_csv(
         df["coord_Y"] = xy[:, 1]
         df["cell_section"] = section_label
         df["cell_class"] = cell_class
-        df.index = cell_ids
+        # LUNA's data_module does `torch.tensor(input_data.index)`,
+        # which crashes on string IDs (e.g. CNS scRNA cell barcodes).
+        # Use cell_ids as the index only when they parse as numeric;
+        # otherwise fall back to integer row positions, preserving the
+        # original strings in a separate column.
+        try:
+            df.index = pd.to_numeric(cell_ids)
+        except (ValueError, TypeError):
+            logger.info(
+                f"    {section_label}: cell_ids are non-numeric "
+                f"({type(cell_ids[0]).__name__}); using integer row "
+                f"position as CSV index, original ids preserved in "
+                f"'cell_id_orig' column."
+            )
+            df["cell_id_orig"] = cell_ids.astype(str)
+            df.index = np.arange(len(df), dtype=np.int64)
         df.index.name = "cell_id"
         df["_bronze_row_pos"] = bronze_row_pos
         per_section_dfs.append(df)
@@ -498,7 +513,10 @@ def run_benchmark(
         return f"'{v}'"
 
     run_name = wandb_run_name or "scgg_luna_benchmark"
-    mode = "test_only" if skip_training else "train_and_test"
+    # Vendored scgg/src/main.py supports `train_only` natively (we
+    # added it in this repo); paired with the data_module patch that
+    # skips the unused split, training never touches the test CSV.
+    mode = "test_only" if skip_training else "train_only"
 
     overrides = [
         f"general.name={run_name}",
@@ -538,49 +556,59 @@ def run_benchmark(
         raise RuntimeError(f"LUNA training failed (exit {rc}). See {log_path}")
 
     # ---- 3. Read LUNA predictions, run scgg.evaluation.luna_metrics ----
-    tracker.start("evaluation")
-    logger.info(f"Reading LUNA predictions from {test_save_dir}")
-    sections = _read_luna_predictions(test_save_dir)
-    logger.info(f"Found predictions for {len(sections)} slices")
-
-    plots_dir = (out_dir / "plots") if make_plots else None
-    if plots_dir is not None:
-        plots_dir.mkdir(parents=True, exist_ok=True)
-
+    # Train mode (mode == "train_only") writes a checkpoint but no
+    # predictions, so nothing to score — run inference_scgg / the
+    # inference wrapper against the checkpoint to compute test metrics.
     per_slice: List[Dict[str, float]] = []
-    for label, (coords_pred, coords_true, cell_class) in sections.items():
-        if coords_true.shape[0] < 10:
-            logger.info(f"  skipping {label} (n<10)")
-            continue
-        row = evaluate_slice(
-            coords_true, coords_pred, cell_class,
-            contact_percentile=contact_percentile,
-            compute_rssd=compute_rssd,
-            rssd_projection="pca",
-        )
-        row["section_label"] = label
-        per_slice.append(row)
-        logger.info(
-            f"  {label:30s}  "
-            f"spr_median={row['spearman_per_cell_median']:.4f}  "
-            f"spr_mean={row['spearman_per_cell_mean']:.4f}  "
-            f"prec={row['precision']:.4f}  "
-            f"rssd={row.get('absolute_rssd', float('nan')):.2f}"
-        )
-        if plots_dir is not None:
-            try:
-                plot_pred_vs_truth(
-                    coords_true=coords_true,
-                    coords_pred=coords_pred,
-                    cell_class=cell_class,
-                    out_path=plots_dir / f"{label}.svg",
-                    title_prefix=f"{label}  |  ",
-                    method_label="scgg prediction",
-                )
-            except Exception as e:  # noqa: BLE001 — plotting must never crash eval
-                logger.warning(f"  plot failed for {label}: {e}")
+    if mode != "train_only":
+        tracker.start("evaluation")
+        logger.info(f"Reading LUNA predictions from {test_save_dir}")
+        sections = _read_luna_predictions(test_save_dir)
+        logger.info(f"Found predictions for {len(sections)} slices")
 
-    tracker.end("evaluation", flush_to=runtime_csv)
+        plots_dir = (out_dir / "plots") if make_plots else None
+        if plots_dir is not None:
+            plots_dir.mkdir(parents=True, exist_ok=True)
+
+        for label, (coords_pred, coords_true, cell_class) in sections.items():
+            if coords_true.shape[0] < 10:
+                logger.info(f"  skipping {label} (n<10)")
+                continue
+            row = evaluate_slice(
+                coords_true, coords_pred, cell_class,
+                contact_percentile=contact_percentile,
+                compute_rssd=compute_rssd,
+                rssd_projection="pca",
+            )
+            row["section_label"] = label
+            per_slice.append(row)
+            logger.info(
+                f"  {label:30s}  "
+                f"spr_median={row['spearman_per_cell_median']:.4f}  "
+                f"spr_mean={row['spearman_per_cell_mean']:.4f}  "
+                f"prec={row['precision']:.4f}  "
+                f"rssd={row.get('absolute_rssd', float('nan')):.2f}"
+            )
+            if plots_dir is not None:
+                try:
+                    plot_pred_vs_truth(
+                        coords_true=coords_true,
+                        coords_pred=coords_pred,
+                        cell_class=cell_class,
+                        out_path=plots_dir / f"{label}.svg",
+                        title_prefix=f"{label}  |  ",
+                        method_label="scgg prediction",
+                    )
+                except Exception as e:  # noqa: BLE001 — plotting must never crash eval
+                    logger.warning(f"  plot failed for {label}: {e}")
+
+        tracker.end("evaluation", flush_to=runtime_csv)
+    else:
+        logger.info(
+            "mode=train_only: skipping evaluation phase (no predictions "
+            "were written). Run `run_scgg_inference.py --checkpoint ...` "
+            "against the saved checkpoint to score on the test split."
+        )
 
     # ---- 4. Aggregate + write outputs ----------------------------------
     tracker.start("write_artifacts")

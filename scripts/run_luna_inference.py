@@ -1,6 +1,6 @@
 """Run inference with a previously-trained LUNA checkpoint.
 
-Thin wrapper around ``run_luna.run_benchmark`` with ``skip_training=True``,
+Thin wrapper around ``run_luna_train.run_benchmark`` with ``skip_training=True``,
 so the underlying pipeline (silver-h5ad discovery, CSV materialisation,
 Hydra invocation, per-slice evaluation, runtime tracking) is shared
 verbatim with the training script — nothing about how predictions are
@@ -8,7 +8,7 @@ computed or scored drifts between train and inference.
 
 Reads the silver dir's ``*_test.h5ad`` files and runs LUNA's
 ``general.mode=test_only`` against the supplied ``.ckpt``. Writes the
-same artifacts as ``run_luna.py`` (per_slice_metrics.csv,
+same artifacts as ``run_luna_train.py`` (per_slice_metrics.csv,
 aggregate_metrics.json, runtime.csv, config.yaml, ...).
 
 Example::
@@ -24,11 +24,11 @@ import argparse
 import sys
 from pathlib import Path
 
-# Reuse the full pipeline from run_luna.py — same silver discovery,
+# Reuse the full pipeline from run_luna_train.py — same silver discovery,
 # CSV builder, LUNA subprocess invocation, evaluation, runtime
 # tracking. No duplication.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import run_luna  # noqa: E402  (local-script import, intentional)
+import run_luna_train  # noqa: E402  (local-script import, intentional)
 
 
 def main():
@@ -52,7 +52,7 @@ def main():
     )
     p.add_argument(
         "--checkpoint", required=True,
-        help="Path to a LUNA .ckpt produced by a previous run_luna.py run.",
+        help="Path to a LUNA .ckpt produced by a previous run_luna_train.py run.",
     )
     p.add_argument(
         "--output_dir", default=None,
@@ -74,9 +74,9 @@ def main():
                    choices=("disabled", "online", "offline", "dryrun"),
                    help="LUNA general.wandb (default 'disabled').")
     p.add_argument(
-        "--luna_repo", default=str(run_luna._DEFAULT_LUNA_REPO),
+        "--luna_repo", default=str(run_luna_train._DEFAULT_LUNA_REPO),
         help=f"Path to the external LUNA repo. Default: "
-             f"{run_luna._DEFAULT_LUNA_REPO}",
+             f"{run_luna_train._DEFAULT_LUNA_REPO}",
     )
     p.add_argument(
         "--luna_override", action="append", default=[],
@@ -92,7 +92,7 @@ def main():
     # Inference uses run_benchmark in skip-training mode. epochs/batch_size
     # are ignored by LUNA when mode=test_only but the API still wants them.
     try:
-        run_luna.run_benchmark(
+        run_luna_train.run_benchmark(
             data_dir=args.data_dir,
             train_csv=args.train_csv,
             test_csv=args.test_csv,
@@ -108,7 +108,7 @@ def main():
             make_plots=not args.no_plots,
         )
     except Exception:
-        run_luna.logger.exception("LUNA inference failed")
+        run_luna_train.logger.exception("LUNA inference failed")
         return 1
     return 0
 

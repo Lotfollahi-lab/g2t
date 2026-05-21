@@ -1,6 +1,6 @@
 """Run inference with a previously-trained scgg (vendored LUNA) checkpoint.
 
-Thin wrapper around ``run_scgg.run_benchmark`` with
+Thin wrapper around ``run_scgg_train.run_benchmark`` with
 ``skip_training=True``. Uses the vendored LUNA under
 ``scgg/src/`` — the modifiable copy we'll edit forward from the
 baseline. Pair this with ``inference_luna.py`` (which uses the
@@ -8,7 +8,7 @@ external LUNA) for A/B comparisons.
 
 Reads the silver dir's ``*_test.h5ad`` files and runs LUNA's
 ``general.mode=test_only`` against the supplied ``.ckpt``. Writes the
-same artifacts as ``run_scgg.py`` (per_slice_metrics.csv,
+same artifacts as ``run_scgg_train.py`` (per_slice_metrics.csv,
 aggregate_metrics.json, runtime.csv, config.yaml, ...).
 
 Example::
@@ -24,9 +24,9 @@ import argparse
 import sys
 from pathlib import Path
 
-# Reuse the full pipeline from run_scgg.py.
+# Reuse the full pipeline from run_scgg_train.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import run_scgg  # noqa: E402
+import run_scgg_train  # noqa: E402
 
 
 def main():
@@ -42,7 +42,7 @@ def main():
     )
     p.add_argument(
         "--checkpoint", required=True,
-        help="Path to a LUNA .ckpt produced by a previous run_scgg.py run.",
+        help="Path to a LUNA .ckpt produced by a previous run_scgg_train.py run.",
     )
     p.add_argument(
         "--output_dir", default=None,
@@ -78,7 +78,7 @@ def main():
     wandb_mode = "online" if args.wandb_online else "disabled"
 
     try:
-        run_scgg.run_benchmark(
+        run_scgg_train.run_benchmark(
             data_dir=args.data_dir,
             output_dir=args.output_dir,
             seed=args.seed,
@@ -92,7 +92,7 @@ def main():
             make_plots=not args.no_plots,
         )
     except Exception:
-        run_scgg.logger.exception("scgg inference failed")
+        run_scgg_train.logger.exception("scgg inference failed")
         return 1
     return 0
 

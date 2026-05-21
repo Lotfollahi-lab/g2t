@@ -26,12 +26,25 @@ def main(cfg: DictConfig):
     # Set up the dataset
     datamodule, dataset_infos = setup_dataset(cfg)
 
-    # Run training or testing based on mode
+    # Run training or testing based on mode.
+    #
+    # `train_only` (scgg addition) — train the model on the train CSV
+    # only; DataModule below skips the test split entirely, so the
+    # test CSV (which may not even be valid for training, e.g. CNS
+    # scRNA cells with string IDs) never gets touched. Pairs with the
+    # `run_*_train.py` entry points.
     if cfg.general.mode == "train_and_test":
         train_model(cfg, datamodule, dataset_infos)
         test_model(cfg, datamodule, dataset_infos)
     elif cfg.general.mode == "test_only":
         test_model(cfg, datamodule, dataset_infos)
+    elif cfg.general.mode == "train_only":
+        train_model(cfg, datamodule, dataset_infos)
+    else:
+        raise ValueError(
+            f"Unknown general.mode={cfg.general.mode!r}. "
+            f"Expected one of: train_and_test, test_only, train_only."
+        )
 
 
 def set_seed(seed: int):

@@ -168,10 +168,35 @@ class Dataset(InMemoryDataset):
 
 class DataModule(AbstractDataModule):
     def __init__(self, cfg):
-        train_data = self.data_loading(cfg, 'train')
-        test_data = self.data_loading(cfg, 'test')
-        self.train_dataset = self._initialize_dataset("train", train_data, cfg)
-        self.test_dataset = self._initialize_dataset("test", test_data, cfg)
+        # scgg modification: load only the splits the current mode
+        # actually needs. The upstream LUNA DataModule always loads
+        # train AND test at construction time, which breaks the
+        # "training shouldn't touch the test data" contract — and
+        # crashes outright when one of the CSVs has incompatible
+        # values (e.g. CNS scRNA test cells with string cell-IDs that
+        # fail `torch.tensor(self.input_data.index)`).
+        #
+        # Mode → splits we materialise:
+        #   train_only        -> train_dataset only
+        #   test_only         -> test_dataset only
+        #   train_and_test    -> both (upstream LUNA behavior)
+        # Unknown modes fall back to "load both" so external callers
+        # that don't set general.mode aren't surprised.
+        mode = getattr(cfg.general, "mode", "train_and_test")
+        load_train = mode in ("train_only", "train_and_test")
+        load_test = mode in ("test_only", "train_and_test")
+
+        if load_train:
+            train_data = self.data_loading(cfg, 'train')
+            self.train_dataset = self._initialize_dataset("train", train_data, cfg)
+        else:
+            self.train_dataset = None
+
+        if load_test:
+            test_data = self.data_loading(cfg, 'test')
+            self.test_dataset = self._initialize_dataset("test", test_data, cfg)
+        else:
+            self.test_dataset = None
 
         if cfg.dataset.validation_data_path:
             validation_data = self.data_loading(cfg, 'validation')
@@ -179,10 +204,17 @@ class DataModule(AbstractDataModule):
         else:
             self.validation_dataset = None
 
+        # statistics: pick whichever split we have for "test" entry, so
+        # downstream Infos doesn't KeyError on test stats during a
+        # train_only run.
+        train_stats = self.train_dataset.statistics if self.train_dataset else None
+        test_stats = self.test_dataset.statistics if self.test_dataset else train_stats
+        if train_stats is None:
+            train_stats = test_stats
         self.statistics = {
-            "train": self.train_dataset.statistics,
+            "train": train_stats,
             "validation": self.validation_dataset.statistics if self.validation_dataset else None,
-            "test": self.test_dataset.statistics,
+            "test": test_stats,
         }
         super().__init__(
             cfg,

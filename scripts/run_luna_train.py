@@ -352,10 +352,27 @@ def _build_luna_csv(
         df["coord_Y"] = xy[:, 1]
         df["cell_section"] = section_label
         df["cell_class"] = cell_class
-        # Use the original bronze cell_id as the index (not 0..N-1) so
-        # LUNA's `cell_ID = torch.tensor(input_data.index)` matches
-        # bronze too (bookkeeping match).
-        df.index = cell_ids
+        # Use the original bronze cell_id as the CSV index (not 0..N-1)
+        # so LUNA's `cell_ID = torch.tensor(input_data.index)` matches
+        # bronze when the cell_ids are integer-typed (MERFISH cortex).
+        # For datasets where cell_ids are strings (CNS scRNA cell
+        # barcodes), torch.tensor on a string index raises
+        # `ValueError: too many dimensions 'str'`, taking the whole
+        # data_module init down. Detect that case up front and fall
+        # back to integer row positions for the index, keeping the
+        # original strings as a separate metadata column so callers
+        # can still round-trip them downstream if they need to.
+        try:
+            df.index = pd.to_numeric(cell_ids)
+        except (ValueError, TypeError):
+            logger.info(
+                f"    {section_label}: cell_ids are non-numeric "
+                f"({type(cell_ids[0]).__name__}); using integer row "
+                f"position as CSV index, original ids preserved in "
+                f"'cell_id_orig' column."
+            )
+            df["cell_id_orig"] = cell_ids.astype(str)
+            df.index = np.arange(len(df), dtype=np.int64)
         df.index.name = "cell_id"
         # Carry _bronze_row_pos through; we'll drop it before writing.
         df["_bronze_row_pos"] = bronze_row_pos
@@ -413,19 +430,36 @@ def _invoke_luna(
     luna_repo: Path,
     overrides: List[str],
     log_path: Path,
+    mode: str = "train_and_test",
 ) -> int:
-    """Run LUNA's main.py with Hydra overrides, in the same Python env.
+    """Run LUNA via our monkey-patching launcher (``_luna_runner.py``),
+    in the same Python env.
 
-    Uses ``sys.executable`` so the subprocess inherits whatever env the
-    script is running in — that's the LUNA venv if the user activated
-    it before launching, exactly as documented.
+    The launcher imports LUNA's modules from ``luna_repo`` and patches
+    ``DataModule.__init__`` to load only the splits the requested
+    ``mode`` actually needs. That's how ``mode=train_only`` skips the
+    test CSV entirely (LUNA's stock ``main.py`` always loads both).
+
+    External LUNA files stay pristine; every change lives in the
+    launcher process.
     """
+    luna_repo = luna_repo.resolve()
     main_py = luna_repo / "main.py"
     if not main_py.exists():
         raise FileNotFoundError(f"LUNA main.py not found: {main_py}")
 
-    cmd = [sys.executable, str(main_py), *overrides]
-    logger.info("Invoking LUNA:")
+    runner = Path(__file__).resolve().parent / "_luna_runner.py"
+    if not runner.exists():
+        raise FileNotFoundError(f"_luna_runner.py launcher missing: {runner}")
+
+    cmd = [
+        sys.executable, str(runner),
+        "--luna_repo", str(luna_repo),
+        "--mode", mode,
+    ]
+    for o in overrides:
+        cmd += ["--override", o]
+    logger.info(f"Invoking LUNA via launcher (mode={mode}):")
     for arg in cmd:
         logger.info(f"    {arg}")
 
@@ -433,8 +467,7 @@ def _invoke_luna(
     t0 = time.time()
     with open(log_path, "wb") as f:
         proc = subprocess.run(
-            cmd, cwd=str(luna_repo), stdout=f, stderr=subprocess.STDOUT,
-            check=False,
+            cmd, stdout=f, stderr=subprocess.STDOUT, check=False,
         )
     elapsed = (time.time() - t0) / 60.0
     logger.info(
@@ -841,10 +874,15 @@ def run_benchmark(
     def _h(v: object) -> str:
         return f"'{v}'"
 
-    mode = "test_only" if skip_training else "train_and_test"
+    # Decoupled by default: train-only mode in train script, test-only
+    # in the inference wrapper. The launcher
+    # (``scripts/_luna_runner.py``) patches LUNA's DataModule so the
+    # unused split's CSV is never loaded — critical for datasets where
+    # one of the CSVs would crash the data_module (e.g. CNS scRNA
+    # cells with string IDs).
+    mode = "test_only" if skip_training else "train_only"
     overrides = [
         f"general.name={run_name}",
-        f"general.mode={mode}",
         f"general.seed={seed}",
         f"general.wandb={wandb_mode}",
         f"dataset.train_data_path={_h(train_csv.resolve())}",
@@ -875,7 +913,7 @@ def run_benchmark(
     log_path = out / "luna_stdout.log"
     tracker.start("training")
     try:
-        rc = _invoke_luna(luna_repo_p, overrides, log_path)
+        rc = _invoke_luna(luna_repo_p, overrides, log_path, mode=mode)
     finally:
         tracker.end("training", flush_to=runtime_csv)
     if rc != 0:
@@ -897,11 +935,23 @@ def run_benchmark(
         logger.warning("No checkpoint found under luna_run/checkpoints/")
 
     # ---- 5. Evaluate predictions ---------------------------------------
-    tracker.start("evaluation")
-    sections = _read_luna_predictions(test_save_dir)
-    plots_dir = (out / "plots") if make_plots else None
-    per_slice = _evaluate_predictions(sections, plots_dir=plots_dir)
-    tracker.end("evaluation", flush_to=runtime_csv)
+    # Train mode (mode == "train_only") writes a checkpoint but no
+    # predictions, so there's nothing to evaluate. Inference mode
+    # (mode == "test_only") and the legacy combined mode both produce
+    # `metadata_pred.csv` files we can score against ground truth.
+    per_slice: List[Dict[str, float]] = []
+    if mode != "train_only":
+        tracker.start("evaluation")
+        sections = _read_luna_predictions(test_save_dir)
+        plots_dir = (out / "plots") if make_plots else None
+        per_slice = _evaluate_predictions(sections, plots_dir=plots_dir)
+        tracker.end("evaluation", flush_to=runtime_csv)
+    else:
+        logger.info(
+            "mode=train_only: skipping evaluation phase (no predictions "
+            "were written). Run `run_luna_inference.py --checkpoint ...` "
+            "against the saved checkpoint to score on the test split."
+        )
 
     headline = float("nan")
     if per_slice:
