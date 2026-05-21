@@ -106,22 +106,28 @@ def _patch_datamodule(target_mode: str) -> None:
     )
 
 
-def _run_train_only(cfg, train_model_fn, setup_dataset_fn) -> None:
-    """train_only: setup_dataset → train_model. No test phase."""
-    import hydra
-    cfg.general.local_saved_path = (
-        hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-    )
-    datamodule, dataset_infos = setup_dataset_fn(cfg)
-    train_model_fn(cfg, datamodule, dataset_infos)
+def _extract_output_dir(overrides) -> Optional[str]:
+    """Pull a ``hydra.run.dir=...`` override out of the list, returning
+    the path. ``compose`` (which we use instead of ``@hydra.main``)
+    does NOT honour ``hydra.run.dir``, so we read it ourselves and
+    chdir there before training — that keeps LUNA's
+    ``checkpoints_parent_dir = os.path.join(os.getcwd(), "checkpoints")``
+    pointing where the caller asked for.
+    """
+    for o in overrides:
+        if o.startswith("hydra.run.dir="):
+            v = o.split("=", 1)[1]
+            return v.strip().strip("'\"")
+    return None
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--luna_repo", required=True,
-                   help="Path to the external LUNA checkout (must contain "
-                        "main.py and configs/).")
+                   help="Path to the LUNA checkout (must contain "
+                        "main.py and configs/). Either the external "
+                        "LUNA repo or scgg's vendored copy.")
     p.add_argument(
         "--mode", required=True,
         choices=("train_only", "test_only", "train_and_test"),
@@ -143,48 +149,59 @@ def main() -> int:
     luna_repo = Path(args.luna_repo).resolve()
     if not (luna_repo / "main.py").exists():
         raise FileNotFoundError(f"LUNA main.py missing under {luna_repo}")
+    config_dir = luna_repo / "configs"
+    if not config_dir.exists():
+        raise FileNotFoundError(f"LUNA configs/ missing under {luna_repo}")
 
-    # cwd / sys.path so LUNA's absolute imports (`from models.X import ...`)
-    # work, and Hydra finds configs/.
+    # sys.path so LUNA's absolute imports (`from models.X import ...`)
+    # resolve. cwd is also set to luna_repo briefly so any module-level
+    # path resolution in LUNA picks up its own tree.
     sys.path.insert(0, str(luna_repo))
     os.chdir(str(luna_repo))
 
     # Patch DataModule BEFORE LUNA's main is imported / runs.
     _patch_datamodule(args.mode)
 
-    # Now we replicate LUNA's main(), but with mode dispatch we control.
-    import hydra
-    from omegaconf import DictConfig
+    from hydra import compose, initialize_config_dir
     from main import set_seed, train_model, test_model  # type: ignore
     from utils.diffusion_model.setup.setup import setup_dataset  # type: ignore
 
-    # Hand the Hydra overrides through sys.argv (Hydra's @hydra.main
-    # picks them up from there).
-    sys.argv = ["main.py"] + list(args.override)
+    # Compose the config from an ABSOLUTE path — using @hydra.main would
+    # resolve config_path relative to THIS file (scgg/scripts/), which
+    # is the wrong tree. initialize_config_dir takes an absolute path,
+    # so it works whether luna_repo is the external LUNA checkout or
+    # the vendored scgg/src/ copy.
+    with initialize_config_dir(
+        version_base="1.3", config_dir=str(config_dir), job_name="luna_runner",
+    ):
+        cfg = compose(config_name="config", overrides=list(args.override))
 
-    @hydra.main(
-        version_base="1.3", config_path="./configs", config_name="config",
-    )
-    def _entry(cfg: DictConfig):
-        # Force the mode override regardless of what Hydra resolved
-        # (the user may have left it on the experiment default).
-        cfg.general.mode = args.mode
-        set_seed(cfg.general.seed)
-        cfg.general.local_saved_path = (
-            hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-        )
-        datamodule, dataset_infos = setup_dataset(cfg)
-        if args.mode == "train_and_test":
-            train_model(cfg, datamodule, dataset_infos)
-            test_model(cfg, datamodule, dataset_infos)
-        elif args.mode == "train_only":
-            train_model(cfg, datamodule, dataset_infos)
-        elif args.mode == "test_only":
-            test_model(cfg, datamodule, dataset_infos)
-        else:  # pragma: no cover — argparse already constrains this
-            raise ValueError(f"unknown mode {args.mode!r}")
+    # Force the mode override regardless of what Hydra resolved (the
+    # user may have left it on the experiment default).
+    cfg.general.mode = args.mode
 
-    _entry()
+    # compose() does NOT auto-create a Hydra runtime output dir or
+    # chdir to it. Read the hydra.run.dir override ourselves, mkdir
+    # it, and chdir so LUNA's relative-path bookkeeping
+    # (`os.path.join(os.getcwd(), "checkpoints")`) lands in the right
+    # place.
+    output_dir = _extract_output_dir(args.override) or os.getcwd()
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    os.chdir(output_dir)
+    cfg.general.local_saved_path = output_dir
+
+    set_seed(cfg.general.seed)
+    datamodule, dataset_infos = setup_dataset(cfg)
+    if args.mode == "train_and_test":
+        train_model(cfg, datamodule, dataset_infos)
+        test_model(cfg, datamodule, dataset_infos)
+    elif args.mode == "train_only":
+        train_model(cfg, datamodule, dataset_infos)
+    elif args.mode == "test_only":
+        test_model(cfg, datamodule, dataset_infos)
+    else:  # pragma: no cover — argparse already constrains this
+        raise ValueError(f"unknown mode {args.mode!r}")
+
     return 0
 
 
