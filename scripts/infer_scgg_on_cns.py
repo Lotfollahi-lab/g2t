@@ -316,18 +316,32 @@ def _load_checkpoint(checkpoint_path: Path, device: str):
     )
     if not gene_names and n_genes_expected is None:
         # Fall back: infer n_genes from the encoder's first linear weight.
-        first_layer_key = next(
-            (k for k in state["model_state_dict"].keys() if "encoder.backbone.0.0.weight" in k),
-            None,
-        )
+        # The exact key depends on how the encoder was configured:
+        #   * encoder.hidden_dims=[...]  -> first weight is `encoder.backbone.0.0.weight`
+        #     (the first block's Linear in the Sequential backbone)
+        #   * encoder.hidden_dims=[]     -> backbone is empty; first weight is
+        #     `encoder.proj.weight` (the LUNA-aligned slim encoder)
+        # Try the slim layout first, then the legacy one.
+        sd = state["model_state_dict"]
+        candidate_keys = [
+            "encoder.proj.weight",        # slim encoder (hidden_dims=[])
+            "encoder.backbone.0.0.weight",  # legacy encoder (hidden_dims=[...])
+        ]
+        first_layer_key = next((k for k in candidate_keys if k in sd), None)
+        # Last-resort: walk the state dict for any "encoder.*.weight" with 2D shape.
+        if first_layer_key is None:
+            for k, v in sd.items():
+                if k.startswith("encoder.") and k.endswith(".weight") and v.dim() == 2:
+                    first_layer_key = k
+                    break
         if first_layer_key is None:
             raise RuntimeError(
                 "Could not determine n_genes from the checkpoint. "
                 "Pass --gene_panel_h5ad to specify it."
             )
-        n_genes_expected = state["model_state_dict"][first_layer_key].shape[1]
+        n_genes_expected = sd[first_layer_key].shape[1]
         logger.info(
-            f"  inferred n_genes={n_genes_expected} from the encoder's first layer"
+            f"  inferred n_genes={n_genes_expected} from {first_layer_key}"
         )
 
     n_genes = len(gene_names) if gene_names else n_genes_expected
