@@ -37,43 +37,46 @@ dev = [
 ]
 
 # Source layout is src/. Map the empty package root to src/ so BOTH
-# `[tool.setuptools.packages.find]` AND `py-modules` resolve relative to
-# src/. Without this `package-dir`, the top-level py-modules
-# (`main.py`, `diffusion_model.py`) silently fail to install on editable
-# pip and `import main` / `import diffusion_model` raise
-# ModuleNotFoundError at runtime.
+# `packages` AND `py-modules` resolve relative to src/.
+#
+# We enumerate every package explicitly instead of using
+# `[tool.setuptools.packages.find]`. The find-based approach kept
+# silently dropping packages from uv's editable install (specifically
+# `utils.data` and the PEP-420 namespace packages under
+# `utils.diffusion_model.*`) even with `namespaces = true`. Listing
+# them by name removes that whole class of failure: every dotted
+# import the LUNA codebase needs is registered.
+#
+# If upstream LUNA gains a new subpackage, add it here.
 [tool.setuptools]
 package-dir = { "" = "src" }
 py-modules = ["main", "diffusion_model"]
-
-# Packages found under src/. We register both:
-#   - `scgg.*`             — our entry-point package (scripts/eval/data live here)
-#   - LUNA's top-level pkgs — vendored verbatim, imported as `models`,
-#                             `utils`, `metrics`, `datasets`, `configs`
-#                             (LUNA's own import style, kept unchanged
-#                             so we track upstream).
-#
-# `namespaces = true` is critical: LUNA does NOT ship __init__.py files
-# in several places (datasets/, utils/diffusion_model/,
-# utils/diffusion_model/diffusion/), making them PEP-420 implicit
-# namespace packages. With the setuptools default (find_packages,
-# which requires __init__.py), those dirs and everything beneath them
-# are silently dropped from the editable install — at import time you
-# get `ModuleNotFoundError: No module named 'utils.data'` inside the
-# vendored LUNA tree, because the strict-editable finder only exposes
-# packages that were discovered at install time. find_namespace
-# (= `namespaces = true`) makes setuptools include implicit-namespace
-# packages too, so every dotted name in the LUNA source tree resolves.
-[tool.setuptools.packages.find]
-where = ["src"]
-namespaces = true
-include = [
-    "scgg", "scgg.*",
-    "models", "models.*",
-    "utils", "utils.*",
-    "metrics", "metrics.*",
-    "datasets", "datasets.*",
-    "configs", "configs.*",
+packages = [
+    # scGG-side package (eval helpers, h5ad loaders, scripts entry points)
+    "scgg",
+    "scgg.data",
+    "scgg.evaluation",
+    # LUNA top-level packages, vendored verbatim under scgg/src/
+    "models",
+    "metrics",
+    "datasets",
+    "utils",
+    "utils.data",
+    "utils.diffusion_model",
+    "utils.diffusion_model.diffusion",
+    "utils.diffusion_model.sample",
+    "utils.diffusion_model.setup",
+    "utils.diffusion_model.test",
+    "utils.diffusion_model.train",
+    "utils.diffusion_model.validation",
+    # LUNA Hydra config tree (the yaml files are package-data below)
+    "configs",
+    "configs.experiment",
+    "configs.general",
+    "configs.model",
+    "configs.test",
+    "configs.train",
+    "configs.validation",
 ]
 
 [tool.setuptools.package-data]
