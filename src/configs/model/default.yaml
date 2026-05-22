@@ -15,3 +15,50 @@ hidden_dims:
     dim_ffy: 256 # hidden dimension of the diffusion time feedforward network in the transformer
     dd: 64 # hidden dimension of the MLP for positions
     output_features_to_pos_dims: 4 # hidden dimension of the MLP for the output features to positions
+
+# ---------------------------------------------------------------------------
+# Loss components (scgg ablation knobs).
+#
+# The original LUNA loss is `pairwise_distance_mse`: per-slice MSE on the
+# full pairwise-distance matrix. It's the unconditional default and acts
+# as the rotation-invariant skeleton — we keep it on for every scgg
+# experiment unless explicitly ablated away.
+#
+# Each additional component below is OFF by default (so the default config
+# is byte-equivalent to LUNA's loss). Flip `enabled: true` on the
+# component you want to ablate AND give the run a descriptive
+# `--wandb_run_name` so it shows up as an identifiable variant in the
+# artifacts tree. The full composed config is also dumped to
+# `<run_dir>/.hydra/config.yaml`, so the exact weights / k / etc. of any
+# past run are recoverable from disk.
+#
+# Whenever you add a NEW component:
+#   1. Add its block here with `enabled: false` (default off).
+#   2. Add a `compute_<name>(...)` method to scgg/src/metrics/loss_function.py
+#      and wire it into `LossFunction.compute_loss`.
+#   3. Document the ablation contract in this file's comment block.
+# ---------------------------------------------------------------------------
+loss:
+    # LUNA's headline loss. Per-slice MSE on the pairwise-distance matrix.
+    # Rotation/translation invariant. Always on unless you explicitly ablate.
+    pairwise_distance_mse:
+        enabled: true
+        weight: 1.0
+
+    # Local kNN-rank preservation. For each cell i, looks at its k
+    # nearest neighbours in TRUE distance space and penalises how
+    # poorly the prediction reproduces that local geometry. The
+    # differentiable surrogate is per-cell Pearson correlation on the
+    # restricted true/pred distance rows; loss = 1 - mean(corr) over
+    # cells. Pearson is a smooth lower bound on Spearman in this
+    # range; we can swap in a soft-rank (Blondel et al.) later if
+    # this turns out to be the deciding component.
+    #
+    # Motivation: the eval metric is per-cell Spearman of pairwise
+    # distances. LUNA's loss only optimises the global pairwise scale;
+    # this component directly targets the local-geometry part of the
+    # metric.
+    knn_rank:
+        enabled: false
+        weight: 1.0    # multiplier on (1 - mean Pearson) over cells/slices
+        k: 20          # k for the per-cell neighbourhood (try 10 / 20 / 50)

@@ -806,7 +806,19 @@ def run_benchmark(
     if (train_csv is None) != (test_csv is None):
         raise ValueError("--train_csv and --test_csv must be passed together.")
 
-    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Inference inherits the model's timestamp from the checkpoint
+    # path so artifacts pair up by eye: a checkpoint at
+    #   .../<engine>_model/20260521_225545/luna_run/checkpoints/epoch=N.ckpt
+    # produces an inference dir at
+    #   .../<engine>_inference/20260521_225545/...
+    # Training runs use the current wall clock (one fresh timestamp
+    # per run). Inference runs that can't find a YYYYMMDD_HHMMSS
+    # token in the checkpoint path fall back to the wall clock.
+    if skip_training and load_checkpoint is not None:
+        m = re.search(r"(\d{8}_\d{6})", str(load_checkpoint))
+        run_ts = m.group(1) if m else datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_dir is None:
         if use_prebuilt:
             # Derive a sensible default from the train CSV's parent dir name.

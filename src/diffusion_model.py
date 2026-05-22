@@ -42,8 +42,12 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.dataset_infos = dataset_infos
         self.input_dims = dataset_infos.input_dims
         self.output_dims = dataset_infos.output_dims
-        self.train_loss = LossFunction()
-        self.val_loss = LossFunction()
+        # Pass the full cfg so the loss can read its `model.loss.*`
+        # block and toggle components on/off. Default config keeps only
+        # LUNA's pairwise-distance MSE on, so train-from-scratch
+        # reproduces the baseline; new ablation components stay opt-in.
+        self.train_loss = LossFunction(cfg=cfg)
+        self.val_loss = LossFunction(cfg=cfg)
 
         self.model = Model(
             input_dims=self.input_dims,
