@@ -775,7 +775,7 @@ def run_benchmark(
     luna_repo: str = str(_ENGINE_REPO_DEFAULT),
     run_name: str = "MERFISH_mouse_cortex",
     log2_normalize: bool = False,
-    wandb_mode: str = "disabled",
+    wandb_mode: str = "online",
     wandb_project: str = "",  # if empty, the script's injected default applies
     extra_overrides: Optional[List[str]] = None,
     train_csv: Optional[str] = None,
@@ -1234,7 +1234,7 @@ def main() -> int:
              "(scgg = \"scgg\"; luna = \"luna\").",
     )
     p.add_argument(
-        "--wandb_mode", default="disabled",
+        "--wandb_mode", default="online",
         choices=("disabled", "online", "offline", "dryrun"),
         help="general.wandb override. Default 'disabled' to avoid LUNA "
              "crashing when the host isn't logged into WandB. Pass "
