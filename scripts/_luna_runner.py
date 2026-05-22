@@ -106,6 +106,45 @@ def _patch_datamodule(target_mode: str) -> None:
     )
 
 
+def _patch_setup_model() -> None:
+    """Monkey-patch upstream LUNA's ``setup_model`` so it only loads a
+    checkpoint when ``general.mode == "test_only"``.
+
+    Upstream LUNA's ``setup_model`` reads::
+
+        if cfg.general.mode == "train_and_test":
+            pass
+        else:
+            cfg, _ = get_resume(cfg, dataset_infos, checkpoint_path)
+
+    Anything that isn't ``train_and_test`` — including our new
+    ``train_only`` — falls into ``else``, where ``checkpoint_path`` is
+    ``None`` for a from-scratch run and ``torch.load(None)`` blows up.
+    The vendored scgg copy already has the corrected
+    ``if mode == "test_only"`` check; this patch mirrors the same fix
+    onto the external LUNA at runtime so the external files stay
+    pristine on disk.
+    """
+    from utils.diffusion_model.setup import setup as setup_mod
+
+    OrigSetupModel = setup_mod.setup_model
+
+    def patched_setup_model(cfg, dataset_infos, checkpoint_path=None):
+        # Only resume from checkpoint when testing — every other mode
+        # starts from a fresh model.
+        if cfg.general.mode == "test_only":
+            cfg, _ = setup_mod.get_resume(cfg, dataset_infos, checkpoint_path)
+        return setup_mod.FullDenoisingDiffusion(cfg=cfg, dataset_infos=dataset_infos)
+
+    setup_mod.setup_model = patched_setup_model
+    # Re-import the binding `main.train_model` uses so its closed-over
+    # `setup_model` reference also picks up the patch.
+    import main as luna_main_mod  # noqa: WPS433
+    if hasattr(luna_main_mod, "setup_model"):
+        luna_main_mod.setup_model = patched_setup_model
+    logger.info("[luna_runner] patched setup_model (resume only on test_only)")
+
+
 def _extract_output_dir(overrides) -> Optional[str]:
     """Pull a ``hydra.run.dir=...`` override out of the list, returning
     the path. ``compose`` (which we use instead of ``@hydra.main``)
@@ -165,6 +204,11 @@ def main() -> int:
     from hydra import compose, initialize_config_dir
     from main import set_seed, train_model, test_model  # type: ignore
     from utils.diffusion_model.setup.setup import setup_dataset  # type: ignore
+
+    # Patch setup_model AFTER main is imported so we can also rebind
+    # main.setup_model (train_model uses the name imported into main's
+    # module namespace at import time).
+    _patch_setup_model()
 
     # Compose the config from an ABSOLUTE path — using @hydra.main would
     # resolve config_path relative to THIS file (scgg/scripts/), which
