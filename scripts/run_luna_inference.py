@@ -79,8 +79,11 @@ def main():
              f"{run_luna_train._ENGINE_REPO_DEFAULT}",
     )
     p.add_argument(
-        "--luna_override", action="append", default=[],
-        help="Extra Hydra overrides. Repeatable.",
+        "--override", "--luna_override",
+        dest="override",
+        action="append", default=[],
+        help="Extra Hydra override (repeatable). "
+             "'--luna_override' is a backward-compat alias.",
     )
     p.add_argument(
         "--no_plots", action="store_true",
@@ -105,7 +108,7 @@ def main():
             luna_repo=args.luna_repo,
             run_name=args.wandb_run_name,
             wandb_mode=args.wandb_mode,
-            extra_overrides=args.luna_override,
+            extra_overrides=args.override,
             skip_training=True,
             load_checkpoint=args.checkpoint,
             make_plots=not args.no_plots,

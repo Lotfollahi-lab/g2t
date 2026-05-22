@@ -1246,9 +1246,13 @@ def main() -> int:
              "training on log-compressed inputs collapses to ~0 Spearman.",
     )
     p.add_argument(
-        "--luna_override", action="append", default=[],
-        help="Extra Hydra overrides, e.g. '--luna_override train.lr=1e-4'. "
-             "Repeatable.",
+        "--override", "--luna_override",
+        dest="override",
+        action="append", default=[],
+        help="Extra Hydra override (repeatable). Examples: "
+             "'--override train.lr=1e-4', "
+             "'--override model.loss.knn_rank.enabled=true'. "
+             "'--luna_override' is kept as a backward-compat alias.",
     )
     p.add_argument(
         "--skip_training", action="store_true",
@@ -1280,7 +1284,7 @@ def main() -> int:
             run_name=args.wandb_run_name,
             log2_normalize=args.log2_normalize,
             wandb_mode=args.wandb_mode,
-            extra_overrides=args.luna_override,
+            extra_overrides=args.override,
             train_csv=args.train_csv,
             test_csv=args.test_csv,
             n_genes=args.n_genes,
