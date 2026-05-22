@@ -760,6 +760,7 @@ def run_benchmark(
     run_name: str = "MERFISH_mouse_cortex",
     log2_normalize: bool = False,
     wandb_mode: str = "disabled",
+    wandb_project: str = "",  # if empty, the script's injected default applies
     extra_overrides: Optional[List[str]] = None,
     train_csv: Optional[str] = None,
     test_csv: Optional[str] = None,
@@ -1034,6 +1035,7 @@ def run_benchmark(
         f"general.name={run_name}",
         f"general.seed={seed}",
         f"general.wandb={wandb_mode}",
+        f"general.wandb_project={wandb_project or 'scgg'}",
         f"dataset.train_data_path={_h(train_csv.resolve())}",
         f"dataset.test_data_path={_h(test_csv.resolve())}",
         "dataset.gene_columns_start=0",
@@ -1211,6 +1213,11 @@ def main() -> int:
                    help="general.seed override. Default 0 matches LUNA's "
                         "published config (configs/general/default.yaml).")
     p.add_argument(
+        "--wandb_project", default=None,
+        help="wandb project name. Default is set per-engine "
+             "(scgg = \"scgg\"; luna = \"luna\").",
+    )
+    p.add_argument(
         "--wandb_mode", default="disabled",
         choices=("disabled", "online", "offline", "dryrun"),
         help="general.wandb override. Default 'disabled' to avoid LUNA "
@@ -1284,6 +1291,7 @@ def main() -> int:
             run_name=args.wandb_run_name,
             log2_normalize=args.log2_normalize,
             wandb_mode=args.wandb_mode,
+            wandb_project=args.wandb_project or "",
             extra_overrides=args.override,
             train_csv=args.train_csv,
             test_csv=args.test_csv,

@@ -45,20 +45,30 @@ loss:
         enabled: true
         weight: 1.0
 
-    # Local kNN-rank preservation. For each cell i, looks at its k
-    # nearest neighbours in TRUE distance space and penalises how
-    # poorly the prediction reproduces that local geometry. The
-    # differentiable surrogate is per-cell Pearson correlation on the
-    # restricted true/pred distance rows; loss = 1 - mean(corr) over
-    # cells. Pearson is a smooth lower bound on Spearman in this
-    # range; we can swap in a soft-rank (Blondel et al.) later if
-    # this turns out to be the deciding component.
+    # Rank-preservation correlation loss. Per-cell Pearson correlation
+    # between true and predicted pairwise-distance rows; loss is
+    # ``1 - mean(corr)`` over cells × slices. Pearson is a smooth
+    # surrogate for Spearman (the eval metric); a soft-rank swap is a
+    # future upgrade if this is the deciding component.
     #
-    # Motivation: the eval metric is per-cell Spearman of pairwise
-    # distances. LUNA's loss only optimises the global pairwise scale;
-    # this component directly targets the local-geometry part of the
-    # metric.
+    # Two scopes:
+    #   scope=global -> use the full distance row of each cell
+    #                   (matches the eval metric exactly).
+    #   scope=local  -> restrict to the k nearest TRUE neighbours of
+    #                   each cell. Targets visual local fidelity but
+    #                   can be hijacked by degenerate local-cluster
+    #                   solutions that hurt global Spearman. Use with
+    #                   a SMALL weight (1e-2..1e-1) as a regulariser,
+    #                   never as the main loss.
+    #
+    # WEIGHT SCALE WARNING: this loss lives in [0, 2] (1 - corr where
+    # corr is bounded in [-1, 1]) while ``pairwise_distance_mse`` lives
+    # in ~[1e-3, 1e-1] for the LUNA setup. weight=1.0 makes this term
+    # ~10–100× bigger than the LUNA loss and the optimiser will
+    # ignore the pairwise MSE entirely. Start with weight in
+    # [1e-2, 1e-1] and sweep up.
     knn_rank:
         enabled: false
-        weight: 1.0    # multiplier on (1 - mean Pearson) over cells/slices
-        k: 20          # k for the per-cell neighbourhood (try 10 / 20 / 50)
+        scope: global  # "global" (full row, matches eval) or "local" (k-NN only)
+        weight: 0.05   # see WEIGHT SCALE WARNING above
+        k: 20          # ignored when scope=global; only used for scope=local

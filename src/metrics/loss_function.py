@@ -94,9 +94,17 @@ class LossFunction(nn.Module):
                                           "knn_rank", "enabled",
                                           default=False))
         self._knn_weight = float(_cfg_get(cfg, "model", "loss",
-                                          "knn_rank", "weight", default=1.0))
+                                          "knn_rank", "weight", default=0.05))
         self._knn_k = int(_cfg_get(cfg, "model", "loss", "knn_rank", "k",
                                    default=20))
+        self._knn_scope = str(_cfg_get(cfg, "model", "loss",
+                                       "knn_rank", "scope",
+                                       default="global")).lower()
+        if self._knn_scope not in ("global", "local"):
+            raise ValueError(
+                f"model.loss.knn_rank.scope must be 'global' or 'local'; "
+                f"got {self._knn_scope!r}"
+            )
 
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
@@ -110,12 +118,16 @@ class LossFunction(nn.Module):
         ]
 
         # One-time summary so the train.log shows what's active.
-        active = [
-            f"{name}(w={w:.3g}"
-            + (f", k={self._knn_k}" if name == "knn_rank" else "")
-            + ")"
-            for (name, on, w, _) in self._components if on
-        ]
+        active = []
+        for (name, on, w, _) in self._components:
+            if not on:
+                continue
+            extra = ""
+            if name == "knn_rank":
+                extra = f", scope={self._knn_scope}"
+                if self._knn_scope == "local":
+                    extra += f", k={self._knn_k}"
+            active.append(f"{name}(w={w:.3g}{extra})")
         print(f"[LossFunction] active components: {', '.join(active) or '(none!)'}")
 
     # ----------------------------- component implementations --------------
@@ -145,30 +157,33 @@ class LossFunction(nn.Module):
     def _compute_knn_rank(
         self, masked_pred: DataHolder, masked_true: DataHolder,
     ) -> torch.Tensor:
-        """Local kNN-rank preservation surrogate.
+        """Rank-preservation correlation surrogate.
 
-        For each masked cell *i*::
+        For each masked cell *i*, compute Pearson correlation between
+        the row of true pairwise distances and the row of predicted
+        pairwise distances. Loss is ``1 - mean(corr_i)`` averaged
+        across slices.
 
-            1. Compute true pairwise distances on the slice (no grad).
-            2. Pick the k nearest TRUE neighbours of *i* (excluding self).
-            3. Gather true and predicted distances on that k-cell subset.
-            4. Compute Pearson correlation between the two length-k
-               vectors. (Pearson on raw distances is a smooth lower
-               bound on Spearman in this range; cheap and differentiable
-               unlike a strict soft-rank.)
+        Scope:
+          - ``global`` (default): the full distance row — directly
+            mirrors the eval metric (per-cell Spearman on full row).
+            Recommended starting point.
+          - ``local``: restricted to the k nearest TRUE neighbours of
+            each cell. Targets local visual fidelity but, used as a
+            primary loss, admits degenerate solutions (tight local
+            clusters that preserve rank within k but break global
+            scale). Always use with a small weight (≤ 1e-1) as a
+            regulariser when ``scope=local``.
 
-        Loss returned is ``1 - mean(corr_i)`` averaged across slices,
-        so it's 0 when local geometry is perfectly preserved and 1
-        when prediction is uncorrelated with truth.
-
-        Direction-matters: we deliberately pick neighbours in TRUE
-        space (the geometry we want to preserve), not in predicted
-        space — otherwise the loss has a degenerate solution where the
-        model predicts a tight cluster and "preserves" the trivial
-        ordering.
+        Why pick neighbours in TRUE space (not PRED) for the local
+        scope: picking in pred space rewards the model for putting
+        any k cells close together, regardless of correctness.
+        Anchoring on true neighbours forces it to recover the right
+        local set.
         """
         slice_losses: List[torch.Tensor] = []
         eps = 1e-8
+        scope = self._knn_scope
         k = self._knn_k
 
         for true_pos, pred_pos, mask in zip(
@@ -177,34 +192,54 @@ class LossFunction(nn.Module):
             true_pos_m = true_pos[mask]  # (n, D)
             pred_pos_m = pred_pos[mask]  # (n, D)
             n = true_pos_m.shape[0]
-            # A slice with too few cells can't form a k-NN; skip
-            # rather than crash. The other slices in the batch carry
-            # the gradient.
-            k_eff = min(k, max(n - 1, 1))
-            if n < 3 or k_eff < 2:
+            # Too few cells → can't compute meaningful row correlation;
+            # skip but let other slices carry the gradient.
+            min_n = 3
+            if scope == "local":
+                min_n = max(min_n, 3)
+            if n < min_n:
                 continue
 
-            # k-NN selection: gradient-free.
+            # True distances: gradient-free reference.
             with torch.no_grad():
                 d_true_ref = torch.cdist(true_pos_m, true_pos_m, p=2)
-                # Mask self-distance so cell i never picks itself.
-                d_true_ref_masked = d_true_ref.clone()
-                d_true_ref_masked.fill_diagonal_(float("inf"))
-                _, knn_idx = torch.topk(
-                    d_true_ref_masked, k=k_eff, largest=False, dim=1,
-                )
-
-            # Distances on the same matrix — true side is detached
-            # (constant data), pred side carries gradients.
             d_true = d_true_ref.detach()
+            # Pred distances: gradient-bearing.
             d_pred = torch.cdist(pred_pos_m, pred_pos_m, p=2)
 
-            true_knn = torch.gather(d_true, 1, knn_idx)   # (n, k_eff)
-            pred_knn = torch.gather(d_pred, 1, knn_idx)   # (n, k_eff)
+            if scope == "global":
+                # Full row; exclude the self-distance (always 0 on
+                # both sides — it would just inflate the correlation).
+                # Mask self by gathering all-but-diagonal entries.
+                # Easiest: subtract off the diagonal contribution by
+                # working on (n, n-1) tensors via gather of the
+                # non-self column indices.
+                idx_all = torch.arange(n, device=d_true.device)
+                # For each row i, the non-self columns are
+                # [0..i-1, i+1..n-1]. Build that as a (n, n-1) index.
+                col = idx_all.unsqueeze(0).expand(n, n)  # (n, n)
+                row = idx_all.unsqueeze(1).expand(n, n)  # (n, n)
+                non_self = col != row                    # (n, n) bool
+                # Reshape to (n, n-1) by masking out the diagonal.
+                non_self_idx = col[non_self].reshape(n, n - 1)
+                true_row = torch.gather(d_true, 1, non_self_idx)
+                pred_row = torch.gather(d_pred, 1, non_self_idx)
+            else:  # scope == "local"
+                k_eff = min(k, max(n - 1, 1))
+                if k_eff < 2:
+                    continue
+                with torch.no_grad():
+                    d_true_masked = d_true_ref.clone()
+                    d_true_masked.fill_diagonal_(float("inf"))
+                    _, knn_idx = torch.topk(
+                        d_true_masked, k=k_eff, largest=False, dim=1,
+                    )
+                true_row = torch.gather(d_true, 1, knn_idx)
+                pred_row = torch.gather(d_pred, 1, knn_idx)
 
-            # Per-cell Pearson(true_knn[i, :], pred_knn[i, :]).
-            true_c = true_knn - true_knn.mean(dim=1, keepdim=True)
-            pred_c = pred_knn - pred_knn.mean(dim=1, keepdim=True)
+            # Per-cell Pearson(true_row[i, :], pred_row[i, :]).
+            true_c = true_row - true_row.mean(dim=1, keepdim=True)
+            pred_c = pred_row - pred_row.mean(dim=1, keepdim=True)
             cov = (true_c * pred_c).sum(dim=1)
             true_norm = torch.sqrt((true_c ** 2).sum(dim=1) + eps)
             pred_norm = torch.sqrt((pred_c ** 2).sum(dim=1) + eps)
