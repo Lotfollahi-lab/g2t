@@ -46,29 +46,51 @@ loss:
         weight: 1.0
 
     # Rank-preservation correlation loss. Per-cell Pearson correlation
-    # between true and predicted pairwise-distance rows; loss is
-    # ``1 - mean(corr)`` over cells × slices. Pearson is a smooth
-    # surrogate for Spearman (the eval metric); a soft-rank swap is a
-    # future upgrade if this is the deciding component.
-    #
-    # Two scopes:
-    #   scope=global -> use the full distance row of each cell
-    #                   (matches the eval metric exactly).
-    #   scope=local  -> restrict to the k nearest TRUE neighbours of
-    #                   each cell. Targets visual local fidelity but
-    #                   can be hijacked by degenerate local-cluster
-    #                   solutions that hurt global Spearman. Use with
-    #                   a SMALL weight (1e-2..1e-1) as a regulariser,
-    #                   never as the main loss.
-    #
-    # WEIGHT SCALE WARNING: this loss lives in [0, 2] (1 - corr where
-    # corr is bounded in [-1, 1]) while ``pairwise_distance_mse`` lives
-    # in ~[1e-3, 1e-1] for the LUNA setup. weight=1.0 makes this term
-    # ~10–100× bigger than the LUNA loss and the optimiser will
-    # ignore the pairwise MSE entirely. Start with weight in
-    # [1e-2, 1e-1] and sweep up.
+    # between true/pred pairwise-distance rows; loss is
+    # ``1 - mean(corr)``. Tested both global (full row, mirrors eval
+    # metric) and local (k-NN only) scopes — neither helped on the
+    # MMC cortex baseline. Kept here as a configurable knob for
+    # future ablations but DEFAULT OFF and we've moved on to the PH
+    # loss below.
     knn_rank:
         enabled: false
-        scope: global  # "global" (full row, matches eval) or "local" (k-NN only)
-        weight: 0.05   # see WEIGHT SCALE WARNING above
-        k: 20          # ignored when scope=global; only used for scope=local
+        scope: global  # "global" (full row) or "local" (k-NN only)
+        weight: 0.05
+        k: 20          # only used when scope=local
+
+    # 0-dim persistent homology loss (MST / Wasserstein-2² formulation).
+    #
+    # The 0-dim persistence diagram of a finite point cloud is exactly
+    # the multiset of MST edge lengths: each cell is "born" at filtration
+    # time 0 and "dies" by merging into another component at the next
+    # MST edge it sits on. So for an N-cell slice, PD_0 = sorted (N-1)
+    # MST edge lengths. Wasserstein-2² between two equal-cardinality
+    # PDs collapses to MSE between the sorted-edge-length vectors —
+    # which is differentiable through the predicted distance matrix
+    # via gather + sort (the MST STRUCTURE is determined
+    # non-differentiably by scipy, but the LENGTHS at those edge
+    # indices flow gradients back to pred coords). This is the
+    # standard "fixed structure" differentiable-persistence trick
+    # (Bruel-Gabrielsson et al. 2020; Hofer et al. 2019).
+    #
+    # Motivation: LUNA's pairwise-distance MSE penalises every pair
+    # uniformly. The MST edges are the "skeleton" that determines
+    # the cluster structure of the tissue; aligning them captures
+    # cell-density topology that pairwise MSE smears across all
+    # N² pairs.
+    #
+    # 1-dim PH (loop / region structure) is a natural follow-up but
+    # needs the alpha complex (gudhi) — not implemented in this
+    # pass; the 0-dim MST version is much cheaper and gives us a
+    # first signal on whether topological signals help here at all.
+    #
+    # Implementation cost: scipy MST is CPU-side (~tens of ms for
+    # N=10k); we transfer the distance matrix once per slice per
+    # step. `subsample: N` caps the cell count per slice (random
+    # subsample at each step) if your slice is large enough to make
+    # this the bottleneck.
+    persistent_homology:
+        enabled: false
+        weight: 0.5       # same units as pairwise_distance_mse; 0.5 = roughly co-equal
+        subsample: null   # null = use all cells; integer caps per-slice n for speed
+        dim: 0            # only 0-dim supported for now (MST). 1-dim TODO via gudhi.

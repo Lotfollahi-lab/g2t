@@ -106,6 +106,25 @@ class LossFunction(nn.Module):
                 f"got {self._knn_scope!r}"
             )
 
+        # 0-dim persistent homology loss (MST / Wasserstein-2²).
+        self._ph_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                         "persistent_homology", "enabled",
+                                         default=False))
+        self._ph_weight = float(_cfg_get(cfg, "model", "loss",
+                                         "persistent_homology", "weight",
+                                         default=0.5))
+        ph_subsample = _cfg_get(cfg, "model", "loss",
+                                "persistent_homology", "subsample", default=None)
+        self._ph_subsample = int(ph_subsample) if ph_subsample else None
+        self._ph_dim = int(_cfg_get(cfg, "model", "loss",
+                                    "persistent_homology", "dim", default=0))
+        if self._ph_dim != 0:
+            raise NotImplementedError(
+                f"model.loss.persistent_homology.dim={self._ph_dim} not "
+                f"supported. Only 0-dim (MST formulation) is implemented; "
+                f"1-dim needs the alpha complex (gudhi) — TODO."
+            )
+
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
         # ``compute_loss`` iterates this list — adding a new component
@@ -115,6 +134,8 @@ class LossFunction(nn.Module):
              self._compute_pairwise_distance_mse),
             ("knn_rank", self._knn_enabled, self._knn_weight,
              self._compute_knn_rank),
+            ("persistent_homology", self._ph_enabled, self._ph_weight,
+             self._compute_persistent_homology),
         ]
 
         # One-time summary so the train.log shows what's active.
@@ -127,6 +148,10 @@ class LossFunction(nn.Module):
                 extra = f", scope={self._knn_scope}"
                 if self._knn_scope == "local":
                     extra += f", k={self._knn_k}"
+            elif name == "persistent_homology":
+                extra = f", dim={self._ph_dim}"
+                if self._ph_subsample:
+                    extra += f", subsample={self._ph_subsample}"
             active.append(f"{name}(w={w:.3g}{extra})")
         print(f"[LossFunction] active components: {', '.join(active) or '(none!)'}")
 
@@ -254,6 +279,85 @@ class LossFunction(nn.Module):
                     else torch.tensor(0.0))
             return zero
 
+        return torch.mean(torch.stack(slice_losses))
+
+    def _compute_persistent_homology(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """0-dim persistent homology loss via minimum spanning tree.
+
+        Per slice: PD_0(true) = sorted MST-edge-lengths of true coords;
+        PD_0(pred) = sorted MST-edge-lengths of pred coords. The
+        Wasserstein-2² distance between two equal-cardinality 0-dim
+        PDs reduces to the MSE between the sorted vectors, which is
+        what we return. The loss is averaged across slices.
+
+        Differentiability: scipy's MST gives us the (row, col) indices
+        of the N−1 spanning edges. We gather distances at those
+        indices from the *gradient-bearing* ``pred_dist`` tensor;
+        gradients flow into ``pred_pos`` via the cdist chain rule.
+        The MST STRUCTURE is treated as constant (standard "fixed
+        structure" differentiable-persistence trick — Hofer 2019,
+        Bruel-Gabrielsson 2020).
+        """
+        import numpy as np
+        from scipy.sparse.csgraph import minimum_spanning_tree
+
+        slice_losses: List[torch.Tensor] = []
+        subsample = self._ph_subsample
+
+        for true_pos, pred_pos, mask in zip(
+            masked_true.positions, masked_pred.positions, masked_true.node_mask,
+        ):
+            true_pos_m = true_pos[mask]
+            pred_pos_m = pred_pos[mask]
+            n = true_pos_m.shape[0]
+            if n < 3:
+                continue
+
+            # Optional random subsampling for large slices. Stochastic
+            # per step — the subsample changes each iteration, which is
+            # fine here (the PH signal is robust to it as long as the
+            # subsample covers the same density profile).
+            if subsample is not None and n > subsample:
+                with torch.no_grad():
+                    idx = torch.randperm(n, device=true_pos_m.device)[:subsample]
+                true_pos_m = true_pos_m[idx]
+                pred_pos_m = pred_pos_m[idx]
+                n = subsample
+
+            # True MST: non-differentiable, computed once via scipy.
+            with torch.no_grad():
+                d_true = torch.cdist(true_pos_m, true_pos_m, p=2)
+                d_true_np = d_true.detach().cpu().numpy()
+                true_mst = minimum_spanning_tree(d_true_np).tocoo()
+                true_edges_sorted = torch.from_numpy(
+                    np.sort(true_mst.data)
+                ).to(true_pos_m.device, dtype=true_pos_m.dtype)
+
+            # Pred distances: gradient-bearing.
+            d_pred = torch.cdist(pred_pos_m, pred_pos_m, p=2)
+            # Pred MST: structure is non-differentiable (scipy) but
+            # the EDGE LENGTHS are gathered from d_pred so gradients
+            # flow back to pred_pos.
+            with torch.no_grad():
+                d_pred_np = d_pred.detach().cpu().numpy()
+                pred_mst = minimum_spanning_tree(d_pred_np).tocoo()
+                pred_rows = torch.from_numpy(pred_mst.row).long().to(d_pred.device)
+                pred_cols = torch.from_numpy(pred_mst.col).long().to(d_pred.device)
+            pred_edges = d_pred[pred_rows, pred_cols]    # (n-1,), gradient-bearing
+            pred_edges_sorted, _ = torch.sort(pred_edges)
+
+            # Equal-cardinality W2² between PDs collapses to MSE between
+            # sorted edge vectors. (Both have n-1 entries by construction.)
+            w2_sq = ((pred_edges_sorted - true_edges_sorted) ** 2).mean()
+            slice_losses.append(w2_sq)
+
+        if not slice_losses:
+            zero = (masked_pred.positions[0].sum() * 0.0
+                    if len(masked_pred.positions) > 0
+                    else torch.tensor(0.0))
+            return zero
         return torch.mean(torch.stack(slice_losses))
 
     # ----------------------------- aggregation ----------------------------

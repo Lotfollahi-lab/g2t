@@ -570,6 +570,7 @@ def _invoke_luna(
     overrides: List[str],
     log_path: Path,
     mode: str = "train_and_test",
+    wandb_project: Optional[str] = None,
 ) -> int:
     """Run LUNA via our monkey-patching launcher (``_luna_runner.py``),
     in the same Python env.
@@ -596,6 +597,8 @@ def _invoke_luna(
         "--luna_repo", str(luna_repo),
         "--mode", mode,
     ]
+    if wandb_project:
+        cmd += ["--wandb_project", wandb_project]
     for o in overrides:
         cmd += ["--override", o]
     logger.info(f"Invoking LUNA via launcher (mode={mode}):")
@@ -1064,7 +1067,11 @@ def run_benchmark(
     log_path = out / "luna_stdout.log"
     tracker.start("training")
     try:
-        rc = _invoke_luna(luna_repo_p, overrides, log_path, mode=mode)
+        rc = _invoke_luna(
+            luna_repo_p, overrides, log_path,
+            mode=mode,
+            wandb_project=(wandb_project or None),
+        )
     finally:
         tracker.end("training", flush_to=runtime_csv)
     if rc != 0:
@@ -1298,7 +1305,8 @@ def main() -> int:
             run_name=args.wandb_run_name,
             log2_normalize=args.log2_normalize,
             wandb_mode=args.wandb_mode,
-            wandb_project=args.wandb_project or "",
+            # 'scgg' is the fixed default; --wandb_project overrides ad-hoc.
+            wandb_project=args.wandb_project or "scgg",
             extra_overrides=args.override,
             train_csv=args.train_csv,
             test_csv=args.test_csv,

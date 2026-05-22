@@ -5,6 +5,10 @@ wandb: 'online' # run, disabled, online, dryrun or offline
 # `compose()` accepts plain `general.wandb_project=...` overrides
 # instead of demanding the `+general.wandb_project=...` add-prefix.
 wandb_project: null
+# wandb entity (team or user). null → wandb's default = your
+# personal account. Pass `general.wandb_entity=<team>` if you want
+# the runs to land under a team account instead.
+wandb_entity: null
 mode: 'train_and_test' # 'train_and_test', 'test_only', 'train_only'
 seed: 0 # random seed
 enable_progress_bar: True # Enable progress bar for training and validation

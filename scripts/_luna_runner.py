@@ -106,6 +106,68 @@ def _patch_datamodule(target_mode: str) -> None:
     )
 
 
+def _patch_setup_wandb(force_project: Optional[str]) -> None:
+    """Monkey-patch ``utils.data.misc.setup_wandb`` to use a fixed
+    project name.
+
+    LUNA's stock ``setup_wandb`` defaults to
+    ``f'MolDiffusion_{dataset_name}'`` and we tried adding a
+    ``cfg.general.wandb_project`` Hydra override on top of that —
+    which doesn't reliably reach the call site (depends on which
+    LUNA tree is on ``sys.path`` and whether ``general.wandb_project``
+    is in the schema). This patch sidesteps that whole chain: each
+    train/inference wrapper passes ``--wandb_project <name>`` to the
+    launcher, which replaces ``setup_wandb`` with a version that
+    always uses ``<name>``. Predictable; no fallback to
+    ``MolDiffusion_*``.
+
+    If ``force_project`` is None (e.g. someone invokes
+    ``_luna_runner.py`` directly without the flag) we leave the
+    upstream ``setup_wandb`` untouched.
+    """
+    if not force_project:
+        return
+    import wandb as wandb_mod
+    import omegaconf as oc
+    from utils.data import misc as misc_mod  # type: ignore
+
+    def patched_setup_wandb(cfg):
+        config_dict = oc.OmegaConf.to_container(
+            cfg, resolve=True, throw_on_missing=True,
+        )
+        entity = getattr(cfg.general, "wandb_entity", None) or None
+        kwargs = {
+            "name": cfg.general.name,
+            "project": force_project,
+            "entity": entity,
+            "config": config_dict,
+            "reinit": True,
+            "mode": cfg.general.wandb,
+        }
+        print(
+            f"[setup_wandb] init (forced): project={force_project!r}, "
+            f"entity={entity!r}, mode={cfg.general.wandb!r}, "
+            f"name={cfg.general.name!r}"
+        )
+        wandb_mod.init(**kwargs)
+        wandb_mod.save("*.txt")
+        return cfg
+
+    misc_mod.setup_wandb = patched_setup_wandb
+    # FullDenoisingDiffusion imports setup_wandb into its module
+    # namespace at import time — rebind that too.
+    import diffusion_model as luna_diffusion_mod  # type: ignore
+    if hasattr(luna_diffusion_mod, "setup_wandb"):
+        luna_diffusion_mod.setup_wandb = patched_setup_wandb
+    # Same for utils.diffusion_model.setup.setup, which also imports it.
+    from utils.diffusion_model.setup import setup as setup_mod  # type: ignore
+    if hasattr(setup_mod, "setup_wandb"):
+        setup_mod.setup_wandb = patched_setup_wandb
+    logger.info(
+        f"[luna_runner] patched setup_wandb (force project={force_project!r})"
+    )
+
+
 def _patch_load_model_config() -> None:
     """LUNA's stock ``load_model_config`` reads
     ``<checkpoint_dir>/../.hydra/config.yaml`` and crashes if the file
@@ -303,6 +365,13 @@ def main() -> int:
         "--override", action="append", default=[],
         help="Hydra override (key=value). Repeatable.",
     )
+    p.add_argument(
+        "--wandb_project", default=None,
+        help="If set, force wandb runs into this project regardless of "
+             "what cfg.general.wandb_project resolves to. Set per-engine "
+             "by the run_*_train.py / run_*_inference.py wrappers "
+             "(scgg -> 'scgg', luna -> 'luna').",
+    )
     args = p.parse_args()
 
     logging.basicConfig(
@@ -342,6 +411,7 @@ def main() -> int:
     _patch_setup_model()
     _patch_load_model_config()
     _patch_setup_callbacks()
+    _patch_setup_wandb(args.wandb_project)
 
     # Compose the config from an ABSOLUTE path — using @hydra.main would
     # resolve config_path relative to THIS file (scgg/scripts/), which
