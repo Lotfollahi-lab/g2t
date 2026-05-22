@@ -267,6 +267,20 @@ class EGNNModel(nn.Module):
         device = positions.device
         flat = lambda t: t.reshape(B * N, -1)
 
+        # The noise model emits `diffusion_time` as one scalar per
+        # slice — shape (B, 1) — not per-cell. LUNA's stock model
+        # handles that implicitly: its time MLP runs on (B, 1) then
+        # the transformer block broadcasts internally. Our EGNN
+        # flattens to (B*N, ·) up-front, so we have to broadcast
+        # explicitly. Accept (B,), (B, 1), (B, time_in), and the
+        # already-broadcast (B, N, time_in) cases — all produce
+        # the same downstream shape.
+        if diffusion_time.dim() == 1:                 # (B,)
+            diffusion_time = diffusion_time.view(B, 1, 1).expand(B, N, 1)
+        elif diffusion_time.dim() == 2:               # (B, T)
+            diffusion_time = diffusion_time.unsqueeze(1).expand(B, N, -1)
+        # else: already (B, N, T) — leave it alone.
+
         # Initial encodings.
         h = self.gene_encoder(flat(node_features))   # (B*N, node_dim)
         x = flat(positions)                          # (B*N, 2)
