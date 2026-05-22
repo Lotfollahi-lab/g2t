@@ -173,22 +173,10 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
     if wandb.run and local_rank == 0:
         setup_wandb(cfg)
 
-    # CSV logger so per-step / per-epoch losses land on disk regardless
-    # of whether wandb is online. The old scgg Trainer wrote
-    # `metrics.csv` next to the checkpoints; this restores that
-    # behaviour now that we run on PyTorch Lightning. Logger writes to
-    # `<cwd>/lightning_logs/<name>/metrics.csv` — and because
-    # _luna_runner.py chdirs into `<out_dir>/luna_run/` before training,
-    # that resolves to `<out_dir>/luna_run/lightning_logs/<name>/metrics.csv`.
-    # ``version=""`` keeps the path stable across re-runs in the same
-    # output dir (PL otherwise auto-increments ``version_N``).
-    from pytorch_lightning.loggers import CSVLogger
-    csv_logger = CSVLogger(
-        save_dir=os.getcwd(),
-        name="lightning_logs",
-        version=cfg.general.name,
-    )
-
+    # NB: per-step / per-epoch CSV metrics come from the
+    # MetricsCsvCallback injected by _luna_runner.py — that writes a
+    # human-discoverable `<out_dir>/metrics.csv` directly, instead of
+    # PL's default-buried `lightning_logs/<name>/version_N/metrics.csv`.
     return Trainer(
         devices=gpus,
         max_epochs=max_epochs,
@@ -198,6 +186,5 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
         strategy='ddp_find_unused_parameters_true',
         log_every_n_steps=50 if fast_dev_run else 1,
         enable_progress_bar=cfg.general.enable_progress_bar,
-        logger=csv_logger,
     )
 

@@ -177,6 +177,100 @@ def _patch_setup_model() -> None:
     logger.info("[luna_runner] patched setup_model (resume only on test_only)")
 
 
+def _patch_setup_callbacks() -> None:
+    """Inject a ``MetricsCsvCallback`` into LUNA's callback list so
+    per-epoch loss values land on disk at ``<out_dir>/metrics.csv``.
+
+    LUNA's PyTorch Lightning trainer ships with no on-disk metrics
+    logger by default — its ``setup_trainer`` doesn't pass a
+    ``logger=`` argument, and even PL's default ``CSVLogger`` puts
+    things under ``lightning_logs/<name>/version_N/metrics.csv``,
+    three directories deep and not very discoverable. We want a
+    single ``metrics.csv`` next to the rest of the artifacts
+    (``runtime.csv``, ``aggregate_metrics.json``, …).
+
+    The callback:
+      * writes one row per training/validation epoch
+      * row contains ``step``, ``epoch``, ``phase``, and every numeric
+        entry in ``trainer.callback_metrics`` (i.e. all the
+        ``train_loss/*``, ``train_epoch/*``, ``val_loss/*`` keys our
+        ``LossFunction`` already emits)
+      * appends across the run; columns grow as new logged keys
+        appear (column set is rewritten on each row to keep things
+        simple — fine for the row counts we produce, ~few × n_epochs).
+    """
+    import csv as _csv
+    import pytorch_lightning as pl_local
+    from utils.diffusion_model.setup import setup as setup_mod  # type: ignore
+
+    class MetricsCsvCallback(pl_local.Callback):
+        def __init__(self, out_path: Path):
+            super().__init__()
+            self.out_path = out_path
+            self.out_path.parent.mkdir(parents=True, exist_ok=True)
+            self._rows: list[dict] = []
+
+        def _snapshot(self, trainer, phase: str) -> None:
+            row = {
+                "phase": phase,
+                "epoch": int(trainer.current_epoch),
+                "global_step": int(trainer.global_step),
+            }
+            for k, v in trainer.callback_metrics.items():
+                try:
+                    if hasattr(v, "detach"):
+                        row[k] = float(v.detach().cpu().item())
+                    else:
+                        row[k] = float(v)
+                except Exception:
+                    # non-numeric metric — stringify so the column is preserved
+                    row[k] = str(v)
+            self._rows.append(row)
+            # Stable column set across writes (sorted for determinism + a
+            # consistent ordering across re-runs in the same out_dir).
+            fieldnames = sorted({k for r in self._rows for k in r.keys()})
+            with open(self.out_path, "w", newline="") as f:
+                w = _csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                w.writeheader()
+                for r in self._rows:
+                    w.writerow(r)
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            self._snapshot(trainer, phase="train_epoch")
+
+        def on_validation_epoch_end(self, trainer, pl_module):
+            # Only meaningful when validation is actually configured;
+            # PL still calls this hook with empty metrics if not.
+            if trainer.sanity_checking:
+                return
+            self._snapshot(trainer, phase="val_epoch")
+
+    OrigSetupCallbacks = setup_mod.setup_callbacks
+
+    def patched_setup_callbacks(cfg, datamodule):
+        callbacks = list(OrigSetupCallbacks(cfg, datamodule))
+        # cfg.general.local_saved_path is the Hydra run dir, which our
+        # run_*_train.py wrappers set to <out_dir>/luna_run/. metrics.csv
+        # should live one level up next to runtime.csv etc.
+        run_dir = Path(cfg.general.local_saved_path)
+        out_dir = run_dir.parent
+        metrics_csv = out_dir / "metrics.csv"
+        callbacks.append(MetricsCsvCallback(metrics_csv))
+        logger.info(
+            f"[luna_runner] MetricsCsvCallback will write per-epoch losses "
+            f"to {metrics_csv}"
+        )
+        return callbacks
+
+    setup_mod.setup_callbacks = patched_setup_callbacks
+    # train_model already imported setup_callbacks into main's namespace;
+    # rebind that too so the patched version is the one called.
+    import main as luna_main_mod  # type: ignore
+    if hasattr(luna_main_mod, "setup_callbacks"):
+        luna_main_mod.setup_callbacks = patched_setup_callbacks
+    logger.info("[luna_runner] patched setup_callbacks (adds MetricsCsvCallback)")
+
+
 def _extract_output_dir(overrides) -> Optional[str]:
     """Pull a ``hydra.run.dir=...`` override out of the list, returning
     the path. ``compose`` (which we use instead of ``@hydra.main``)
@@ -247,6 +341,7 @@ def main() -> int:
     # checkpoint path to fail loudly, not default to epoch 0.
     _patch_setup_model()
     _patch_load_model_config()
+    _patch_setup_callbacks()
 
     # Compose the config from an ABSOLUTE path — using @hydra.main would
     # resolve config_path relative to THIS file (scgg/scripts/), which

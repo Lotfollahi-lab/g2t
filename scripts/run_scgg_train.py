@@ -1125,11 +1125,18 @@ def run_benchmark(
     tracker.start("write_artifacts")
     if per_slice:
         fieldnames = sorted({k for r in per_slice for k in r.keys()})
-        with open(out / "per_slice_metrics.csv", "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for r in per_slice:
-                w.writerow(r)
+        # Write the canonical `metrics.csv` for inference + a
+        # back-compat alias `per_slice_metrics.csv`. The former
+        # mirrors the training-side `metrics.csv` filename so any
+        # downstream notebook that reads `<out_dir>/metrics.csv`
+        # works for both train (per-epoch losses) and inference
+        # (per-slice eval metrics).
+        for fname in ("metrics.csv", "per_slice_metrics.csv"):
+            with open(out / fname, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for r in per_slice:
+                    w.writerow(r)
     agg = {"spearman_mean_of_medians": headline, "n_test_slices": len(per_slice)}
     with open(out / "aggregate_metrics.json", "w") as f:
         json.dump(agg, f, indent=2, default=str)
