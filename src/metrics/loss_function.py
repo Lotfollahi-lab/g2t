@@ -118,6 +118,18 @@ class LossFunction(nn.Module):
         self._ph_subsample = int(ph_subsample) if ph_subsample else None
         self._ph_dim = int(_cfg_get(cfg, "model", "loss",
                                     "persistent_homology", "dim", default=0))
+        self._ph_frequency = max(1, int(_cfg_get(
+            cfg, "model", "loss", "persistent_homology", "frequency", default=1,
+        )))
+        self._ph_cache_true = bool(_cfg_get(
+            cfg, "model", "loss", "persistent_homology", "cache_true", default=True,
+        ))
+        # Step counter for `frequency` knob; cache for true MST edges.
+        # Cache size is bounded by the dataset's slice count, which is
+        # small (LUNA cortex: 33; ABCA Animal-1: 147). No eviction
+        # needed.
+        self._ph_step_counter = 0
+        self._ph_true_cache: dict = {}
         if self._ph_dim != 0:
             raise NotImplementedError(
                 f"model.loss.persistent_homology.dim={self._ph_dim} not "
@@ -150,6 +162,10 @@ class LossFunction(nn.Module):
                     extra += f", k={self._knn_k}"
             elif name == "persistent_homology":
                 extra = f", dim={self._ph_dim}"
+                if self._ph_frequency > 1:
+                    extra += f", every {self._ph_frequency} steps"
+                if self._ph_cache_true:
+                    extra += ", cache_true=on"
                 if self._ph_subsample:
                     extra += f", subsample={self._ph_subsample}"
             active.append(f"{name}(w={w:.3g}{extra})")
@@ -299,9 +315,32 @@ class LossFunction(nn.Module):
         The MST STRUCTURE is treated as constant (standard "fixed
         structure" differentiable-persistence trick — Hofer 2019,
         Bruel-Gabrielsson 2020).
+
+        Speed knobs:
+          * ``frequency``: compute PH every N training steps; other
+            steps return a detached zero. The PH signal direction is
+            identical, just sampled — a 10× speedup at frequency=10.
+          * ``cache_true``: skip the (constant) true cdist + true MST
+            on cache hits. True positions never change across epochs
+            so this is a pure win.
         """
         import numpy as np
         from scipy.sparse.csgraph import minimum_spanning_tree
+
+        # Detached-zero shortcut for "this isn't a PH step". Attached
+        # to the prediction graph via *0 so backward stays valid when
+        # this term is summed into the total loss.
+        def _zero():
+            if len(masked_pred.positions) > 0:
+                return masked_pred.positions[0].sum() * 0.0
+            return torch.tensor(0.0)
+
+        # `frequency` skip — early return BEFORE we do any cdist /
+        # CPU transfer / scipy work. This is where the wall-clock
+        # win comes from for frequency > 1.
+        self._ph_step_counter += 1
+        if (self._ph_step_counter - 1) % self._ph_frequency != 0:
+            return _zero()
 
         slice_losses: List[torch.Tensor] = []
         subsample = self._ph_subsample
@@ -318,28 +357,54 @@ class LossFunction(nn.Module):
             # Optional random subsampling for large slices. Stochastic
             # per step — the subsample changes each iteration, which is
             # fine here (the PH signal is robust to it as long as the
-            # subsample covers the same density profile).
-            if subsample is not None and n > subsample:
+            # subsample covers the same density profile). Note: when
+            # subsample is on, the true-MST cache is bypassed because
+            # the random subsample changes per step.
+            using_subsample = subsample is not None and n > subsample
+            if using_subsample:
                 with torch.no_grad():
                     idx = torch.randperm(n, device=true_pos_m.device)[:subsample]
                 true_pos_m = true_pos_m[idx]
                 pred_pos_m = pred_pos_m[idx]
                 n = subsample
 
-            # True MST: non-differentiable, computed once via scipy.
-            with torch.no_grad():
-                d_true = torch.cdist(true_pos_m, true_pos_m, p=2)
-                d_true_np = d_true.detach().cpu().numpy()
-                true_mst = minimum_spanning_tree(d_true_np).tocoo()
-                true_edges_sorted = torch.from_numpy(
-                    np.sort(true_mst.data)
-                ).to(true_pos_m.device, dtype=true_pos_m.dtype)
+            # ---- True MST: cache hit fast-path ----
+            cache_key = None
+            true_edges_sorted = None
+            if self._ph_cache_true and not using_subsample:
+                # Fingerprint by cell count + a few values + sum. This
+                # is unique-enough across slices and stable across
+                # training steps (true_pos is the same tensor content
+                # every step). data_ptr won't work because boolean
+                # indexing creates fresh tensors per step.
+                with torch.no_grad():
+                    cache_key = (
+                        n,
+                        float(true_pos_m[0, 0].item()),
+                        float(true_pos_m[-1, -1].item()),
+                        float(true_pos_m.sum().item()),
+                    )
+                cached = self._ph_true_cache.get(cache_key)
+                if cached is not None:
+                    true_edges_sorted = cached.to(
+                        device=true_pos_m.device, dtype=true_pos_m.dtype,
+                    )
 
-            # Pred distances: gradient-bearing.
+            if true_edges_sorted is None:
+                with torch.no_grad():
+                    d_true = torch.cdist(true_pos_m, true_pos_m, p=2)
+                    d_true_np = d_true.detach().cpu().numpy()
+                    true_mst = minimum_spanning_tree(d_true_np).tocoo()
+                    true_edges_sorted = torch.from_numpy(
+                        np.sort(true_mst.data)
+                    ).to(true_pos_m.device, dtype=true_pos_m.dtype)
+                # Stash on CPU to avoid GPU memory growth across the
+                # dataset; we'll move it back per step.
+                if cache_key is not None:
+                    self._ph_true_cache[cache_key] = true_edges_sorted.detach().cpu()
+
+            # ---- Pred MST: must recompute every step ----
             d_pred = torch.cdist(pred_pos_m, pred_pos_m, p=2)
-            # Pred MST: structure is non-differentiable (scipy) but
-            # the EDGE LENGTHS are gathered from d_pred so gradients
-            # flow back to pred_pos.
             with torch.no_grad():
                 d_pred_np = d_pred.detach().cpu().numpy()
                 pred_mst = minimum_spanning_tree(d_pred_np).tocoo()
@@ -354,10 +419,7 @@ class LossFunction(nn.Module):
             slice_losses.append(w2_sq)
 
         if not slice_losses:
-            zero = (masked_pred.positions[0].sum() * 0.0
-                    if len(masked_pred.positions) > 0
-                    else torch.tensor(0.0))
-            return zero
+            return _zero()
         return torch.mean(torch.stack(slice_losses))
 
     # ----------------------------- aggregation ----------------------------
