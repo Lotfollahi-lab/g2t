@@ -106,6 +106,118 @@ def _patch_datamodule(target_mode: str) -> None:
     )
 
 
+def _patch_test_single_checkpoint() -> None:
+    """LUNA's stock ``test_single_checkpoint`` silently bails out when
+    the checkpoint filename doesn't match ``epoch=N.ckpt``::
+
+        try:
+            cfg.test.epoch_index = int(checkpoint_path.split("=")[-1].split(".")[0])
+        except ValueError:
+            return   # silently!
+
+    That fires for anything sensible-but-non-standard you'd pass:
+    ``best_model.ckpt`` (our symlink target name), ``last.ckpt``,
+    ``checkpoint.ckpt``, etc. The whole test phase becomes a no-op,
+    LUNA exits 0, and the caller sees "no metadata_pred.csv" with no
+    explanation. We replace the silent return with a fallback that
+    sets ``epoch_index = 0`` and continues, so the test always runs.
+    """
+    import os
+    import main as luna_main_mod  # noqa: WPS433
+
+    def patched_test_single_checkpoint(
+        cfg, dataset_infos, *positional, **kwargs,
+    ):
+        # Signature note: upstream LUNA's signature is
+        # (cfg, datamodule, dataset_infos, checkpoint_path, dataloader_test).
+        # We accept varargs/kwargs so any version of LUNA we wrap stays
+        # callable, then re-extract the parts we need by name or position.
+        datamodule = positional[0] if positional else kwargs["datamodule"]
+        checkpoint_path = (
+            positional[1] if len(positional) > 1
+            else kwargs.get("checkpoint_path") or kwargs["checkpoint"]
+        )
+        dataloader_test = (
+            positional[2] if len(positional) > 2
+            else kwargs.get("dataloader_test") or kwargs.get("dataloaders_test")
+        )
+
+        cfg.test.checkpoint_path = checkpoint_path
+        cfg.test.test_save_parent_path = os.path.join(
+            cfg.test.save_dir, cfg.general.name
+        )
+        print(f"Testing checkpoint: {checkpoint_path}")
+        try:
+            cfg.test.epoch_index = int(
+                checkpoint_path.split("=")[-1].split(".")[0]
+            )
+        except ValueError:
+            cfg.test.epoch_index = 0
+            print(
+                f"  (filename {os.path.basename(checkpoint_path)!r} doesn't "
+                f"match epoch=N.ckpt — defaulting epoch_index to 0 and "
+                f"continuing instead of LUNA's silent skip.)"
+            )
+        print(f"Epoch index: {cfg.test.epoch_index}")
+        if cfg.general.mode == "test_only":
+            luna_main_mod.load_model_config(cfg, checkpoint_path)
+        model = luna_main_mod.setup_model(
+            cfg, dataset_infos, checkpoint_path=checkpoint_path,
+        )
+        callbacks = luna_main_mod.setup_callbacks(cfg, datamodule)
+        trainer = luna_main_mod.setup_trainer(cfg, callbacks)
+        trainer.test(
+            model, ckpt_path=checkpoint_path, dataloaders=dataloader_test,
+        )
+
+    # Wrap so we get the upstream calling convention back. test_model
+    # invokes `test_single_checkpoint(cfg, datamodule, dataset_infos,
+    # checkpoint_path, dataloaders_test)` positionally — bind the
+    # positional args through to our patched body.
+    def adapter(cfg, datamodule, dataset_infos, checkpoint_path, dataloader_test):
+        return patched_test_single_checkpoint(
+            cfg, dataset_infos, datamodule, checkpoint_path, dataloader_test,
+        )
+
+    luna_main_mod.test_single_checkpoint = adapter
+    logger.info(
+        "[luna_runner] patched test_single_checkpoint "
+        "(non-epoch=N filenames no longer silently skipped)"
+    )
+
+
+def _patch_load_model_config() -> None:
+    """LUNA's stock ``load_model_config`` reads
+    ``<checkpoint_dir>/../.hydra/config.yaml`` and crashes if the file
+    is missing. Training runs from before we started writing this
+    snapshot (or runs launched via ``compose()`` rather than
+    ``@hydra.main``) don't have it. Make the load lenient so we
+    keep the currently-composed ``cfg.model`` in that case — same
+    fix we made in the vendored scgg/src/main.py.
+    """
+    import os
+    import main as luna_main_mod  # noqa: WPS433
+    from yaml import safe_load
+
+    def patched_load_model_config(cfg, checkpoint_path):
+        config_file = "/".join(checkpoint_path.split("/")[:-2])
+        config_yaml = f"{config_file}/.hydra/config.yaml"
+        if not os.path.exists(config_yaml):
+            print(
+                f"[load_model_config] no snapshot at {config_yaml} — "
+                f"keeping the currently composed cfg.model."
+            )
+            return
+        loading_model_cfg = safe_load(open(config_yaml))
+        cfg["model"] = loading_model_cfg["model"]
+
+    luna_main_mod.load_model_config = patched_load_model_config
+    logger.info(
+        "[luna_runner] patched load_model_config "
+        "(missing .hydra/config.yaml no longer crashes)"
+    )
+
+
 def _patch_setup_model() -> None:
     """Monkey-patch upstream LUNA's ``setup_model`` so it only loads a
     checkpoint when ``general.mode == "test_only"``.
@@ -207,8 +319,10 @@ def main() -> int:
 
     # Patch setup_model AFTER main is imported so we can also rebind
     # main.setup_model (train_model uses the name imported into main's
-    # module namespace at import time).
+    # module namespace at import time). Same for the test-side patches.
     _patch_setup_model()
+    _patch_test_single_checkpoint()
+    _patch_load_model_config()
 
     # Compose the config from an ABSOLUTE path — using @hydra.main would
     # resolve config_path relative to THIS file (scgg/scripts/), which

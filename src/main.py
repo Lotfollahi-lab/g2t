@@ -106,10 +106,20 @@ def test_single_checkpoint(
     cfg.test.test_save_parent_path = os.path.join(cfg.test.save_dir, cfg.general.name)
 
     print("Testing checkpoint:", checkpoint_path)
+    # Default to 0 instead of silently returning when the filename
+    # doesn't match `epoch=N.ckpt`. Upstream LUNA's `return` on
+    # ValueError caused the whole test phase to no-op for anyone
+    # passing best_model.ckpt / last.ckpt / similar — LUNA would
+    # exit 0 with no predictions and no explanation. We mirror this
+    # patch onto external LUNA at runtime via _luna_runner.py too.
     try:
         cfg.test.epoch_index = int(checkpoint_path.split("=")[-1].split(".")[0])
     except ValueError:
-        return
+        cfg.test.epoch_index = 0
+        print(
+            f"  (filename {os.path.basename(checkpoint_path)!r} doesn't "
+            f"match epoch=N.ckpt — defaulting epoch_index to 0.)"
+        )
     print("Epoch index:", cfg.test.epoch_index)
 
     if cfg.general.mode == "test_only":
