@@ -49,13 +49,38 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.train_loss = LossFunction(cfg=cfg)
         self.val_loss = LossFunction(cfg=cfg)
 
-        self.model = Model(
-            input_dims=self.input_dims,
-            n_layers=cfg.model.n_layers,
-            hidden_mlp_dims=cfg.model.hidden_mlp_dims,
-            hidden_dims=cfg.model.hidden_dims,
-            output_dims=self.output_dims,
-        )
+        # Backbone selector: LUNA's stock transformer or scgg's
+        # SE(2)-equivariant EGNN. The EGNN path is gated behind a
+        # config knob so existing runs keep using the LUNA backbone
+        # unless explicitly opted in via
+        #     --override model.backbone=egnn
+        backbone = str(getattr(cfg.model, "backbone", "luna_transformer")).lower()
+        if backbone == "luna_transformer":
+            self.model = Model(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+            )
+        elif backbone == "egnn":
+            # Local import so the LUNA-baseline path (which doesn't
+            # need EGNN's torch-geometric kNN code) keeps loading
+            # fast even if torch-geometric's optional deps are flaky.
+            from models.egnn import EGNNModel
+            self.model = EGNNModel(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                egnn_cfg=cfg.model.egnn,
+            )
+        else:
+            raise ValueError(
+                f"Unknown model.backbone={backbone!r}. "
+                f"Expected 'luna_transformer' or 'egnn'."
+            )
 
         self.noise_model = NoiseModel(cfg)
 

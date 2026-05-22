@@ -1,4 +1,17 @@
-n_layers: 8 # Number of transformer layers
+# Architecture selector.
+# - "luna_transformer" — LUNA's original architecture: 3-stream
+#   (node features / diffusion time / positions) transformer with
+#   linear attention and position-direction-conditioned attention.
+#   Translation-invariance via mean-subtraction; rotation invariance
+#   has to be learned from data.
+# - "egnn"             — scgg's SE(2)-equivariant backbone. Built-in
+#   translation AND rotation equivariance via the standard
+#   Satorras et al. 2021 message-passing update on relative vectors.
+#   Same input/output interface as the LUNA Model so it drops in
+#   under the same training/inference pipeline.
+backbone: "luna_transformer"
+
+n_layers: 8 # Number of transformer/EGNN layers
 diffusion_noise_schedule: cosine # noise schedule for diffusion time
 diffusion_steps: 1000 # number of diffusion steps
 nu:
@@ -94,3 +107,25 @@ loss:
         weight: 0.5       # same units as pairwise_distance_mse; 0.5 = roughly co-equal
         subsample: null   # null = use all cells; integer caps per-slice n for speed
         dim: 0            # only 0-dim supported for now (MST). 1-dim TODO via gudhi.
+
+# ---------------------------------------------------------------------------
+# EGNN backbone hyperparameters. Only consulted when `backbone: "egnn"`.
+#
+# Equivariant message-passing on a per-step kNN graph (positions
+# determine the graph, but the graph is rebuilt each forward pass so
+# it always reflects current geometry). The kNN cap keeps memory
+# linear in `n_cells × knn_k` instead of quadratic in `n_cells`,
+# which matters once you scale past cortex slices.
+#
+# Defaults are chosen so a single EGNN layer is roughly memory-
+# comparable to one LUNA transformer layer on cortex
+# (B=6, N≈7500, edge_dim=64, knn_k=50 → ~300 MB / layer).
+# ---------------------------------------------------------------------------
+egnn:
+    node_dim: 256   # scalar per-cell feature width. Match LUNA's dx by default.
+    edge_dim: 64    # edge-message MLP hidden width. Smaller = less memory.
+    time_dim: 32    # diffusion-time embedding width fed into edge messages.
+    knn_k: 50       # message-passing neighbours per cell. 50 ≈ tissue-locally meaningful.
+    update_coords: true   # if false, EGNN updates h only; positions stay frozen
+                          # (useful for ablation: does the equivariant graph just
+                          # need to denoise features, not coords?). Default true.
