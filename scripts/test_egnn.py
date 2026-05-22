@@ -194,8 +194,17 @@ def test_time_shape_broadcast(tol: float = 1e-5) -> None:
 
 def test_gradient_flow() -> None:
     """Every learnable parameter should receive a non-zero gradient
-    from a loss on predicted positions. Catches dead branches (e.g.,
-    layer outputs not contributing to the prediction).
+    when the loss touches BOTH outputs of the model (positions AND
+    node features). This is a smoke test for wiring — the diffusion
+    training loss is positions-only, which *correctly* gives zero
+    gradient on output-side `h` branches (layers[-1].node_mlp and
+    out_node_proj feed only into out.node_features, which the
+    position loss ignores). Those branches are still part of the
+    architecture for future auxiliary losses on cell features, so we
+    want them trainable in principle — hence the joint loss here.
+
+    Catches actual wiring bugs (e.g., the zero-init coord_mlp issue
+    that blocked gradient flow through every upstream parameter).
     """
     torch.manual_seed(0)
     B, N, F = 2, 32, 16
@@ -210,9 +219,18 @@ def test_gradient_flow() -> None:
     )
     out = model(data)
 
-    # Simple loss: MSE against random "targets".
-    target = torch.randn_like(out.positions)
-    loss = ((out.positions - target) ** 2).mean()
+    # Joint loss: positions + node_features. The diffusion loss only
+    # uses positions in real training; we add the node_features term
+    # here solely to exercise the h-output branches in the gradient
+    # check. Both halves are simple MSEs against random targets — the
+    # values are meaningless, the only thing being tested is that
+    # gradient propagates everywhere.
+    target_pos = torch.randn_like(out.positions)
+    target_feat = torch.randn_like(out.node_features)
+    loss = (
+        ((out.positions - target_pos) ** 2).mean()
+        + ((out.node_features - target_feat) ** 2).mean()
+    )
     loss.backward()
 
     zero_names = []
@@ -233,11 +251,16 @@ def test_gradient_flow() -> None:
         for name in zero_names:
             print(f"          {name}")
         raise AssertionError(
-            f"{len(zero_names)}/{n_total} parameters got NO gradient through "
-            f"the position-loss path. This is the same failure mode the "
-            f"strict zero-init on coord_mlp produced — check that the EGNN "
-            f"layer's coord_mlp final init is non-zero (e.g. "
-            f"xavier_uniform_(gain=1e-3))."
+            f"{len(zero_names)}/{n_total} parameters got NO gradient under "
+            f"a JOINT positions + node_features loss. This means some "
+            f"learnable branch is completely disconnected from BOTH "
+            f"outputs — a real wiring bug, not just a position-loss "
+            f"dead-end. Likely culprits:\n"
+            f"  - a coord_mlp / node_mlp last layer that's strictly "
+            f"zero-init (use xavier_uniform_(gain=1e-3) instead)\n"
+            f"  - a layer's output not being passed forward / written "
+            f"to the returned DataHolder\n"
+            f"  - a module created but never called in forward()"
         )
     print(f"[grad]  {n_total}/{n_total} params received gradient")
     print("[grad]  PASS\n")
