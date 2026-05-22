@@ -123,9 +123,26 @@ def test_single_checkpoint(
 
 
 def load_model_config(cfg: DictConfig, checkpoint_path: str):
-    """Load model configuration from a previous training session."""
+    """Load model configuration from a previous training session.
+
+    Tolerant of missing snapshots: training runs from before scgg
+    started writing ``.hydra/config.yaml`` (or runs launched via
+    ``compose()`` instead of ``@hydra.main``) won't have this file. In
+    that case we just keep the currently-composed ``cfg.model``,
+    which matches the training-time model config as long as the user
+    didn't override it. The checkpoint load will fail at the next
+    step if there's a real mismatch.
+    """
     config_file = "/".join(checkpoint_path.split("/")[:-2])
-    loading_model_cfg = safe_load(open(f"{config_file}/.hydra/config.yaml"))
+    config_yaml = f"{config_file}/.hydra/config.yaml"
+    if not os.path.exists(config_yaml):
+        print(
+            f"[load_model_config] no snapshot at {config_yaml} — keeping "
+            f"the currently composed cfg.model (works if model config "
+            f"is unchanged from training)."
+        )
+        return
+    loading_model_cfg = safe_load(open(config_yaml))
     cfg["model"] = loading_model_cfg["model"]
 
 
