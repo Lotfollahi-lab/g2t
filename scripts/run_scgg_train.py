@@ -289,6 +289,16 @@ def _plot_pred_vs_truth(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
+    # Editable text in vector outputs. ``svg.fonttype="none"``
+    # writes text as <text> elements (Inkscape / Illustrator can
+    # select and re-style them); the default rasterises text into
+    # <path> outlines, which is what makes "SVG but not editable".
+    # ``pdf.fonttype=42`` embeds TrueType fonts in the PDF for the
+    # same reason.
+    matplotlib.rcParams["svg.fonttype"] = "none"
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    matplotlib.rcParams["ps.fonttype"] = 42
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     coords_true = np.asarray(coords_true, dtype=np.float64)
@@ -348,7 +358,14 @@ def _plot_pred_vs_truth(
     else:
         fig.tight_layout()
 
+    # Save BOTH .svg (editable text, vector) and .pdf (embedded
+    # font, vector) for each plot. SVG is best for in-browser
+    # diffing and Inkscape; PDF is best for paper inclusion.
+    # We honour the caller's extension as the "primary" name and
+    # write the other format as a sibling with the same stem.
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    sibling_ext = ".pdf" if out_path.suffix.lower() == ".svg" else ".svg"
+    fig.savefig(out_path.with_suffix(sibling_ext), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 

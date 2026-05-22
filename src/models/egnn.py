@@ -106,12 +106,19 @@ class EGNNLayer(nn.Module):
         # so positions don't blow up — but NON-ZERO so gradients flow
         # through every upstream parameter from step 0.
         #
-        # Strict zero-init (which I tried first) blocks gradient flow:
-        # if ``c = coord_mlp(m) == 0`` then ``x_update == 0`` and
-        # ``∂c/∂(coord_mlp inputs) == 0`` everywhere, so every
-        # parameter feeding into ``m`` — the edge MLP, node MLP, gene
-        # encoder, time encoder — gets zero gradient and never trains.
-        # The diffusion loss is on positions, so this is fatal.
+        # The Tanh on the LAST activation bounds the per-edge
+        # coefficient to (-1, 1). Without it, ``c`` can grow
+        # unboundedly during training: combined with ``scatter_sum``
+        # over ``knn_k`` neighbours, the per-cell position update
+        # accumulates roughly as ``k · c`` per layer, and 8 layers
+        # compound multiplicatively. On the first MMC run the loss
+        # exploded to ~1e10 around epoch 50 — this is what fixed it.
+        # See:
+        #   - github.com/vgsatorras/egnn (canonical implementation;
+        #     uses tanh on coord head for stability)
+        #   - Brandstetter et al. 2022 "Geometric and Physical
+        #     Quantities Improve E(3) Equivariant Message Passing"
+        #     (discusses the explosion failure mode explicitly).
         coord_last = nn.Linear(edge_dim, 1)
         nn.init.xavier_uniform_(coord_last.weight, gain=1e-3)
         nn.init.zeros_(coord_last.bias)
@@ -119,6 +126,7 @@ class EGNNLayer(nn.Module):
             nn.Linear(edge_dim, edge_dim),
             nn.SiLU(),
             coord_last,
+            nn.Tanh(),
         )
 
         # φ_h: [h_i, Σ_j m_ij] → Δh_i (residual added below).
@@ -137,7 +145,7 @@ class EGNNLayer(nn.Module):
         edge_valid: torch.Tensor,  # (E,) bool — both endpoints are real cells
         mask: torch.Tensor,     # (B*N,) bool
     ):
-        from torch_scatter import scatter_sum  # noqa: WPS433
+        from torch_scatter import scatter_mean, scatter_sum  # noqa: WPS433
 
         src, dst = edge_index[0], edge_index[1]
 
@@ -145,7 +153,6 @@ class EGNNLayer(nn.Module):
         # SE(2)-invariant scalar feature of (x_i, x_j).
         x_diff = x[src] - x[dst]                          # (E, 2)
         d_sq = (x_diff * x_diff).sum(dim=-1, keepdim=True)  # (E, 1)
-        d = torch.sqrt(d_sq + 1e-8)                       # for normalization
 
         # Edge messages.
         edge_input = torch.cat([h[src], h[dst], d_sq, t[src]], dim=-1)
@@ -156,19 +163,40 @@ class EGNNLayer(nn.Module):
         ev = edge_valid.float().unsqueeze(-1)
         m = m * ev
 
-        # Coordinate update: sum of relative-unit-vectors weighted by
-        # a scalar function of the message. Zero-init of coord_mlp's
-        # last layer keeps the first forward an identity for x.
+        # Coordinate update: this is the stability-critical block.
+        # Three lessons baked in (from the first MMC run that blew up
+        # to loss ~1e10 around epoch 50):
+        #
+        #   1. Use RAW ``x_diff``, NOT ``x_diff / ‖d‖``. Unit-vector
+        #      normalisation gives each edge a magnitude-1 direction
+        #      times ``c``, regardless of how close the points really
+        #      are. Once ``c`` drifts from init, the update has no
+        #      geometric anchor and positions explode.
+        #
+        #   2. Use ``scatter_mean``, NOT ``scatter_sum``. With
+        #      ``knn_k=50`` neighbours, a sum makes per-cell updates
+        #      ~50× larger than the per-edge contribution. mean
+        #      decouples the update scale from ``knn_k`` entirely.
+        #
+        #   3. The Tanh inside ``coord_mlp`` (set up in __init__)
+        #      bounds ``c ∈ (-1, 1)``. Without it, ``c`` can grow
+        #      arbitrarily during training and compound across the
+        #      8-layer stack.
+        #
+        # This combination matches the canonical Satorras et al.
+        # EGNN implementation at github.com/vgsatorras/egnn.
         if self.update_coords:
             c = self.coord_mlp(m)                         # (E, 1)
-            x_update = (x_diff / (d + 1e-8)) * c          # (E, 2)
-            x_agg = scatter_sum(
+            x_update = x_diff * c                         # (E, 2) -- raw, not /‖d‖
+            x_agg = scatter_mean(
                 x_update, src, dim=0, dim_size=x.shape[0],
             )                                             # (B*N, 2)
         else:
             x_agg = torch.zeros_like(x)
 
-        # Message aggregation for the node-feature update.
+        # Message aggregation for the node-feature update. Sum is fine
+        # here because m is bounded by SiLU's range AND multiplied by
+        # the edge_valid mask AND followed by an MLP that re-scales.
         m_agg = scatter_sum(m, src, dim=0, dim_size=h.shape[0])  # (B*N, edge_dim)
 
         # Residual updates. Cells with mask=False stay at 0 (we re-mask
