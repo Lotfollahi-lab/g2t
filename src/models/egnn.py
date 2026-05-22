@@ -100,11 +100,20 @@ class EGNNLayer(nn.Module):
         )
 
         # φ_x: edge feature → scalar coordinate-update coefficient.
-        # Zero-init the last layer so the position update starts as a
-        # no-op and the equivariance is exact at step 0 (Satorras
-        # et al. 2021 §3.2 "Initialization").
+        # SMALL-GAIN Xavier init on the last layer (Satorras et al. 2021,
+        # https://github.com/vgsatorras/egnn). Keeps the initial
+        # position update tiny — predictions start near the identity
+        # so positions don't blow up — but NON-ZERO so gradients flow
+        # through every upstream parameter from step 0.
+        #
+        # Strict zero-init (which I tried first) blocks gradient flow:
+        # if ``c = coord_mlp(m) == 0`` then ``x_update == 0`` and
+        # ``∂c/∂(coord_mlp inputs) == 0`` everywhere, so every
+        # parameter feeding into ``m`` — the edge MLP, node MLP, gene
+        # encoder, time encoder — gets zero gradient and never trains.
+        # The diffusion loss is on positions, so this is fatal.
         coord_last = nn.Linear(edge_dim, 1)
-        nn.init.zeros_(coord_last.weight)
+        nn.init.xavier_uniform_(coord_last.weight, gain=1e-3)
         nn.init.zeros_(coord_last.bias)
         self.coord_mlp = nn.Sequential(
             nn.Linear(edge_dim, edge_dim),

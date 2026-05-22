@@ -215,24 +215,31 @@ def test_gradient_flow() -> None:
     loss = ((out.positions - target) ** 2).mean()
     loss.backward()
 
-    n_zero = 0
+    zero_names = []
     n_total = 0
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         n_total += 1
+        # Use absolute-sum > 0 as the "any gradient flowed" predicate.
+        # The previous zero-init coord_mlp bug specifically produced
+        # exact-zero gradients on a long list of parameters; this is
+        # the cheapest check that catches it.
         if p.grad is None or p.grad.abs().sum().item() == 0.0:
-            print(f"[grad]  no gradient: {name}")
-            n_zero += 1
-    print(f"[grad]  {n_total - n_zero}/{n_total} params received gradient")
-    # Allow up to one zero (the position-stream bias term in node_mlp
-    # can legitimately get zero on a 1-batch test if it always sees
-    # zeros; we don't expect this in practice but be lenient).
-    if n_zero > 1:
+            zero_names.append(name)
+    if zero_names:
+        print(f"[grad]  {n_total - len(zero_names)}/{n_total} params received gradient")
+        print("[grad]  parameters with ZERO gradient (likely wiring bug):")
+        for name in zero_names:
+            print(f"          {name}")
         raise AssertionError(
-            f"{n_zero}/{n_total} parameters got NO gradient — likely a "
-            f"wiring bug (some EGNN branch isn't connected to the loss)."
+            f"{len(zero_names)}/{n_total} parameters got NO gradient through "
+            f"the position-loss path. This is the same failure mode the "
+            f"strict zero-init on coord_mlp produced — check that the EGNN "
+            f"layer's coord_mlp final init is non-zero (e.g. "
+            f"xavier_uniform_(gain=1e-3))."
         )
+    print(f"[grad]  {n_total}/{n_total} params received gradient")
     print("[grad]  PASS\n")
 
 
