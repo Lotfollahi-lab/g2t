@@ -783,6 +783,7 @@ def run_benchmark(
     skip_training: bool = False,
     load_checkpoint: Optional[str] = None,
     make_plots: bool = False,
+    output_subdir: Optional[str] = None,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
@@ -812,7 +813,12 @@ def run_benchmark(
             base = Path(train_csv).resolve().parent.name or "luna_paper_csvs"
         else:
             base = Path(data_dir).name
-        out = _ARTIFACTS_ROOT / base / ENGINE_OUTPUT_SUBDIR / run_ts
+        # Inference wrappers pass output_subdir="..._inference"
+        # so re-using the same training pipeline writes to a
+        # different subtree. Defaults to ENGINE_OUTPUT_SUBDIR
+        # for training runs.
+        subdir = output_subdir or ENGINE_OUTPUT_SUBDIR
+        out = _ARTIFACTS_ROOT / base / subdir / run_ts
     else:
         out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)

@@ -190,6 +190,23 @@ def main() -> int:
     os.chdir(output_dir)
     cfg.general.local_saved_path = output_dir
 
+    # Write the .hydra/config.yaml snapshot that @hydra.main would have
+    # produced for free. LUNA's `test_single_checkpoint` -> `load_model_config`
+    # reads <checkpoint_dir>/../.hydra/config.yaml at inference time to
+    # restore the exact model config used during training; without
+    # this file, test_only crashes with FileNotFoundError. Done only
+    # for the train modes — test_only relies on the snapshot left
+    # behind by the original training run, not the inference run dir.
+    if args.mode in ("train_only", "train_and_test"):
+        from omegaconf import OmegaConf
+        hydra_dir = Path(output_dir) / ".hydra"
+        hydra_dir.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, hydra_dir / "config.yaml")
+        logger.info(
+            f"[luna_runner] wrote config snapshot for later inference: "
+            f"{hydra_dir / 'config.yaml'}"
+        )
+
     set_seed(cfg.general.seed)
     datamodule, dataset_infos = setup_dataset(cfg)
     if args.mode == "train_and_test":

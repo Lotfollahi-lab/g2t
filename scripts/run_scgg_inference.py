@@ -92,6 +92,9 @@ def main():
 
     # Inference uses run_benchmark in skip-training mode. epochs/batch_size
     # are ignored by LUNA when mode=test_only but the API still wants them.
+    # output_subdir routes inference outputs into a different artifacts
+    # subtree (scgg_inference/...) so they don't clobber training runs
+    # (scgg_model/...).
     try:
         run_scgg_train.run_benchmark(
             data_dir=args.data_dir,
@@ -107,6 +110,7 @@ def main():
             skip_training=True,
             load_checkpoint=args.checkpoint,
             make_plots=not args.no_plots,
+            output_subdir="scgg_inference",
         )
     except Exception:
         run_scgg_train.logger.exception("LUNA inference failed")
