@@ -1,4 +1,26 @@
-# Architecture selector.
+# Generative framework selector.
+# - "diffusion"      — LUNA's original DDPM. Forward: x_t = sqrt(αₜ)·x_0
+#   + sqrt(1−αₜ)·ε with the cosine β schedule. Reverse: 1000 sequential
+#   denoising steps. This is the default — `luna_train.py` always uses
+#   it (it runs the external LUNA repo, untouched).
+# - "flow_matching"  — scgg's faster alternative. x_0-parameterised
+#   rectified flow: forward is linear interpolation x_t = (1−t)·x_0 +
+#   t·x_1 with x_1 ~ 𝒩(0, I) and t ~ 𝒰(ε, 1). The network predicts
+#   clean positions; loss is identical to the diffusion path (pairwise
+#   distance MSE + any opt-in components). Sampling is a 50-step Euler
+#   ODE solve instead of 1000 DDPM steps — that's the 20× wall-clock
+#   win at inference. Training cost per step is the same; the
+#   simpler loss landscape often converges in fewer epochs.
+#
+#   Implementation contract: FlowMatchingModel exposes the SAME methods
+#   as NoiseModel (apply_noise / sample_limit_dist /
+#   sample_zs_from_zt_and_pred) so the diffusion-model Lightning class,
+#   training_step, and sampling loop are all framework-agnostic — the
+#   only branch point is which class fills `self.noise_model` at
+#   __init__.
+framework: "diffusion"
+
+# Backbone architecture selector (independent of `framework`).
 # - "luna_transformer" — LUNA's original architecture: 3-stream
 #   (node features / diffusion time / positions) transformer with
 #   linear attention and position-direction-conditioned attention.
@@ -13,7 +35,25 @@ backbone: "luna_transformer"
 
 n_layers: 8 # Number of transformer/EGNN layers
 diffusion_noise_schedule: cosine # noise schedule for diffusion time
-diffusion_steps: 1000 # number of diffusion steps
+diffusion_steps: 1000 # number of diffusion steps (DDPM only — FM ignores this; see flow_matching.n_sampling_steps below)
+
+# ---------------------------------------------------------------------------
+# Flow-matching hyperparameters. Only consulted when `framework: "flow_matching"`.
+#
+# n_sampling_steps  — number of Euler ODE steps at INFERENCE time.
+#                     50 is the canonical rectified-flow default; the
+#                     ODE is smooth so quality plateaus quickly past
+#                     ~20-30 steps. Set to 25 for an extra 2× inference
+#                     speedup if quality is acceptable.
+# eps_t             — minimum sampled t during training. The velocity
+#                     parameterisation has a 1/t factor in the Euler
+#                     step, so very-tiny t at training time creates
+#                     huge implicit x_1 estimates and noisy gradients.
+#                     1e-3 is the standard rectified-flow choice.
+# ---------------------------------------------------------------------------
+flow_matching:
+    n_sampling_steps: 50
+    eps_t: 1.0e-3
 nu:
     p: 2
 hidden_mlp_dims:

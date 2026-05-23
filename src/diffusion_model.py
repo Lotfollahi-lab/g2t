@@ -36,7 +36,21 @@ class FullDenoisingDiffusion(pl.LightningModule):
 
         self.cfg = cfg
         self.name = cfg.general.name
-        self.max_diffusion_steps = cfg.model.diffusion_steps
+        # ``max_diffusion_steps`` is the outer step count for the
+        # sampling loop in utils/diffusion_model/sample/sample.py:47:
+        #     for s_int in reversed(range(0, self.max_diffusion_steps, ...))
+        # DDPM uses cfg.model.diffusion_steps (typically 1000). FM
+        # uses cfg.model.flow_matching.n_sampling_steps (typically
+        # 50). We resolve it here so the sampling loop stays
+        # framework-agnostic — it just iterates whatever count the
+        # current noise model exposes.
+        framework = str(getattr(cfg.model, "framework", "diffusion")).lower()
+        if framework == "flow_matching":
+            fm_cfg = getattr(cfg.model, "flow_matching", None)
+            n_steps = int(getattr(fm_cfg, "n_sampling_steps", 50)) if fm_cfg is not None else 50
+            self.max_diffusion_steps = n_steps
+        else:
+            self.max_diffusion_steps = cfg.model.diffusion_steps
         self.log_every_steps = True
 
         self.dataset_infos = dataset_infos
@@ -82,7 +96,25 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"Expected 'luna_transformer' or 'egnn'."
             )
 
-        self.noise_model = NoiseModel(cfg)
+        # Generative framework: DDPM (LUNA default) or rectified-flow
+        # FM. Both classes share the same apply_noise /
+        # sample_limit_dist / sample_zs_from_zt_and_pred interface so
+        # the training step and sampling loop are unchanged.
+        if framework == "flow_matching":
+            # Local import keeps the DDPM path import-cost identical
+            # for runs that don't opt into FM (parity with how the
+            # EGNN backbone is imported on demand above).
+            from utils.diffusion_model.diffusion.flow_matching_model import (
+                FlowMatchingModel,
+            )
+            self.noise_model = FlowMatchingModel(cfg)
+        elif framework == "diffusion":
+            self.noise_model = NoiseModel(cfg)
+        else:
+            raise ValueError(
+                f"Unknown model.framework={framework!r}. "
+                f"Expected 'diffusion' or 'flow_matching'."
+            )
 
     def on_train_epoch_start(self) -> None:
         on_train_epoch_start_func(self)
