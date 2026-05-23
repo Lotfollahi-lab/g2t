@@ -4,3 +4,37 @@ batch_size: 1 # Batch size for training
 lr: 5e-4 # Learning rate
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
 weight_decay: 1.0e-12
+
+# ---------------------------------------------------------------------------
+# Train-time rotation+reflection augmentation.
+#
+# Each training step applies an INDEPENDENT random element of O(2)
+# (rotation + optional reflection) to every slice in the batch.
+# Gene features are scalars and stay untouched; only positions are
+# transformed. The pairwise-distance loss is O(2)-invariant, so
+# augmenting the input data and leaving targets in their (also-
+# transformed) frame is a no-op for the loss but forces the network
+# to be invariant to the input rotation/reflection.
+#
+# Why
+# ---
+# LUNA's transformer has no built-in rotation invariance — it has to
+# learn it from data. The MMC cortex dataset has only ~6 slices, so
+# the network sees the SAME six absolute orientations every epoch
+# and learns a frame-specific solution. Augmentation breaks that
+# correlation: each step the network sees a fresh random orientation
+# of each slice. Same effect as EGNN's built-in equivariance, but
+# applied to the cheaper transformer backbone.
+#
+# Defaults OFF for reproducibility of the prior baseline. Turn ON
+# per-run via:
+#     --override train.augment_rotation=true
+# and give the run a descriptive --wandb_run_name so it shows up as
+# an identifiable variant.
+# ---------------------------------------------------------------------------
+augment_rotation: false   # if true, apply random rotation per slice per step
+augment_reflection: false # if true, also flip x-axis with p=0.5 (full O(2)
+                          # rather than just SO(2)). Tissue slices are
+                          # chirally symmetric in expectation, so this is
+                          # usually safe — but worth its own toggle in case
+                          # the dataset has a real chirality signal.
