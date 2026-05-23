@@ -358,14 +358,9 @@ def _plot_pred_vs_truth(
     else:
         fig.tight_layout()
 
-    # Save BOTH .svg (editable text, vector) and .pdf (embedded
-    # font, vector) for each plot. SVG is best for in-browser
-    # diffing and Inkscape; PDF is best for paper inclusion.
-    # We honour the caller's extension as the "primary" name and
-    # write the other format as a sibling with the same stem.
+    # SVG only — editable text via the rcParams set above is
+    # enough for figure work; PDFs were redundant.
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    sibling_ext = ".pdf" if out_path.suffix.lower() == ".svg" else ".svg"
-    fig.savefig(out_path.with_suffix(sibling_ext), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1149,19 +1144,52 @@ def run_benchmark(
     tracker.start("write_artifacts")
     if per_slice:
         fieldnames = sorted({k for r in per_slice for k in r.keys()})
-        # Write the canonical `metrics.csv` for inference + a
-        # back-compat alias `per_slice_metrics.csv`. The former
-        # mirrors the training-side `metrics.csv` filename so any
-        # downstream notebook that reads `<out_dir>/metrics.csv`
-        # works for both train (per-epoch losses) and inference
-        # (per-slice eval metrics).
-        for fname in ("metrics.csv", "per_slice_metrics.csv"):
-            with open(out / fname, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=fieldnames)
-                w.writeheader()
-                for r in per_slice:
-                    w.writerow(r)
-    agg = {"spearman_mean_of_medians": headline, "n_test_slices": len(per_slice)}
+        # per_slice_metrics.csv : one row per test slice (raw values).
+        with open(out / "per_slice_metrics.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for r in per_slice:
+                w.writerow(r)
+
+    # Aggregate metrics across slices: mean / median / std / min /
+    # max for every numeric per-slice column, plus the headline
+    # ``spearman_mean_of_medians`` and ``n_test_slices``. Lives
+    # both as a single-row metrics.csv (easy to glob and pandas
+    # together with training-side metrics.csv from earlier in the
+    # pipeline) and as aggregate_metrics.json (already used by
+    # downstream notebooks).
+    agg = {
+        "spearman_mean_of_medians": headline,
+        "n_test_slices": len(per_slice),
+    }
+    if per_slice:
+        numeric_keys = sorted({
+            k for r in per_slice for k, v in r.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        })
+        for k in numeric_keys:
+            vals = [
+                float(r[k]) for r in per_slice
+                if k in r
+                and isinstance(r[k], (int, float))
+                and not isinstance(r[k], bool)
+                and not (isinstance(r[k], float) and (np.isnan(r[k]) or np.isinf(r[k])))
+            ]
+            if not vals:
+                continue
+            agg[f"{k}_mean"] = float(np.mean(vals))
+            agg[f"{k}_median"] = float(np.median(vals))
+            agg[f"{k}_std"] = float(np.std(vals)) if len(vals) > 1 else 0.0
+            agg[f"{k}_min"] = float(np.min(vals))
+            agg[f"{k}_max"] = float(np.max(vals))
+
+    # metrics.csv : single-row aggregate. Same data as
+    # aggregate_metrics.json, just in tabular form so you can
+    # `pd.concat([...])` across many runs without parsing JSON.
+    with open(out / "metrics.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(agg.keys()))
+        w.writeheader()
+        w.writerow(agg)
     with open(out / "aggregate_metrics.json", "w") as f:
         json.dump(agg, f, indent=2, default=str)
 
