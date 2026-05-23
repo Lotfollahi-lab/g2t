@@ -242,10 +242,102 @@ def test_full_sampling_loop(tol: float = 1e-4) -> None:
     print("[loop]   PASS\n")
 
 
+def test_heun_correction_endpoints(tol: float = 1e-5) -> None:
+    """The Heun correction has two boundary properties to check:
+
+      (a) At the final step (s = 0), the 1/s factor in the
+          trapezoidal velocity is undefined and the implementation
+          falls back to the Euler result (which IS the canonical
+          x_0_pred at s=0).
+      (b) When the network's prediction is the SAME at both
+          endpoints (z_t and z_s_euler), Heun reduces to Euler.
+          This happens trivially for a constant-x_0 'network' and
+          confirms the trapezoidal average is correctly weighted.
+    """
+    cfg = _FakeCfg()
+    # Flip to heun for this test.
+    cfg.model.flow_matching.sampler = "heun"
+    fm = FlowMatchingModel(cfg)
+    batch = _make_batch()
+    B = batch.positions.shape[0]
+
+    # Build z_t at an intermediate time and a pred.
+    t_val = 0.5
+    t_tensor = torch.full((B, 1), t_val)
+    z_t = DataHolder(
+        node_features=batch.node_features,
+        positions=batch.positions.clone(),
+        node_mask=batch.node_mask,
+        cell_class=batch.cell_class,
+        t_int=torch.full((B, 1), int(t_val * fm.max_diffusion_steps), dtype=torch.long),
+        t=t_tensor,
+        diffusion_time=t_tensor,
+    ).mask()
+    pred = DataHolder(
+        node_features=batch.node_features,
+        positions=batch.positions.clone() * 0.5,   # arbitrary
+        node_mask=batch.node_mask,
+        cell_class=batch.cell_class,
+        t_int=z_t.t_int,
+        t=z_t.t,
+        diffusion_time=z_t.t,
+    ).mask()
+
+    # (a) Final-step fallback. s_int = 0 → s = 0 → Heun returns
+    # z_s_euler unchanged.
+    z_s_euler = fm.sample_zs_from_zt_and_pred(z_t, pred, torch.zeros(1, 1, dtype=torch.long))
+    pred2_dummy = DataHolder(  # value irrelevant — Heun should bail out
+        node_features=batch.node_features,
+        positions=torch.randn_like(batch.positions),
+        node_mask=batch.node_mask,
+        cell_class=batch.cell_class,
+        t_int=z_s_euler.t_int, t=z_s_euler.t, diffusion_time=z_s_euler.t,
+    ).mask()
+    z_s_heun = fm.heun_correction(
+        z_t, pred, z_s_euler, pred2_dummy,
+        s_int=torch.zeros(1, 1, dtype=torch.long),
+    )
+    err_fallback = (z_s_heun.positions - z_s_euler.positions).abs().max().item()
+    print(f"[heun]  s=0 fallback   max-err vs Euler: {err_fallback:.2e}")
+    if err_fallback > tol:
+        raise AssertionError(
+            f"Heun should fall back to Euler at s=0 (the 1/s factor "
+            f"is undefined); got max-err {err_fallback:.2e}."
+        )
+
+    # (b) Constant-pred sanity: if pred at z_t and pred at z_s_euler
+    # are the same value (i.e. the "network" returns a constant
+    # regardless of input), Heun's velocity average equals the
+    # Euler velocity → Heun == Euler.
+    s_val = 0.3
+    s_int_b = torch.full((1, 1), int(s_val * fm.max_diffusion_steps), dtype=torch.long)
+    z_s_euler_b = fm.sample_zs_from_zt_and_pred(z_t, pred, s_int_b)
+    pred2_same = DataHolder(  # SAME prediction at the new point
+        node_features=batch.node_features,
+        positions=pred.positions.clone(),
+        node_mask=batch.node_mask,
+        cell_class=batch.cell_class,
+        t_int=z_s_euler_b.t_int, t=z_s_euler_b.t, diffusion_time=z_s_euler_b.t,
+    ).mask()
+    z_s_heun_b = fm.heun_correction(z_t, pred, z_s_euler_b, pred2_same, s_int_b)
+    # Note: this equality is exact ONLY for a constant-x_0 prediction
+    # (which makes the velocity at both endpoints equal). For real
+    # networks v1 ≠ v2 and that's the whole point of Heun.
+    err_const = (z_s_heun_b.positions - z_s_euler_b.positions).abs().max().item()
+    print(f"[heun]  constant-pred  max-err vs Euler: {err_const:.2e}")
+    if err_const > 1e-4:  # slightly looser — masking/centering jitter
+        raise AssertionError(
+            f"Heun with constant pred should equal Euler (both use "
+            f"the same velocity); got max-err {err_const:.2e}."
+        )
+    print("[heun]  PASS\n")
+
+
 def main() -> int:
     test_apply_noise_interpolation()
     test_euler_step_endpoints()
     test_full_sampling_loop()
+    test_heun_correction_endpoints()
     print("All flow-matching tests passed.")
     return 0
 

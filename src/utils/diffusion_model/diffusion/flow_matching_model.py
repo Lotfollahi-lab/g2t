@@ -90,9 +90,16 @@ class FlowMatchingModel:
         if fm_cfg is None:
             self.n_sampling_steps = 50
             self.eps_t = 1.0e-3
+            self.sampler = "euler"
         else:
             self.n_sampling_steps = int(getattr(fm_cfg, "n_sampling_steps", 50))
             self.eps_t = float(getattr(fm_cfg, "eps_t", 1.0e-3))
+            self.sampler = str(getattr(fm_cfg, "sampler", "euler")).lower()
+        if self.sampler not in ("euler", "heun"):
+            raise ValueError(
+                f"Unknown model.flow_matching.sampler={self.sampler!r}. "
+                f"Expected 'euler' or 'heun'."
+            )
 
         # ``max_diffusion_steps`` is the attribute the sample loop in
         # utils/diffusion_model/sample/sample.py uses to size the
@@ -273,5 +280,81 @@ class FlowMatchingModel:
             t_int=s_int if s_int.dim() == 2 else s_int.view(1, 1).expand_as(new_t),
             t=new_t,
             diffusion_time=new_t,
+        ).mask()
+        return z_s
+
+    # ------------------------------------------------------------------
+    # Heun (2nd-order / "improved Euler") correction
+    # ------------------------------------------------------------------
+    def heun_correction(
+        self,
+        z_t: DataHolder,
+        pred1: DataHolder,
+        z_s_euler: DataHolder,
+        pred2: DataHolder,
+        s_int: torch.Tensor,
+    ) -> DataHolder:
+        """Apply the trapezoidal Heun correction on top of an Euler
+        prestep.
+
+        Called by ``sample.sample_zs_from_zt`` AFTER the standard
+        single-forward Euler step has produced ``z_s_euler`` and a
+        SECOND network forward has produced ``pred2`` at the Euler
+        endpoint. We compute the velocity at both ends of the step
+        and re-take the step with the averaged velocity::
+
+            v₁ = (z_t        − pred1) / t                # at (z_t, t)
+            v₂ = (z_s_euler  − pred2) / s                # at (z_s_euler, s)
+            v̄  = ½·(v₁ + v₂)
+            z_s = z_t − (t − s)·v̄
+
+        Discretization error is O(dt²) vs Euler's O(dt). The 1/s
+        factor diverges at the final step (s=0), so we fall back to
+        the Euler result there — that's the canonical x_0_pred
+        anyway, so the fallback is mathematically clean.
+
+        Cost: this method itself is cheap; the dominant per-step
+        cost is the SECOND ``self.forward(z_s_euler)`` call in
+        ``sample.sample_zs_from_zt`` (2× forwards per step vs Euler's
+        1×).
+        """
+        node_mask = z_t.node_mask
+
+        t = z_t.t                                                       # (B, 1)
+        s_float = s_int.float() / float(self.max_diffusion_steps)
+
+        # Normalise s to the same (B, 1) shape as t for broadcasting.
+        if s_float.dim() == 2:
+            s_per_slice = s_float
+        else:
+            s_per_slice = s_float.view(1, 1).expand_as(t).contiguous()
+
+        # If we're already at the final step (s ≤ eps), Heun's 1/s
+        # factor is undefined — return the Euler result. This is the
+        # canonical x_0_pred (Euler's last step IS the clean
+        # prediction by construction).
+        if (s_per_slice <= self.eps_t).all():
+            return z_s_euler
+
+        t_safe = t.clamp_min(self.eps_t).unsqueeze(-1)                  # (B, 1, 1)
+        s_safe = s_per_slice.clamp_min(self.eps_t).unsqueeze(-1)        # (B, 1, 1)
+        dt_b = (t_safe - s_safe)                                        # (B, 1, 1)
+
+        # Velocity at both endpoints of the step.
+        v1 = (z_t.positions - pred1.positions) / t_safe
+        v2 = (z_s_euler.positions - pred2.positions) / s_safe
+        v_avg = 0.5 * (v1 + v2)
+
+        positions = z_t.positions - dt_b * v_avg
+        positions = positions * node_mask.unsqueeze(-1)
+        positions = remove_mean_with_mask(positions, node_mask)
+
+        z_s = DataHolder(
+            node_features=z_t.node_features,
+            positions=positions,
+            node_mask=node_mask,
+            t_int=z_s_euler.t_int,
+            t=z_s_euler.t,
+            diffusion_time=z_s_euler.diffusion_time,
         ).mask()
         return z_s

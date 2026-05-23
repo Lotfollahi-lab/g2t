@@ -38,3 +38,29 @@ augment_reflection: false # if true, also flip x-axis with p=0.5 (full O(2)
                           # chirally symmetric in expectation, so this is
                           # usually safe — but worth its own toggle in case
                           # the dataset has a real chirality signal.
+
+# ---------------------------------------------------------------------------
+# Exponential moving average of model weights.
+#
+# Each train step (after the optimizer update), maintain a shadow
+# copy θ_EMA = decay · θ_EMA + (1 - decay) · θ. Validation, test,
+# and CHECKPOINT-SAVE all use θ_EMA instead of the live training
+# weights. Inference loads the checkpoint normally and therefore
+# gets EMA-by-default — no inference-side changes needed.
+#
+# Why
+# ---
+# Late-training oscillation in the loss landscape means the
+# instantaneous θ at step N is rarely the best-generalizing model.
+# A long EMA smooths over that oscillation and consistently
+# improves test-time metrics. Standard trick in diffusion (Karras
+# et al., Stable Diffusion 3) and flow matching.
+#
+# Defaults OFF for byte-equivalence with the prior baseline. Enable
+# with `--override train.ema_decay=0.999`. Common values: 0.999
+# (decay over ~1k steps, "fast" EMA), 0.9999 (decay over ~10k
+# steps, "slow" EMA — only use for long runs).
+# ---------------------------------------------------------------------------
+ema_decay: 0.0            # 0 disables the EMA callback entirely
+ema_every_n_steps: 1      # update EMA every N optimizer steps; >1 saves a
+                          # tiny bit of compute, almost never used

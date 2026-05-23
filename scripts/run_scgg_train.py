@@ -1322,10 +1322,13 @@ def main() -> int:
     p.add_argument(
         "--override", "--luna_override",
         dest="override",
-        action="append", default=[],
-        help="Extra Hydra override (repeatable). Examples: "
-             "'--override train.lr=1e-4', "
-             "'--override model.loss.knn_rank.enabled=true'. "
+        action="extend", nargs="+", default=[],
+        help="Extra Hydra overrides. Accepts ONE OR MORE key=value "
+             "tokens per --override (space-separated), and the flag "
+             "itself is repeatable. So all three of these work:\n"
+             "  --override train.lr=1e-4\n"
+             "  --override train.lr=1e-4 model.framework=flow_matching\n"
+             "  --override train.lr=1e-4 --override model.framework=flow_matching\n"
              "'--luna_override' is kept as a backward-compat alias.",
     )
     p.add_argument(

@@ -71,12 +71,19 @@ def _apply_o2_augmentation(
     pos_aug = torch.einsum("bnd,bed->bne", pos, R)  # (B, N, 2)
 
     # Construct a new DataHolder (DataHolder is roughly a dataclass —
-    # safer than mutating in-place).
+    # safer than mutating in-place). DataHolder.__init__ requires
+    # ``diffusion_time`` as a positional arg; at this point in the
+    # pipeline (between to_batch and apply_noise) it's typically
+    # None on the input — passing it through preserves whatever
+    # the upstream stage set.
     return DataHolder(
         node_features=batched_data.node_features,
         positions=pos_aug,
+        diffusion_time=getattr(batched_data, "diffusion_time", None),
         cell_class=batched_data.cell_class,
         cell_ID=getattr(batched_data, "cell_ID", None),
+        t_int=getattr(batched_data, "t_int", None),
+        t=getattr(batched_data, "t", None),
         node_mask=batched_data.node_mask,
     ).mask()
 

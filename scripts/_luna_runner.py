@@ -357,6 +357,30 @@ def _patch_setup_callbacks() -> None:
             f"[luna_runner] MetricsCsvCallback will write per-epoch losses "
             f"to {metrics_csv}"
         )
+
+        # Optional EMA callback. Default decay=0 means OFF (and we
+        # never instantiate the callback, so train.py is byte-
+        # equivalent to before). Anything in (0, 1) turns it on with
+        # that decay; canonical values are 0.999 / 0.9999.
+        ema_decay = float(getattr(cfg.train, "ema_decay", 0.0))
+        if ema_decay > 0.0:
+            try:
+                from utils.diffusion_model.ema import EMACallback  # type: ignore
+            except ImportError as e:
+                # Fail loudly — if the user asked for EMA, silently
+                # dropping it would be the wrong default.
+                raise RuntimeError(
+                    f"train.ema_decay={ema_decay} but EMACallback could "
+                    f"not be imported: {e}. Check that the scgg src tree "
+                    f"is on sys.path."
+                )
+            ema_every = int(getattr(cfg.train, "ema_every_n_steps", 1))
+            callbacks.append(EMACallback(decay=ema_decay, every_n_steps=ema_every))
+            logger.info(
+                f"[luna_runner] EMACallback enabled (decay={ema_decay}, "
+                f"every_n_steps={ema_every}). val/test/checkpoint-save "
+                f"will use EMA weights."
+            )
         return callbacks
 
     setup_mod.setup_callbacks = patched_setup_callbacks

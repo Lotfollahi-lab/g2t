@@ -54,6 +54,24 @@ diffusion_steps: 1000 # number of diffusion steps (DDPM only — FM ignores this
 flow_matching:
     n_sampling_steps: 50
     eps_t: 1.0e-3
+    # ODE sampler order.
+    # - "euler"  — 1st-order. One network forward per ODE step.
+    #              Default, matches the original FM rollout.
+    # - "heun"   — 2nd-order ("improved Euler" / trapezoidal). Two
+    #              forwards per step: predict z_s with Euler, then
+    #              re-evaluate the velocity at that point and average
+    #              with the velocity at z_t. Halves discretization
+    #              error, so the same sample quality is reached in
+    #              roughly half the steps. At the LAST step (s=0)
+    #              the 1/s factor in the velocity diverges; we fall
+    #              back to Euler there automatically.
+    #
+    # Effective inference cost: heun with 25 steps ≈ euler with 50
+    # steps in wall-clock (same number of forwards), but heun's
+    # truncation error is O(dt²) vs euler's O(dt) → quality wins
+    # at equal cost. For absolute quality keep euler at 50 steps
+    # AND switch to heun (cost doubles, quality gain comes on top).
+    sampler: "euler"
 nu:
     p: 2
 hidden_mlp_dims:

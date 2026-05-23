@@ -91,9 +91,27 @@ def sample_zs_from_zt(self, z_t: torch.Tensor, s_int: torch.Tensor) -> torch.Ten
 
     Returns:
         torch.Tensor: The sampled zs tensor.
+
+    Notes:
+        Default path is single-forward (Euler / DDPM reverse step).
+        If the noise model advertises ``sampler == "heun"`` (currently
+        FlowMatchingModel only), we take a SECOND forward at the
+        Euler-predicted endpoint and ask the noise model to apply
+        the Heun (trapezoidal) correction. DDPM's NoiseModel never
+        sets ``sampler``, so its path is untouched.
     """
     pred = self.forward(z_t)
     z_s = self.noise_model.sample_zs_from_zt_and_pred(z_t=z_t, pred=pred, s_int=s_int)
+
+    # 2nd-order (Heun) correction: one extra forward at the Euler
+    # endpoint, averaged-velocity re-step. Only flow-matching opts
+    # in. The DDPM NoiseModel has no `sampler` attr so this branch
+    # is dead for the diffusion path.
+    if getattr(self.noise_model, "sampler", "euler") == "heun":
+        pred2 = self.forward(z_s)
+        z_s = self.noise_model.heun_correction(
+            z_t=z_t, pred1=pred, z_s_euler=z_s, pred2=pred2, s_int=s_int,
+        )
     return z_s
 
 
