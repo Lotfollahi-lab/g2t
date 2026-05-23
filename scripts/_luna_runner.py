@@ -106,9 +106,13 @@ def _patch_datamodule(target_mode: str) -> None:
     )
 
 
-def _patch_setup_wandb(force_project: Optional[str]) -> None:
+def _patch_setup_wandb(
+    force_project: Optional[str],
+    run_timestamp: Optional[str] = None,
+) -> None:
     """Monkey-patch ``utils.data.misc.setup_wandb`` to use a fixed
-    project name.
+    project name (and optionally tag the run with our training
+    timestamp).
 
     LUNA's stock ``setup_wandb`` defaults to
     ``f'MolDiffusion_{dataset_name}'`` and we tried adding a
@@ -120,6 +124,16 @@ def _patch_setup_wandb(force_project: Optional[str]) -> None:
     launcher, which replaces ``setup_wandb`` with a version that
     always uses ``<name>``. Predictable; no fallback to
     ``MolDiffusion_*``.
+
+    ``run_timestamp`` (optional, ``YYYYMMDD_HHMMSS``): if passed, the
+    same wall-clock timestamp that names the on-disk artifacts dir
+    is also injected into the wandb run as
+      * ``wandb.config['run_timestamp']`` (searchable/filterable),
+      * a wandb tag (visually obvious in the run list),
+      * ``wandb.summary['run_timestamp']`` (sortable column in the
+        run table).
+    This is the canonical link from a wandb run back to its on-disk
+    artifacts subtree at ``.../<engine>_model/<run_timestamp>/``.
 
     If ``force_project`` is None (e.g. someone invokes
     ``_luna_runner.py`` directly without the flag) we leave the
@@ -135,6 +149,15 @@ def _patch_setup_wandb(force_project: Optional[str]) -> None:
         config_dict = oc.OmegaConf.to_container(
             cfg, resolve=True, throw_on_missing=True,
         )
+        # Inject the training timestamp into the run config so the
+        # wandb run pairs unambiguously with its on-disk artifacts
+        # dir (also named by this timestamp). Done by mutating the
+        # dict we hand to wandb.init rather than by writing to
+        # `cfg` — keeps the Hydra-composed config snapshot on disk
+        # unchanged.
+        if run_timestamp:
+            if isinstance(config_dict, dict):
+                config_dict.setdefault("run_timestamp", run_timestamp)
         entity = getattr(cfg.general, "wandb_entity", None) or None
         kwargs = {
             "name": cfg.general.name,
@@ -144,12 +167,24 @@ def _patch_setup_wandb(force_project: Optional[str]) -> None:
             "reinit": True,
             "mode": cfg.general.wandb,
         }
+        if run_timestamp:
+            # Tag form is human-friendly in the run-list UI.
+            kwargs["tags"] = [f"ts:{run_timestamp}"]
         print(
             f"[setup_wandb] init (forced): project={force_project!r}, "
             f"entity={entity!r}, mode={cfg.general.wandb!r}, "
-            f"name={cfg.general.name!r}"
+            f"name={cfg.general.name!r}, run_timestamp={run_timestamp!r}"
         )
         wandb_mod.init(**kwargs)
+        # Also publish as a summary metric so it shows up as a
+        # sortable column in the wandb run table. `summary` only
+        # exists after init succeeded and only when wandb is in
+        # online/offline mode (disabled mode returns a stub).
+        if run_timestamp and getattr(wandb_mod, "run", None) is not None:
+            try:
+                wandb_mod.run.summary["run_timestamp"] = run_timestamp
+            except Exception:  # noqa: BLE001 — best-effort decoration
+                pass
         wandb_mod.save("*.txt")
         return cfg
 
@@ -372,6 +407,14 @@ def main() -> int:
              "by the run_*_train.py / run_*_inference.py wrappers "
              "(scgg -> 'scgg', luna -> 'luna').",
     )
+    p.add_argument(
+        "--run_timestamp", default=None,
+        help="YYYYMMDD_HHMMSS string. Injected into wandb.config, "
+             "wandb tags, and wandb.summary so the wandb run pairs "
+             "unambiguously with its on-disk artifacts dir (which is "
+             "named by the same timestamp). Set automatically by the "
+             "run_*_train.py wrappers.",
+    )
     args = p.parse_args()
 
     logging.basicConfig(
@@ -411,7 +454,7 @@ def main() -> int:
     _patch_setup_model()
     _patch_load_model_config()
     _patch_setup_callbacks()
-    _patch_setup_wandb(args.wandb_project)
+    _patch_setup_wandb(args.wandb_project, run_timestamp=args.run_timestamp)
 
     # Compose the config from an ABSOLUTE path — using @hydra.main would
     # resolve config_path relative to THIS file (scgg/scripts/), which

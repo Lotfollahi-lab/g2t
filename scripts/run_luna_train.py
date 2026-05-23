@@ -599,6 +599,7 @@ def _invoke_luna(
     log_path: Path,
     mode: str = "train_and_test",
     wandb_project: Optional[str] = None,
+    run_timestamp: Optional[str] = None,
 ) -> int:
     """Run LUNA via our monkey-patching launcher (``_luna_runner.py``),
     in the same Python env.
@@ -627,6 +628,12 @@ def _invoke_luna(
     ]
     if wandb_project:
         cmd += ["--wandb_project", wandb_project]
+    if run_timestamp:
+        # Forward the train-script's wall-clock timestamp so wandb
+        # tags / config / summary include it — that's the canonical
+        # link from a wandb run to its on-disk artifacts dir
+        # (which is named by the same timestamp).
+        cmd += ["--run_timestamp", run_timestamp]
     for o in overrides:
         cmd += ["--override", o]
     logger.info(f"Invoking LUNA via launcher (mode={mode}):")
@@ -1099,6 +1106,7 @@ def run_benchmark(
             luna_repo_p, overrides, log_path,
             mode=mode,
             wandb_project=(wandb_project or None),
+            run_timestamp=run_ts,
         )
     finally:
         tracker.end("training", flush_to=runtime_csv)

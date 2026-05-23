@@ -188,7 +188,93 @@ def test_time_shape_broadcast(tol: float = 1e-5) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: EGNNModel gradient flow
+# Test 3: EGNNModel SE(2) equivariance end-to-end
+# ---------------------------------------------------------------------------
+
+
+def test_model_equivariance(tol: float = 1e-3) -> None:
+    """Full-model SE(2) equivariance — EGNNLayer is checked in Test 1,
+    but the output stage (radial magnitude rescale + mean-subtract)
+    can silently break equivariance if any non-invariant scalar (raw
+    pos coords, un-centered ‖x‖, etc.) leaks into the mlp_out_pos_norm
+    input. This test feeds the SAME point cloud through the model in
+    two different SE(2) frames and asserts:
+
+      * predicted positions transform consistently under R, b
+        (rotation: R-rotated input -> R-rotated output;
+         translation: the centered output is identical regardless of
+         input translation, since the model centers internally);
+      * predicted node features are SE(2)-invariant.
+
+    Catches the failure mode where a translation-non-invariant scalar
+    (e.g. raw ‖x‖ pre-centering) ends up driving the magnitude MLP.
+    """
+    torch.manual_seed(0)
+    B, N, F = 2, 64, 16
+
+    model = _build_egnn_model(time_in=1).eval()
+
+    node_features = torch.randn(B, N, F)
+    positions = torch.randn(B, N, 2)
+    diffusion_time = torch.rand(B, 1)
+    node_mask = torch.ones(B, N, dtype=torch.bool)
+
+    data_base = DataHolder(
+        node_features=node_features.clone(),
+        positions=positions.clone(),
+        node_mask=node_mask,
+        diffusion_time=diffusion_time.clone(),
+    )
+    with torch.no_grad():
+        out_base = model(data_base)
+
+    # Random SE(2) transform (same R, b for all slices).
+    theta = 0.7
+    R = torch.tensor([
+        [math.cos(theta), -math.sin(theta)],
+        [math.sin(theta),  math.cos(theta)],
+    ])
+    b = torch.tensor([0.4, -1.2])
+
+    positions_t = positions @ R.T + b
+    data_t = DataHolder(
+        node_features=node_features.clone(),
+        positions=positions_t,
+        node_mask=node_mask,
+        diffusion_time=diffusion_time.clone(),
+    )
+    with torch.no_grad():
+        out_t = model(data_t)
+
+    # Model mean-centers internally — so the OUTPUT is always
+    # mean-zero regardless of input translation. The expected
+    # transformed output is R · out_base (no +b), since the input
+    # translation b is absorbed by the internal centering.
+    expected_pos = out_base.positions @ R.T
+
+    pos_err = (out_t.positions - expected_pos).abs().max().item()
+    feat_err = (out_t.node_features - out_base.node_features).abs().max().item()
+    print(f"[model]  pos equivariance max-err (R·out_base vs out_t): {pos_err:.2e}  (tol={tol})")
+    print(f"[model]  feat invariance max-err: {feat_err:.2e}  (tol={tol})")
+    if pos_err > tol:
+        raise AssertionError(
+            f"EGNNModel positions NOT SE(2)-equivariant end-to-end "
+            f"(err={pos_err}). Most likely a non-invariant scalar "
+            f"(e.g. raw ‖x‖ pre-centering) is leaking into "
+            f"mlp_out_pos_norm. The MLP must take only "
+            f"translation-AND-rotation-invariant inputs (h_out and "
+            f"the post-centering ‖x_c‖)."
+        )
+    if feat_err > tol:
+        raise AssertionError(
+            f"EGNNModel node_features NOT SE(2)-invariant "
+            f"(err={feat_err})."
+        )
+    print("[model]  PASS\n")
+
+
+# ---------------------------------------------------------------------------
+# Test 4: EGNNModel gradient flow
 # ---------------------------------------------------------------------------
 
 
@@ -272,6 +358,7 @@ def test_gradient_flow() -> None:
 def main() -> int:
     test_layer_equivariance()
     test_time_shape_broadcast()
+    test_model_equivariance()
     test_gradient_flow()
     print("All EGNN tests passed.")
     return 0
