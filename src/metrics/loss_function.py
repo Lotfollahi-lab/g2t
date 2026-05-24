@@ -187,6 +187,17 @@ class LossFunction(nn.Module):
                                          "coarse_centroid_mse", "weight",
                                          default=1.0))
 
+        # Cluster balance regularizer for Gumbel-softmax mode in the
+        # c2f wrapper. Pulled in from a stash on the pred DataHolder
+        # (the wrapper computes the entropy-based reg term during
+        # forward and writes ``_cluster_balance_loss`` /
+        # ``_cluster_balance_weight``). Active iff the wrapper has
+        # a non-zero ``cluster_balance_weight`` AND we're in
+        # training mode (wrapper sets the stash to None at eval).
+        # We don't gate this on a config knob in the same way as
+        # other components — the wrapper is the source of truth.
+        self._cluster_balance_enabled = True
+
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
         # ``compute_loss`` iterates this list — adding a new component
@@ -202,6 +213,14 @@ class LossFunction(nn.Module):
              self._compute_sinkhorn),
             ("coarse_centroid_mse", self._cc_enabled, self._cc_weight,
              self._compute_coarse_centroid_mse),
+            # cluster_balance is always "enabled" in the registry; the
+            # actual value is gated by whether the wrapper stashed
+            # anything (returns a graph-attached zero otherwise).
+            # Weight 1.0 here because the WRAPPER carries the
+            # per-run weight (stashed on the DataHolder) and we just
+            # forward it through.
+            ("cluster_balance", self._cluster_balance_enabled, 1.0,
+             self._compute_cluster_balance),
         ]
 
         # One-time summary so the train.log shows what's active.
@@ -908,9 +927,74 @@ class LossFunction(nn.Module):
                                  pred_centroids[b][mask_b], p=2)
             losses.append(self.mse(d_pred, d_true))
 
-        if not losses:
-            return pred_centroids.sum() * 0.0
-        return torch.mean(torch.stack(losses))
+        primary_loss = (
+            torch.mean(torch.stack(losses)) if losses
+            else pred_centroids.sum() * 0.0
+        )
+
+        # Multi-resolution: if the wrapper also stashed a secondary
+        # (K2, 2) centroid set, fold it into this loss component
+        # weighted by the per-run config. Same pairwise-distance MSE
+        # formulation as primary.
+        sec_centroids = getattr(masked_pred, "_predicted_cluster_centroids_secondary", None)
+        sec_ids = getattr(masked_pred, "_cluster_ids_secondary", None)
+        K_sec = getattr(masked_pred, "_n_clusters_secondary", None)
+        sec_weight = float(getattr(masked_pred, "_multi_resolution_loss_weight", 0.5))
+        if sec_centroids is None or sec_ids is None or K_sec is None:
+            return primary_loss
+
+        # Same scatter-mean true-centroid computation as primary, but
+        # at K_sec resolution.
+        B2, N2 = sec_ids.shape
+        device2 = sec_centroids.device
+        safe2 = sec_ids.clamp(min=0)
+        valid2 = masked_true.node_mask & (sec_ids >= 0)
+        batch_idx2 = torch.arange(B2, device=device2).unsqueeze(1).expand(B2, N2)
+        combined_id2 = (batch_idx2 * K_sec + safe2).reshape(-1)
+        valid_f2 = valid2.float().reshape(-1, 1)
+        pos_flat2 = masked_true.positions.reshape(B2 * N2, 2) * valid_f2
+        count_flat2 = valid2.float().reshape(B2 * N2)
+        sum_pos2 = sec_centroids.new_zeros(B2 * K_sec, 2)
+        sum_cnt2 = sec_centroids.new_zeros(B2 * K_sec)
+        sum_pos2.scatter_add_(0, combined_id2.unsqueeze(-1).expand(-1, 2), pos_flat2)
+        sum_cnt2.scatter_add_(0, combined_id2, count_flat2)
+        cnt_safe2 = sum_cnt2.clamp(min=1.0)
+        true_centroids2 = (sum_pos2 / cnt_safe2.unsqueeze(-1)).reshape(B2, K_sec, 2)
+        present2 = (sum_cnt2 > 0).reshape(B2, K_sec)
+
+        sec_losses = []
+        for b in range(B2):
+            mb = present2[b]
+            if mb.sum().item() < 2:
+                continue
+            d_t = torch.cdist(true_centroids2[b][mb], true_centroids2[b][mb], p=2)
+            d_p = torch.cdist(sec_centroids[b][mb], sec_centroids[b][mb], p=2)
+            sec_losses.append(self.mse(d_p, d_t))
+
+        if sec_losses:
+            sec_loss = torch.mean(torch.stack(sec_losses))
+            return primary_loss + sec_weight * sec_loss
+        return primary_loss
+
+    def _compute_cluster_balance(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Cluster-balance regularizer for Gumbel-softmax mode.
+
+        The CoarseToFineWrapper computes the entropy-based reg term
+        during forward and stashes it (plus its weight) on the pred
+        DataHolder:
+          * ``_cluster_balance_loss``  — scalar tensor (or None)
+          * ``_cluster_balance_weight`` — float (per-run config)
+
+        We just multiply and return. Returns zero (graph-attached)
+        when the wrapper isn't in use OR when the per-run weight is 0.
+        """
+        bal = getattr(masked_pred, "_cluster_balance_loss", None)
+        weight = float(getattr(masked_pred, "_cluster_balance_weight", 0.0))
+        if bal is None or weight <= 0.0:
+            return masked_pred.positions[0].sum() * 0.0
+        return weight * bal
 
     # ----------------------------- aggregation ----------------------------
 

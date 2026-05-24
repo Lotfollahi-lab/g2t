@@ -513,10 +513,85 @@ coarse_to_fine:
     # Gumbel-softmax temperature. Only consulted when
     # ``cluster_mode == "gumbel"``. Lower = more peaked / decisive
     # logits but harder optimisation; higher = smoother gradient
-    # signal. 1.0 is the canonical Gumbel-softmax default. Constant
-    # for now; annealing would be a natural follow-up if convergence
-    # is slow.
+    # signal. 1.0 is the canonical Gumbel-softmax default.
     gumbel_tau: 1.0
+    # Gumbel-softmax temperature annealing. When > 0, the tau decays
+    # linearly from ``gumbel_tau`` (initial) to ``gumbel_tau_final``
+    # over this many forward passes during training. Forces clusters
+    # to sharpen as training progresses (soft early to explore, hard
+    # late to commit). Standard Gumbel-softmax practice. 0 = no
+    # annealing (constant tau). For cortex's ~1000 training steps,
+    # 500-800 is a reasonable annealing window.
+    gumbel_anneal_steps: 0
+    # Final Gumbel-softmax temperature after annealing completes.
+    # Only consulted when ``gumbel_anneal_steps > 0``.
+    gumbel_tau_final: 0.1
+    # Cluster balance regularizer weight. When > 0, adds a loss term
+    # that encourages uniform cluster usage (entropy maximisation on
+    # the AVERAGE cluster assignment distribution across cells in a
+    # batch). Without this, Gumbel can collapse to "all cells in one
+    # cluster" — a known failure mode. The reg term is small relative
+    # to the main loss; 0.01 is a reasonable starting point. Set to 0
+    # to disable. Only meaningful in ``cluster_mode='gumbel'`` because
+    # k-means already balances clusters by construction.
+    cluster_balance_weight: 0.0
+
+    # How the inner backbone consumes cluster conditioning.
+    # - "concat" (default, backward-compatible). Each cell gets its
+    #   argmax cluster's [centroid_2, embedding_128] vector
+    #   concatenated to its gene features. Static one-hot view of
+    #   cluster membership.
+    # - "cross_attention". Each cell uses its (projected) gene
+    #   features as a Query against the K cluster tokens as
+    #   Key/Value. Output is a single per-cell vector that's a
+    #   soft mixture over relevant clusters. Lets boundary cells
+    #   attend to multiple nearby clusters. Compounds with Gumbel
+    #   clustering — both are about soft, learnable cluster
+    #   structure.
+    conditioning_mode: "concat"
+    # Cross-attention block hidden width. Only consulted when
+    # conditioning_mode='cross_attention'.
+    cross_attn_hidden_dim: 128
+    # Number of attention heads in the cell→cluster cross-attention.
+    cross_attn_n_heads: 4
+    # Width of the per-cell vector that the cross-attention block
+    # produces and concatenates to gene features. Smaller = lighter
+    # conditioning, larger = more dominant signal. 128 mirrors the
+    # concat path's effective conditioning width (2 + 128 = 130).
+    cross_attn_output_dim: 128
+
+    # Multi-resolution clustering: add a SECOND parallel cluster_module
+    # + coarse_regressor at a different K, providing both COARSE and
+    # FINE gene-similarity grouping. Each cell receives conditioning
+    # from BOTH resolutions, and the auxiliary centroid MSE covers
+    # both centroid sets.
+    #
+    # Risk: when we tried stacking hierarchical + c2f the result was
+    # WORSE than c2f alone on cortex (multi-scale axes seemed to
+    # overfit on the 6-slice dataset). This option tests whether
+    # multi-scale WITHIN c2f (just different K's) behaves differently.
+    # Off by default.
+    multi_resolution_enabled: false
+    # K for the secondary (typically finer) resolution. 64 gives ~4×
+    # the granularity of K=16. The primary K is ``n_clusters`` above.
+    multi_resolution_k: 64
+    # Weight of the secondary-resolution centroid-MSE loss term,
+    # relative to the primary centroid MSE.
+    multi_resolution_loss_weight: 0.5
+
+    # Coarse-stage architecture.
+    # - "regression" (default). One-shot transformer head over the K
+    #   cluster tokens predicts each cluster's centroid. Loss is MSE
+    #   on those predictions. Matches everything documented above.
+    # - "flow_matching". A FULL FM on cluster centroids: the coarse
+    #   model is repeatedly called with noisy centroids at random t
+    #   during training (FM loss on velocity / x0); at inference the
+    #   coarse stage runs an internal ODE (e.g. 25 Euler steps) BEFORE
+    #   the cell-level FM sampling loop, and the cell-level ODE then
+    #   conditions on the coarse stage's converged centroids.
+    #   ``coarse_stage_n_steps`` controls the inner ODE step count.
+    coarse_stage: "regression"
+    coarse_stage_n_steps: 25
     # Hidden width of the coarse regressor's transformer.
     coarse_hidden_dim: 128
     # Coarse regressor depth (transformer encoder layers).
