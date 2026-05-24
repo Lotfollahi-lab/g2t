@@ -351,6 +351,123 @@ def _run_scvi_global(
 
 
 # ---------------------------------------------------------------------------
+# Quality-control UMAP plot
+# ---------------------------------------------------------------------------
+
+
+def _plot_embedding_umap(
+    files: List[Path],
+    field: str,
+    out_path: Path,
+    subsample: Optional[int] = None,
+) -> None:
+    """Sanity-check the precomputed embeddings via a 2-panel UMAP plot.
+
+    Aggregates ``adata.obsm[<field>]`` across all slices, runs scanpy
+    UMAP, and saves an SVG with two side-by-side panels:
+
+      1. coloured by ``cell_class`` — should show coherent clusters
+         per cell type (the embedding preserves biological identity);
+      2. coloured by source slice — should NOT show clusters per
+         slice if batch correction (scVI) is working. For raw genes,
+         PCA, or per-slice AE, expect strong per-slice clustering;
+         for global scVI, expect mixing.
+
+    Saved as SVG with editable text (rcParams["svg.fonttype"]="none")
+    so the figure can be cleaned up in Illustrator/Inkscape before
+    publication.
+    """
+    try:
+        import anndata as ad
+        import scanpy as sc
+        import matplotlib
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "--plot_quality requires scanpy + matplotlib. Install via "
+            "`pip install scanpy`. Underlying error: " + str(e)
+        )
+
+    embeddings: List[np.ndarray] = []
+    cell_classes: List[str] = []
+    batches: List[str] = []
+    for path in files:
+        ad_i = ad.read_h5ad(path)
+        if field not in ad_i.obsm:
+            logger.warning(
+                f"  {path.name}: obsm[{field!r}] missing; skipping in UMAP."
+            )
+            continue
+        embeddings.append(np.asarray(ad_i.obsm[field], dtype=np.float32))
+        if "cell_class" in ad_i.obs.columns:
+            cell_classes.extend(ad_i.obs["cell_class"].astype(str).tolist())
+        else:
+            cell_classes.extend(["unknown"] * ad_i.n_obs)
+        batches.extend([path.stem] * ad_i.n_obs)
+
+    if not embeddings:
+        logger.warning(f"No embeddings to plot for field {field!r} — skipping UMAP.")
+        return
+
+    emb_all = np.concatenate(embeddings, axis=0)
+    n_cells = emb_all.shape[0]
+
+    # Optional subsampling for speed. UMAP on 100k+ cells can take
+    # several minutes; subsampling to 20k is usually plenty for a
+    # quality plot.
+    if subsample is not None and n_cells > subsample:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(n_cells, size=subsample, replace=False)
+        emb_all = emb_all[idx]
+        cell_classes = [cell_classes[i] for i in idx]
+        batches = [batches[i] for i in idx]
+        n_cells = subsample
+        logger.info(f"  subsampled to {n_cells} cells for UMAP")
+
+    # Build a minimal AnnData for scanpy. ``X`` is unused; the
+    # embedding lives in obsm.
+    big = ad.AnnData(X=np.zeros((n_cells, 1), dtype=np.float32))
+    big.obsm["X_emb"] = emb_all
+    big.obs["cell_class"] = cell_classes
+    big.obs["batch"] = batches
+    # Make `cell_class` and `batch` categorical so scanpy assigns
+    # a stable colour palette per category.
+    big.obs["cell_class"] = big.obs["cell_class"].astype("category")
+    big.obs["batch"] = big.obs["batch"].astype("category")
+
+    logger.info(
+        f"  running scanpy UMAP on {n_cells} cells × "
+        f"{emb_all.shape[1]} embedding dims..."
+    )
+    sc.pp.neighbors(big, use_rep="X_emb", n_neighbors=15)
+    sc.tl.umap(big)
+
+    # Editable SVG text for downstream figure-tweaking.
+    matplotlib.rcParams["svg.fonttype"] = "none"
+    matplotlib.rcParams["pdf.fonttype"] = 42
+
+    # Two side-by-side panels.
+    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+    sc.pl.umap(
+        big, color="cell_class",
+        ax=axes[0], show=False, frameon=False,
+        legend_loc="right margin", legend_fontsize=8,
+        title=f"UMAP({field}) — colored by cell_class",
+    )
+    sc.pl.umap(
+        big, color="batch",
+        ax=axes[1], show=False, frameon=False,
+        legend_loc="right margin", legend_fontsize=8,
+        title=f"UMAP({field}) — colored by source slice",
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  → wrote UMAP quality plot to {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -413,6 +530,22 @@ def main() -> int:
         "--overwrite_field", action="store_true",
         help="If the obsm field already exists, overwrite it. Default: "
              "skip files where it's already present.",
+    )
+    p.add_argument(
+        "--plot_quality", action="store_true",
+        help="After computing embeddings, run scanpy UMAP on the "
+             "concatenated embeddings across all slices and save a "
+             "2-panel SVG (colored by cell_class and by source slice). "
+             "Sanity check that biological identity is preserved AND "
+             "batch correction works (no per-slice clustering). Plot "
+             "lives at <silver_dir>/embedding_quality_umap_<field>.svg "
+             "(or under --out_dir if set).",
+    )
+    p.add_argument(
+        "--plot_subsample", type=int, default=20000,
+        help="Cap cell count for UMAP plotting. Default 20k — UMAP "
+             "on more than ~50k cells is slow and the visual barely "
+             "improves. Set to 0 to use all cells.",
     )
     args = p.parse_args()
 
@@ -480,6 +613,27 @@ def main() -> int:
             out_path = (out_dir / path.name) if out_dir else path
             adata.write_h5ad(out_path)
             logger.info(f"  → wrote {out_path} (obsm[{field!r}] shape={emb.shape})")
+
+    # Optional UMAP quality plot. Re-reads the h5ads we just wrote
+    # (rather than caching embeddings in memory) so the plot path
+    # works identically when --plot_quality is run as a follow-up
+    # invocation on already-embedded h5ads.
+    if args.plot_quality:
+        # Plot reads from the FINAL location of the h5ads. If
+        # --out_dir was set, the modified h5ads landed there; else
+        # in-place in silver_dir.
+        plot_source_files = (
+            sorted((out_dir / p.name) for p in files) if out_dir is not None
+            else files
+        )
+        plot_target_dir = out_dir if out_dir is not None else silver_dir
+        plot_path = plot_target_dir / f"embedding_quality_umap_{field}.svg"
+        subsample = args.plot_subsample if args.plot_subsample > 0 else None
+        logger.info(f"Plotting UMAP quality check for field {field!r}...")
+        _plot_embedding_umap(
+            plot_source_files, field=field, out_path=plot_path,
+            subsample=subsample,
+        )
 
     logger.info("Done.")
     return 0
