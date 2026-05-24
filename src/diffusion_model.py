@@ -419,6 +419,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 embed_dim=int(getattr(knn_graph_cfg, "embed_dim", 16)),
                 spectral_layout=bool(getattr(knn_graph_cfg, "spectral_layout", True)),
                 k_for_layout=int(getattr(knn_graph_cfg, "k", 10)),
+                temperature=float(getattr(knn_graph_cfg, "temperature", 0.1)),
             )
 
         # Auxiliary gene-reconstruction head. Active iff

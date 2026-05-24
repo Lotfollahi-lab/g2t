@@ -146,22 +146,58 @@ def test_edm_forward_shapes_and_finite() -> None:
 
 def test_edm_gradient_flows_through_projector_and_inner() -> None:
     """EDM-only loss path: gradient should reach both the projector
-    (wrapper) and the inner backbone."""
+    (wrapper) and the inner backbone. Mirrors the EUCLIDEAN-distance
+    MSE formulation in LossFunction._compute_edm_distance_mse."""
     B, N = 1, 24
     inner = _StubInner(in_features=16, out_features=4)
     wrap = EDMOutputWrapper(inner_model=inner, inner_out_dim=4, embed_dim=8, mds_align=False)
     data = _build_data(B=B, N=N)
     pred = wrap(data)
-    # Hand-build the squared-distance loss (mirrors LossFunction's
-    # _compute_edm_distance_mse).
-    diff_t = data.positions.unsqueeze(2) - data.positions.unsqueeze(1)
-    D_true = (diff_t * diff_t).sum(dim=-1)
-    loss = ((pred.edm_D - D_true) ** 2).mean()
+    # Hand-build the Euclidean-distance loss (matches LossFunction):
+    # MSE on sqrt(D) — same scale as LUNA's pairwise_distance_mse.
+    d_true = torch.cdist(data.positions[0], data.positions[0], p=2)
+    d_pred = (pred.edm_D[0] + 1e-8).sqrt()
+    loss = ((d_pred - d_true) ** 2).mean()
     loss.backward()
     proj_grad = sum(p.grad.abs().sum().item() for p in wrap.projector.parameters() if p.grad is not None)
     inner_grad = sum(p.grad.abs().sum().item() for p in inner.parameters() if p.grad is not None)
     assert proj_grad > 0, "projector got zero gradient"
     assert inner_grad > 0, "inner got zero gradient"
+
+
+def test_edm_multi_step_stable() -> None:
+    """Regression check for the NaN-divergence we saw at training step ~2
+    with the v1 (MSE on SQUARED distances) of this loss. Now uses MSE
+    on Euclidean distances which puts the loss on the same scale as
+    LUNA's pairwise_distance_mse — known-stable with lr=5e-4.
+
+    Runs 30 optimizer steps with the EUCLIDEAN-distance EDM loss.
+    Tests with positions in a realistic raw-coordinate scale (×50)
+    so squared distances would be ~2500× larger than Euclidean — the
+    failure regime from the GPU run.
+    """
+    B, N = 1, 32
+    inner = _StubInner(in_features=16, out_features=4)
+    wrap = EDMOutputWrapper(inner_model=inner, inner_out_dim=4, embed_dim=8, mds_align=False)
+    data = _build_data(B=B, N=N)
+    # Scale positions to "raw cortex" magnitude — exposes the
+    # squared-vs-euclidean scale issue. With v1 squared-MSE this would
+    # explode immediately.
+    data.positions = data.positions * 50.0
+    optimizer = torch.optim.AdamW(wrap.parameters(), lr=5e-4)
+    eps = 1e-8
+
+    for step in range(30):
+        optimizer.zero_grad()
+        pred = wrap(data)
+        d_true = torch.cdist(data.positions[0], data.positions[0], p=2)
+        d_pred = (pred.edm_D[0] + eps).sqrt()
+        loss = ((d_pred - d_true) ** 2).mean()
+        assert torch.isfinite(loss), f"Loss went non-finite at step {step}: {loss}"
+        loss.backward()
+        optimizer.step()
+        for p in wrap.parameters():
+            assert torch.isfinite(p).all(), f"Parameter went NaN at step {step}"
 
 
 def test_edm_zero_ref_no_crash() -> None:
@@ -219,6 +255,54 @@ def test_knn_graph_gradient() -> None:
     assert inner_grad > 0
 
 
+def test_knn_graph_multi_step_stable() -> None:
+    """Regression check for the NaN-divergence we saw at training step ~9
+    with the v1 (no normalisation, no temperature) of this module.
+
+    Runs 30 optimizer steps with both positive AND negative edges
+    (the negative-edge BCE was the unbounded direction). Asserts
+    that no parameter goes NaN and the loss stays finite. The unit-
+    norm + temperature recipe in the wrapper should make this trivially
+    pass; if anyone removes it, this test catches the regression before
+    GPU time is wasted.
+    """
+    B, N = 1, 32
+    inner = _StubInner(in_features=16, out_features=4)
+    wrap = KNNGraphOutputWrapper(
+        inner_model=inner, inner_out_dim=4, embed_dim=8,
+        spectral_layout=False, k_for_layout=5, temperature=0.1,
+    )
+    data = _build_data(B=B, N=N)
+    # `wrap.parameters()` recursively includes inner because
+    # `wrap.inner_model = inner`, so passing only wrap.parameters()
+    # covers both modules without the duplicate-parameter warning.
+    optimizer = torch.optim.AdamW(wrap.parameters(), lr=5e-4)
+    bce = torch.nn.functional.binary_cross_entropy_with_logits
+
+    for step in range(30):
+        optimizer.zero_grad()
+        pred = wrap(data)
+        logits = pred.knn_logits[0]
+        with torch.no_grad():
+            d_true = torch.cdist(data.positions[0], data.positions[0], p=2)
+            d_true_self = d_true.clone()
+            d_true_self.fill_diagonal_(float("inf"))
+            _, pos_idx = torch.topk(d_true_self, k=4, largest=False, dim=1)
+            # Random negatives.
+            neg_idx = torch.randint(0, N, (N, 8))
+        pos_logits = torch.gather(logits, 1, pos_idx)
+        neg_logits = torch.gather(logits, 1, neg_idx)
+        pos_loss = bce(pos_logits, torch.ones_like(pos_logits))
+        neg_loss = bce(neg_logits, torch.zeros_like(neg_logits))
+        loss = 0.5 * (pos_loss + neg_loss)
+        assert torch.isfinite(loss), f"Loss went non-finite at step {step}: {loss}"
+        loss.backward()
+        optimizer.step()
+        # Check parameters stayed finite.
+        for p in wrap.parameters():
+            assert torch.isfinite(p).all(), f"Parameter went NaN at step {step}"
+
+
 def test_c2f_marker_propagation() -> None:
     """If the inner model has _c2f_uses_true_positions, the EDM/kNN
     wrapper should also expose it so the LightningModule's c2f
@@ -252,9 +336,11 @@ def main() -> int:
         ("Procrustes finds inverse rotation",          test_procrustes_finds_inverse_rotation),
         ("EDM forward shapes + finiteness",            test_edm_forward_shapes_and_finite),
         ("EDM gradient flow",                          test_edm_gradient_flows_through_projector_and_inner),
+        ("EDM 30-step stability with raw-scale positions", test_edm_multi_step_stable),
         ("EDM zero-ref guard (regression framework)",  test_edm_zero_ref_no_crash),
         ("kNN graph forward",                          test_knn_graph_forward),
         ("kNN graph gradient flow",                    test_knn_graph_gradient),
+        ("kNN graph 30-step stability (no NaN)",       test_knn_graph_multi_step_stable),
         ("c2f marker propagation through wrappers",    test_c2f_marker_propagation),
         ("stubs raise NotImplementedError",            test_stubs_raise),
     ]

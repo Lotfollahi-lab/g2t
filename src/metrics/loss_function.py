@@ -1043,28 +1043,35 @@ class LossFunction(nn.Module):
         return weight * bal
 
     # ------------------------------------------------------------------
-    # scGG fundamental method #1: EDM (squared-distance) MSE loss
+    # scGG fundamental method #1: EDM (Euclidean-distance) MSE loss
     # ------------------------------------------------------------------
     def _compute_edm_distance_mse(
         self, masked_pred: DataHolder, masked_true: DataHolder,
     ) -> torch.Tensor:
-        """MSE between predicted and true SQUARED pairwise-distance
-        matrices.
+        """MSE between predicted and true EUCLIDEAN pairwise distances.
 
-        Reads ``masked_pred.edm_D`` (B, N, N) stashed by
-        EDMOutputWrapper. If it isn't there (wrapper disabled but loss
-        accidentally enabled), returns a graph-attached zero rather
-        than crashing — the bootstrap config patching in
-        FullDenoisingDiffusion.__init__ keeps this from happening in
-        practice, but defensive code here makes ablations safer.
+        Reads ``masked_pred.edm_D`` (B, N, N SQUARED distances) stashed
+        by EDMOutputWrapper, takes sqrt to get Euclidean distances, and
+        compares to ``cdist(masked_true.positions)``. If edm_D isn't
+        there (wrapper disabled but loss accidentally enabled), returns
+        a graph-attached zero rather than crashing.
 
-        Per-slice loop because each slice's valid count differs. Each
-        slice contributes the mean squared error of the upper-triangle
-        (i<j) of the squared-distance matrices on its valid cells.
-        Upper-triangle only to avoid double-counting the symmetric
-        (i,j) / (j,i) entries; the diagonal is 0 on both sides so
-        excluding it doesn't affect the loss value but tightens the
-        scale.
+        Why Euclidean, not squared
+        --------------------------
+        v1 of this loss supervised SQUARED distances directly. That's
+        the literal "Euclidean Distance Matrix" definition, but on
+        position scales where d ~ O(1-100), D² is O(1-10⁴) and the
+        MSE on D² is O(10⁸). Gradients blew up on step 1 of training
+        and the run NaN'd at step 2. Taking sqrt before the MSE puts
+        the loss on the same scale as LUNA's pairwise_distance_mse
+        (known-stable with lr=5e-4) while keeping the same information
+        content (sqrt is monotonic). pred.edm_D stays as SQUARED
+        distances because that's what classical MDS needs in the
+        wrapper's inference path.
+
+        Per-slice loop because each slice's valid count differs.
+        Upper triangle (i<j) only to avoid double-counting symmetric
+        entries.
         """
         D_pred = getattr(masked_pred, "edm_D", None)
         if D_pred is None:
@@ -1073,25 +1080,28 @@ class LossFunction(nn.Module):
             return masked_pred.positions[0].sum() * 0.0
 
         losses = []
+        # Numerical eps for the sqrt (avoid 0-derivative singularity at
+        # the diagonal even though we mask it out below).
+        eps = 1e-8
         for b in range(D_pred.shape[0]):
             mask = masked_true.node_mask[b]
             valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
             n = int(valid_idx.numel())
             if n < 2:
                 continue
-            # True squared distances on the valid sub-tensor.
+            # True Euclidean distances on the valid sub-tensor.
             true_pos_v = masked_true.positions[b].index_select(0, valid_idx)
-            diff_t = true_pos_v.unsqueeze(1) - true_pos_v.unsqueeze(0)
-            D_true_v = (diff_t * diff_t).sum(dim=-1)
-            # Predicted squared distances on the same sub-tensor.
+            d_true_v = torch.cdist(true_pos_v, true_pos_v, p=2)
+            # Predicted Euclidean distances from the stashed squared form.
             D_pred_v = D_pred[b].index_select(0, valid_idx).index_select(1, valid_idx)
+            d_pred_v = (D_pred_v + eps).sqrt()
             # Upper triangle (k=1 excludes diagonal).
             triu_mask = torch.triu(
                 torch.ones(n, n, device=D_pred.device, dtype=torch.bool),
                 diagonal=1,
             )
             losses.append(
-                self.mse(D_pred_v[triu_mask], D_true_v[triu_mask])
+                self.mse(d_pred_v[triu_mask], d_true_v[triu_mask])
             )
         if not losses:
             return masked_pred.positions[0].sum() * 0.0

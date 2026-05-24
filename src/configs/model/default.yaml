@@ -783,6 +783,20 @@ knn_graph:
     n_negatives: 20
     # Weight of the k-NN graph loss in the total objective.
     loss_weight: 1.0
+    # Temperature for the contrastive softmax (CLIP / SimCLR style).
+    # The wrapper L2-NORMALISES embeddings before computing pairwise
+    # squared distance, so ‖h_i − h_j‖² is bounded in [0, 4]. The
+    # raw negative-distance is then divided by ``temperature`` to
+    # produce the BCE-with-logits input. Smaller = sharper logits =
+    # higher-confidence predictions. 0.1 is the CLIP default and
+    # what we use here.
+    #
+    # WITHOUT normalisation + temperature, the unconstrained contrastive
+    # BCE rewards pushing negatives' embeddings infinitely far apart;
+    # ‖h‖ grows unboundedly over training and the loss eventually
+    # NaNs out (we hit this in the v1 of this module). The normalise+
+    # temperature recipe is the standard stability fix.
+    temperature: 0.1
     # If true, the original ``pairwise_distance_mse`` component is
     # auto-disabled when knn_graph is on (the graph loss replaces it).
     # If false they run in parallel.

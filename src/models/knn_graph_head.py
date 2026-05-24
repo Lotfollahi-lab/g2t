@@ -131,6 +131,7 @@ class KNNGraphOutputWrapper(nn.Module):
         embed_dim: int = 16,
         spectral_layout: bool = True,
         k_for_layout: int = 10,
+        temperature: float = 0.1,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
@@ -140,6 +141,13 @@ class KNNGraphOutputWrapper(nn.Module):
         # has its own k (in LossFunction config). Default tied to
         # ``cfg.model.knn_graph.k``.
         self.k_for_layout = int(k_for_layout)
+        # Contrastive temperature. See cfg.model.knn_graph.temperature
+        # for the rationale and the NaN-divergence story.
+        self.temperature = float(temperature)
+        if self.temperature <= 0.0:
+            raise ValueError(
+                f"knn_graph.temperature must be > 0; got {temperature}"
+            )
 
         in_dim = int(inner_out_dim) + 2
         hidden = max(32, 2 * self.embed_dim)
@@ -163,12 +171,27 @@ class KNNGraphOutputWrapper(nn.Module):
         feat_in = torch.cat([pred.node_features, pred.positions], dim=-1)
         h = self.projector(feat_in)                    # (B, N, k)
         mask = data.node_mask.to(h.dtype).unsqueeze(-1)
-        h = h * mask
+        # L2-normalise embeddings BEFORE masking, so unit-norm holds for
+        # real cells. Padding cells then get zeroed by `* mask` and
+        # contribute zero to pairwise distances regardless of where
+        # their pre-mask gradients point. clamp_min(eps) prevents
+        # division-by-zero for the (rare) degenerate case of a zero
+        # projector output.
+        h_norm = h / h.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        h_norm = h_norm * mask
+        # Backward-compat: expose the (unnormalised) projector output too.
+        pred.knn_h = h_norm
 
-        # Edge logits = negative squared distance in embedding space.
-        diff = h.unsqueeze(2) - h.unsqueeze(1)         # (B, N, N, k)
-        d_sq = (diff * diff).sum(dim=-1)               # (B, N, N)
-        logits = -d_sq                                  # (B, N, N)
+        # Edge logits = temperature-scaled NEGATIVE squared distance in
+        # the L2-normalised embedding space. For unit-norm h:
+        #     ‖h_i − h_j‖² = 2 − 2·cos(θ_ij) ∈ [0, 4]
+        # so logits = -‖h_i − h_j‖² / T ∈ [-4/T, 0]. BCE-with-logits on
+        # these is well-bounded; gradient on h is bounded; training is
+        # stable. See the NaN-divergence comment in
+        # configs/model/default.yaml::knn_graph.temperature.
+        diff = h_norm.unsqueeze(2) - h_norm.unsqueeze(1)   # (B, N, N, k)
+        d_sq = (diff * diff).sum(dim=-1)                    # (B, N, N)
+        logits = -d_sq / self.temperature                   # (B, N, N)
 
         # Mask padding rows/cols. We set padding entries to a large
         # negative number so the top-k step never picks them.
@@ -177,7 +200,6 @@ class KNNGraphOutputWrapper(nn.Module):
         logits = logits.masked_fill(~m2, float("-inf"))
 
         pred.knn_logits = logits
-        pred.knn_h = h
 
         if self.spectral_layout:
             new_pos = self._spectral_layout(logits, pred.positions, data.node_mask)
