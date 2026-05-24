@@ -153,6 +153,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "with their training counterpart in the wandb UI.",
     )
 
+    # ---------------- Pretrained gene encoder ----------------
+    p.add_argument(
+        "--embedding_field", default=None,
+        help="adata.obsm key containing PRECOMPUTED per-cell embeddings "
+             "to use in place of raw gene counts (e.g. 'pca_64', "
+             "'ae_128', 'scvi_10'). Run scripts/precompute_embeddings.py "
+             "first to populate this obsm field on every silver h5ad. "
+             "Forwarded to BOTH the train and inference subprocess "
+             "calls so the inference path sees the same input "
+             "representation as training.",
+    )
+
     # ---------------- Wrapper control ----------------
     p.add_argument(
         "--skip_inference", action="store_true",
@@ -205,6 +217,8 @@ def _build_train_cmd(
         cmd += ["--wandb_run_name", args.wandb_run_name]
     if args.luna_repo:
         cmd += ["--luna_repo", args.luna_repo]
+    if args.embedding_field:
+        cmd += ["--embedding_field", args.embedding_field]
     if args.override:
         cmd += ["--override", *args.override]
     return cmd
@@ -240,6 +254,8 @@ def _build_inference_cmd(
         cmd += ["--wandb_run_name", infer_name]
     if args.luna_repo:
         cmd += ["--luna_repo", args.luna_repo]
+    if args.embedding_field:
+        cmd += ["--embedding_field", args.embedding_field]
     if args.no_inference_plots:
         cmd += ["--no_plots"]
     if args.inference_override:

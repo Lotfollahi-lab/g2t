@@ -93,6 +93,14 @@ def main():
         help="Skip per-section ground-truth-vs-prediction plots. Plots "
              "ON by default in inference mode (in <out_dir>/plots/).",
     )
+    p.add_argument(
+        "--embedding_field", default=None,
+        help="adata.obsm key containing PRECOMPUTED per-cell embeddings "
+             "to use in place of raw gene counts (e.g. 'pca_64', "
+             "'scvi_10'). Must match what the model was trained with. "
+             "Run scripts/precompute_embeddings.py first to populate "
+             "this obsm field on the inference h5ads.",
+    )
     args = p.parse_args()
 
     # Inference uses run_benchmark in skip-training mode. epochs/batch_size
@@ -116,6 +124,7 @@ def main():
             load_checkpoint=args.checkpoint,
             make_plots=not args.no_plots,
             output_subdir="scgg_inference",
+            embedding_field=args.embedding_field,
         )
     except Exception:
         run_scgg_train.logger.exception("LUNA inference failed")
