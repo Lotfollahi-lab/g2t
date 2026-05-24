@@ -82,9 +82,11 @@ def main():
     p.add_argument(
         "--override", "--luna_override",
         dest="override",
-        action="append", default=[],
-        help="Extra Hydra override (repeatable). "
-             "'--luna_override' is a backward-compat alias.",
+        action="extend", nargs="+", default=[],
+        help="Extra Hydra overrides. Accepts ONE OR MORE key=value "
+             "tokens per --override (space-separated), and the flag "
+             "itself is repeatable. '--luna_override' is a "
+             "backward-compat alias.",
     )
     p.add_argument(
         "--no_plots", action="store_true",
