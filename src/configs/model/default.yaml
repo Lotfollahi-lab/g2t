@@ -301,3 +301,76 @@ egnn:
     update_coords: true   # if false, EGNN updates h only; positions stay frozen
                           # (useful for ablation: does the equivariant graph just
                           # need to denoise features, not coords?). Default true.
+# ---------------------------------------------------------------------------
+# Multi-scale hierarchical wrapper. Only consulted when
+# `hierarchical.enabled = true`. Currently supported with
+# `backbone: "luna_transformer"` only — EGNN+hierarchical isn't wired
+# yet (the equivariance bookkeeping doesn't compose trivially).
+#
+# Motivation
+# ----------
+# The cortex prediction picture showed the LUNA transformer learning
+# the global tissue density (cells in a rough cortex-shaped blob) but
+# failing at INTERNAL structure (laminar layers absent, cell types
+# spatially intermixed where the ground truth has sharp bands).
+# Linear attention is technically global, but the softmax-free
+# averaging in LUNA's attention smears tissue-level signal across all
+# cells uniformly — no cell has an explicit summary of "where it sits
+# in the global organ."
+#
+# This wrapper makes that summary explicit:
+#   1. Per forward, bin cells into n_patches_per_axis² spatial patches
+#      via quantile binning of the CURRENT positions x_t (no info
+#      leak — true positions never enter this assignment).
+#   2. Aggregate cells in each patch: mean of gene embeddings +
+#      patch centroid + log(cell count).
+#   3. Run a small transformer OVER patches (16-64 tokens) to mix
+#      tissue-level context across the slice.
+#   4. Broadcast each patch's output back to its member cells.
+#   5. Concatenate the broadcast vector to each cell's gene-expression
+#      features as additional input to the main backbone.
+#
+# Properties
+# ----------
+# * The patch transformer is small (~16 patches × 128 hidden × 2
+#   layers ≈ 200 KB), so the parameter cost is trivial.
+# * The patch assignment is recomputed every forward pass from the
+#   CURRENT x_t. During sampling, as x_t evolves toward x_0, the
+#   patch geometry sharpens accordingly — a built-in
+#   coarse-to-fine refinement that mirrors how the diffusion / FM
+#   trajectory itself works.
+# * Translation-invariance is preserved: patch centroids are
+#   measured relative to the LUNA-mean-centered position frame, so
+#   the patch features only depend on relative geometry.
+# * Rotation-equivariance is NOT preserved (the patch_transformer
+#   processes 2D centroids as raw scalars). That's fine for the
+#   LUNA-transformer backbone (also not rotation-equivariant). When
+#   we wire EGNN+hierarchical, the centroid features will need an
+#   invariant reformulation (e.g. ‖centroid‖ + relative angle to
+#   nearest neighbour).
+#
+# Off by default — flip on with:
+#     --override model.hierarchical.enabled=true
+# ---------------------------------------------------------------------------
+hierarchical:
+    enabled: false
+    # Number of patches along each axis. Total patches = n_patches_per_axis².
+    # 4 → 16 patches (good default for cortex, captures laminar
+    # structure with a few patches per layer). 6 → 36 (finer; useful
+    # if cortex is the bottleneck and laminar bands need sharper
+    # resolution).
+    n_patches_per_axis: 4
+    # Hidden dim of the patch-level transformer. Smaller than the
+    # cell-level transformer because there are only 16-64 tokens.
+    patch_hidden_dim: 128
+    # Number of patch-level transformer layers.
+    patch_n_layers: 2
+    # Number of patch-level attention heads.
+    patch_n_heads: 4
+    # Dim of the per-cell patch context vector that gets concatenated
+    # to the cell's gene-expression features at the input to the main
+    # backbone. Smaller = lighter conditioning, larger = more dominant
+    # signal. 64 is a reasonable middle ground given that LUNA's
+    # gene-expression input is typically O(2000)-dim raw, so 64 is
+    # 3% of the input width and unlikely to drown out gene signal.
+    output_dim: 64

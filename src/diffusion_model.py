@@ -75,20 +75,52 @@ class FullDenoisingDiffusion(pl.LightningModule):
         else:
             self._fm_prediction = "x0"   # ignored for DDPM
 
+        # Multi-scale hierarchical wrapper — toggled by
+        # cfg.model.hierarchical.enabled. When on, the wrapper bins
+        # cells into spatial patches per forward, runs a small
+        # patch-level transformer, and injects each patch's summary
+        # as additional input to the main backbone. Off by default
+        # for byte-equivalence with the LUNA baseline. Currently
+        # supported only with backbone="luna_transformer"; we raise
+        # at construction time on egnn+hierarchical so it fails
+        # loudly rather than silently dropping the wrapper.
+        hier_cfg = getattr(cfg.model, "hierarchical", None)
+        hier_enabled = bool(getattr(hier_cfg, "enabled", False)) if hier_cfg else False
+
         # Backbone selector: LUNA's stock transformer or scgg's
         # SE(2)-equivariant EGNN. The EGNN path is gated behind a
         # config knob so existing runs keep using the LUNA backbone
         # unless explicitly opted in via
         #     --override model.backbone=egnn
         backbone = str(getattr(cfg.model, "backbone", "luna_transformer")).lower()
-        if backbone == "luna_transformer":
-            self.model = Model(
-                input_dims=self.input_dims,
-                n_layers=cfg.model.n_layers,
-                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
-                hidden_dims=cfg.model.hidden_dims,
-                output_dims=self.output_dims,
+
+        if hier_enabled and backbone != "luna_transformer":
+            raise ValueError(
+                f"model.hierarchical.enabled=true currently only supports "
+                f"backbone='luna_transformer' (got backbone={backbone!r}). "
+                f"EGNN+hierarchical needs an invariant reformulation of "
+                f"the patch centroid features — not yet implemented."
             )
+
+        if backbone == "luna_transformer":
+            if hier_enabled:
+                from models.hierarchical import HierarchicalModelWrapper
+                self.model = HierarchicalModelWrapper(
+                    input_dims=self.input_dims,
+                    n_layers=cfg.model.n_layers,
+                    hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                    hidden_dims=cfg.model.hidden_dims,
+                    output_dims=self.output_dims,
+                    hierarchical_cfg=hier_cfg,
+                )
+            else:
+                self.model = Model(
+                    input_dims=self.input_dims,
+                    n_layers=cfg.model.n_layers,
+                    hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                    hidden_dims=cfg.model.hidden_dims,
+                    output_dims=self.output_dims,
+                )
         elif backbone == "egnn":
             # Local import so the LUNA-baseline path (which doesn't
             # need EGNN's torch-geometric kNN code) keeps loading
