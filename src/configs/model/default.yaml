@@ -314,6 +314,37 @@ loss:
         #                   KeOps. Use for N ≫ 10k.
         backend: "tensorized"
 
+    # EDM (Euclidean Distance Matrix) squared-distance MSE —
+    # automatically enabled by the EDMOutputWrapper, ignored otherwise.
+    #
+    # MSE between the predicted squared-pairwise-distance matrix
+    # (stashed on pred.edm_D by the wrapper) and the true squared-
+    # distance matrix of masked_true.positions. Supervises O(N²)
+    # entries per slice rather than O(N) positions, and the loss is
+    # frame-invariant by construction.
+    #
+    # Defined here (with enabled: false) so it lives in the strict
+    # config schema; the LightningModule flips ``enabled=true`` and
+    # syncs ``weight`` from ``cfg.model.edm.loss_weight`` when
+    # ``cfg.model.edm.enabled=true`` is set.
+    edm_distance_mse:
+        enabled: false
+        weight: 1.0
+
+    # k-NN graph contrastive BCE — automatically enabled by the
+    # KNNGraphOutputWrapper, ignored otherwise.
+    #
+    # For each cell: positives = top-k spatial nearest neighbours
+    # under TRUE positions; negatives = sampled non-positives.
+    # Binary-cross-entropy on the predicted edge logits (stashed on
+    # pred.knn_logits by the wrapper). Defined here so the strict
+    # OmegaConf schema accepts the runtime ``enabled=true`` flip.
+    knn_graph_loss:
+        enabled: false
+        weight: 1.0
+        k: 10
+        n_negatives: 20
+
     # Coarse-cluster centroid MSE — automatically enabled by the
     # coarse-to-fine wrapper, ignored otherwise.
     #

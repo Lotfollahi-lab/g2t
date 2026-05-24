@@ -123,44 +123,55 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 "exclusive — both replace the position output path. Enable "
                 "exactly one."
             )
+        # NB: cfg.model.loss is in OmegaConf struct mode (forbids
+        # adding new keys at runtime). The default config now declares
+        # ``edm_distance_mse`` and ``knn_graph_loss`` blocks (defaulted
+        # off), so the hot path is the ``else`` branch — pure attribute
+        # writes, no schema mutation. The ``if not hasattr`` branch
+        # exists for the edge case where an old training snapshot
+        # (from before these blocks were declared) is being restored
+        # at inference; that branch enters ``open_dict`` to bypass the
+        # struct check so the runtime add succeeds. See the
+        # ConfigAttributeError in the run logs from before the schema
+        # was added — that's what this guard prevents.
+        from omegaconf import OmegaConf as _OC
+
         if _edm_enabled_early:
             # Auto-disable original pairwise-distance MSE if requested.
             if bool(getattr(_edm_cfg_early, "replace_position_loss", True)):
                 if hasattr(cfg.model.loss, "pairwise_distance_mse"):
                     cfg.model.loss.pairwise_distance_mse.enabled = False
-            # Patch cfg so LossFunction registers the new component.
-            from omegaconf import OmegaConf as _OC
-            if not hasattr(cfg.model.loss, "edm_distance_mse"):
-                cfg.model.loss.edm_distance_mse = _OC.create({
-                    "enabled": True,
-                    "weight": float(getattr(_edm_cfg_early, "loss_weight", 1.0)),
-                })
-            else:
+            edm_loss_weight = float(getattr(_edm_cfg_early, "loss_weight", 1.0))
+            if hasattr(cfg.model.loss, "edm_distance_mse"):
                 cfg.model.loss.edm_distance_mse.enabled = True
-                cfg.model.loss.edm_distance_mse.weight = float(
-                    getattr(_edm_cfg_early, "loss_weight", 1.0)
-                )
+                cfg.model.loss.edm_distance_mse.weight = edm_loss_weight
+            else:
+                with _OC.open_dict(cfg.model.loss):
+                    cfg.model.loss.edm_distance_mse = _OC.create({
+                        "enabled": True,
+                        "weight": edm_loss_weight,
+                    })
+
         if _knn_graph_enabled_early:
             if bool(getattr(_knn_graph_cfg_early, "replace_position_loss", True)):
                 if hasattr(cfg.model.loss, "pairwise_distance_mse"):
                     cfg.model.loss.pairwise_distance_mse.enabled = False
-            from omegaconf import OmegaConf as _OC
-            if not hasattr(cfg.model.loss, "knn_graph_loss"):
-                cfg.model.loss.knn_graph_loss = _OC.create({
-                    "enabled": True,
-                    "weight": float(getattr(_knn_graph_cfg_early, "loss_weight", 1.0)),
-                    "k": int(getattr(_knn_graph_cfg_early, "k", 10)),
-                    "n_negatives": int(getattr(_knn_graph_cfg_early, "n_negatives", 20)),
-                })
-            else:
+            knn_loss_weight = float(getattr(_knn_graph_cfg_early, "loss_weight", 1.0))
+            knn_k = int(getattr(_knn_graph_cfg_early, "k", 10))
+            knn_n_neg = int(getattr(_knn_graph_cfg_early, "n_negatives", 20))
+            if hasattr(cfg.model.loss, "knn_graph_loss"):
                 cfg.model.loss.knn_graph_loss.enabled = True
-                cfg.model.loss.knn_graph_loss.weight = float(
-                    getattr(_knn_graph_cfg_early, "loss_weight", 1.0)
-                )
-                cfg.model.loss.knn_graph_loss.k = int(getattr(_knn_graph_cfg_early, "k", 10))
-                cfg.model.loss.knn_graph_loss.n_negatives = int(
-                    getattr(_knn_graph_cfg_early, "n_negatives", 20)
-                )
+                cfg.model.loss.knn_graph_loss.weight = knn_loss_weight
+                cfg.model.loss.knn_graph_loss.k = knn_k
+                cfg.model.loss.knn_graph_loss.n_negatives = knn_n_neg
+            else:
+                with _OC.open_dict(cfg.model.loss):
+                    cfg.model.loss.knn_graph_loss = _OC.create({
+                        "enabled": True,
+                        "weight": knn_loss_weight,
+                        "k": knn_k,
+                        "n_negatives": knn_n_neg,
+                    })
 
         # Pass the full cfg so the loss can read its `model.loss.*`
         # block and toggle components on/off. Default config keeps only
