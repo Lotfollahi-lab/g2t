@@ -236,12 +236,26 @@ class EGNNModel(nn.Module):
         hidden_dims: dict,
         output_dims,
         egnn_cfg,
+        subtract_input_pos: bool = False,
     ):
+        """Args:
+            subtract_input_pos: if True, the forward pass subtracts the
+                INITIAL ``x_t`` from the cumulative ``x = x_t + Σℓ Δxℓ``
+                before the final mean-center, so the output is the
+                pure cumulative residual ``R = Σℓ Δxℓ``. Used when the
+                FullDenoisingDiffusion wrapper interprets the EGNN
+                output as a velocity-prediction (rather than absolute
+                position) — see ``model.flow_matching.prediction=v``
+                in the default config. At init R≈0, so v_pred≈0, which
+                gives a stable "don't move" starting point that fits
+                EGNN's residual-update inductive bias.
+        """
         super().__init__()
         self.n_layers = n_layers
         self.n_genes_in = int(input_dims["node_features_dimensions"])
         self.time_in = int(input_dims["diffusion_time_dimensions"])
         self.out_node_dim = int(hidden_dims["output_features_to_pos_dims"])
+        self.subtract_input_pos = bool(subtract_input_pos)
 
         # Read EGNN-specific config with safe defaults.
         def _g(k, default):
@@ -289,40 +303,27 @@ class EGNNModel(nn.Module):
             nn.Linear(hidden_mlp_dims["X"], self.out_node_dim),
         )
 
-        # Learned per-cell radial-magnitude correction.
+        # ---- DELIBERATELY no output magnitude projection. ----
+        # An earlier revision added an `mlp_out_pos_norm`-style
+        # radial rescale at the output (mirroring LUNA's transformer
+        # which does ``pos * new_norm / ‖pos‖``). That operation
+        # PRESERVES each cell's angle from the centroid and only
+        # rescales its radius. Since the input ``x_t`` is Gaussian
+        # noise at training time, each cell's input angle is
+        # essentially random — so a radial-only output projection
+        # forces the prediction onto a degenerate manifold where
+        # cells form a "starburst" / spoke pattern. We observed
+        # exactly that failure mode in the
+        # ``scgg_mmc_egnn_v3_radial`` run on cortex.
         #
-        # LUNA's transformer (models/model.py:155-158) sets the output
-        # position magnitude via a learned `mlp_out_pos_norm` because
-        # its positional stream goes through attention QKV the whole
-        # way — the final ||pos|| is some arbitrary post-attention
-        # value that has to be rescaled to match the data scale
-        # (positions live in [-0.5, 0.5] per slice after dataset
-        # normalisation). EGNN's coord updates are residual
-        # (x_out = x_t + Σ_layers Δx), so ‖x_out‖ ≈ ‖x_t‖ at init and
-        # the network has no direct knob to set the output magnitude
-        # — it would have to learn the right cumulative drift end-to-
-        # end across all layers. That's the failure mode we saw
-        # (Spearman ~0.003 on cortex): the model effectively outputs
-        # the noisy input.
-        #
-        # Fix: mirror LUNA's mlp_out_pos_norm, but feed it only
-        # SE(2)-invariant scalars (h_out, ‖x‖) — never the raw pos
-        # vector — so the equivariance of the coord-update stack is
-        # preserved. We parametrise as a RESIDUAL correction
-        # ``new_norm = ‖x‖ + δ`` with ``δ``'s last layer zero-init'd,
-        # so at init the model is the identity on positions
-        # (``x_out * new_norm / ‖x_out‖ == x_out``) and the magnitude
-        # correction is learned from there. This avoids the
-        # alternative failure mode where new_norm starts near 0 and
-        # collapses positions to the origin.
-        self.mlp_out_pos_norm = nn.Sequential(
-            nn.Linear(self.out_node_dim + 1, hidden_mlp_dims["X"]),
-            nn.SiLU(),
-            nn.Linear(hidden_mlp_dims["X"], 1),
-        )
-        nn.init.zeros_(self.mlp_out_pos_norm[-1].weight)
-        nn.init.zeros_(self.mlp_out_pos_norm[-1].bias)
-        self.pos_eps = 1e-6
+        # Standard practice for equivariant diffusion / FM
+        # (Satorras 2021, Hoogeboom EDM 2022, GeoDiff) is to use ONLY
+        # the cumulative-residual output: ``x_out = x_t + Σℓ Δxℓ``,
+        # optionally mean-centered. Each Δxℓ is a sum of relative
+        # vectors scaled by INVARIANT scalars, so the cumulative is
+        # free to move cells in any direction. The output stage in
+        # forward() below is just the mask+mean-center; no radial
+        # rescale.
 
     def forward(self, data: DataHolder) -> DataHolder:
         # We import here so torch_geometric stays an optional dep — if
@@ -356,6 +357,12 @@ class EGNNModel(nn.Module):
         # Initial encodings.
         h = self.gene_encoder(flat(node_features))   # (B*N, node_dim)
         x = flat(positions)                          # (B*N, 2)
+        # Stash x_t (the initial positions, before any EGNN layer
+        # updates) — needed at the output stage when
+        # ``subtract_input_pos=True`` to isolate the pure cumulative
+        # residual R = x_final - x_t. We snapshot here BEFORE any
+        # in-place updates can touch ``x``.
+        x_t_initial = x.clone() if self.subtract_input_pos else None
         t_emb = self.time_encoder(flat(diffusion_time))  # (B*N, time_dim)
         mask_flat = node_mask.reshape(B * N)         # (B*N,) bool
 
@@ -409,40 +416,29 @@ class EGNNModel(nn.Module):
         h_out = self.out_node_proj(h_dense.reshape(B * N, -1)).reshape(B, N, -1)
         h_out = h_out * mask_d
 
-        # (2) Mean-center positions FIRST, then learned radial-
-        # magnitude correction.
-        #
-        # We center upfront so ‖x_c‖ — fed into mlp_out_pos_norm — is
-        # translation-invariant. Otherwise translating the input would
-        # shift each cell's ‖x‖ and the MLP would emit a different δ
-        # for the same point cloud in two different frames, breaking
-        # SE(2) translation equivariance. ‖x_c‖ is invariant under
-        # BOTH rotation and translation, so the rescale x_c * (new_
-        # norm / ‖x_c‖) is fully SE(2)-equivariant.
+        # (2) Optional: subtract the initial x_t so the output is
+        # the pure cumulative residual R = Σℓ Δxℓ. Only activated
+        # when the wrapping LightningModule interprets the EGNN
+        # output as a velocity-prediction (FM ``prediction=v``) —
+        # see EGNNModel.__init__ docstring. With this on, R ≈ 0 at
+        # init, which is the correct starting point for v_pred (the
+        # network learns from zero rather than from x_t).
+        if self.subtract_input_pos:
+            x_dense = (x.reshape(B, N, -1) - x_t_initial.reshape(B, N, -1)) * mask_d
+
+        # (3) Mean-subtract over real cells per slice. This is the
+        # final post-processing on positions — no radial rescale
+        # (see __init__ comment for why). The EGNN's per-layer Δxℓ
+        # updates are a sum of relative vectors scaled by invariant
+        # scalars, so the cumulative ``x = x_t + Σℓ Δxℓ`` (or the
+        # pure residual R when subtract_input_pos=True) can move
+        # cells in any direction; we just re-center so the predicted
+        # centroid sits at the origin (matching LUNA's translation-
+        # invariance convention and the loss's translation
+        # invariance).
         valid_count = mask_d.sum(dim=1, keepdim=True).clamp_min(1.0)
         x_mean = x_dense.sum(dim=1, keepdim=True) / valid_count
-        x_c = (x_dense - x_mean) * mask_d                         # centered
-
-        # Learned per-cell radial-magnitude correction.
-        # Inputs to the MLP are SE(2)-invariant by construction:
-        # h_out is a scalar-per-cell embedding (output of an MLP on
-        # invariant h), ‖x_c‖ is rotation+translation invariant. The
-        # MLP outputs a per-cell scalar δ; we rescale x_c radially by
-        # (‖x_c‖ + δ) / ‖x_c‖. δ is zero-init'd (see __init__), so at
-        # step 0 the rescale is the identity on positions and the
-        # output is just mean-centered x_t — a sensible starting
-        # point for the optimiser. The magnitude correction is then
-        # learned from there.
-        norm_c = torch.norm(x_c, dim=-1, keepdim=True)            # (B, N, 1)
-        delta_norm = self.mlp_out_pos_norm(
-            torch.cat([h_out, norm_c], dim=-1)
-        )                                                          # (B, N, 1)
-        new_norm = norm_c + delta_norm
-        x_dense = x_c * new_norm / (norm_c + self.pos_eps)
-        x_dense = x_dense * mask_d
-        # No final mean-subtract needed — x_c was already centered
-        # and the rescale is purely radial (preserves zero centroid
-        # up to numerical eps).
+        x_dense = (x_dense - x_mean) * mask_d
 
         return DataHolder(
             node_features=h_out,

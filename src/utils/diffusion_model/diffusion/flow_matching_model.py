@@ -91,14 +91,21 @@ class FlowMatchingModel:
             self.n_sampling_steps = 50
             self.eps_t = 1.0e-3
             self.sampler = "euler"
+            self.prediction = "x0"
         else:
             self.n_sampling_steps = int(getattr(fm_cfg, "n_sampling_steps", 50))
             self.eps_t = float(getattr(fm_cfg, "eps_t", 1.0e-3))
             self.sampler = str(getattr(fm_cfg, "sampler", "euler")).lower()
+            self.prediction = str(getattr(fm_cfg, "prediction", "x0")).lower()
         if self.sampler not in ("euler", "heun"):
             raise ValueError(
                 f"Unknown model.flow_matching.sampler={self.sampler!r}. "
                 f"Expected 'euler' or 'heun'."
+            )
+        if self.prediction not in ("x0", "v"):
+            raise ValueError(
+                f"Unknown model.flow_matching.prediction={self.prediction!r}. "
+                f"Expected 'x0' or 'v'."
             )
 
         # ``max_diffusion_steps`` is the attribute the sample loop in

@@ -54,6 +54,29 @@ diffusion_steps: 1000 # number of diffusion steps (DDPM only — FM ignores this
 flow_matching:
     n_sampling_steps: 50
     eps_t: 1.0e-3
+    # Prediction target.
+    # - "x0" — network outputs predicted clean positions. Loss is on
+    #          positions directly. This is the default and matches
+    #          LUNA's transformer (which outputs absolute positions).
+    # - "v"  — network outputs the velocity field v = x_1 - x_0.
+    #          LightningModule converts to x_0_pred = x_t - t·v_pred
+    #          at the forward() boundary, so the LOSS and SAMPLER stay
+    #          unchanged (both still see x_0_pred vs x_0). The point
+    #          is the GRADIENT SIGNAL: v-pred's gradient w.r.t. the
+    #          network output is roughly uniform across noise levels,
+    #          whereas x_0-pred's gradient vanishes as t→0 (the
+    #          target x_0 ≈ x_t in that limit). This often helps
+    #          architectures whose natural output is "near identity"
+    #          at init (like EGNN's residual-only updates) by giving
+    #          a stronger learning signal at low noise.
+    #
+    # When prediction=v AND backbone=egnn, EGNN automatically
+    # switches to outputting only the cumulative residual
+    # R = Σℓ Δxℓ (instead of x_t + R). This makes the network's
+    # raw output ≈ 0 at init, which is the right initial state
+    # for v_pred (v_target has magnitude ~1, but starting at 0
+    # is symmetric and gradient-friendly).
+    prediction: "x0"
     # ODE sampler order.
     # - "euler"  — 1st-order. One network forward per ODE step.
     #              Default, matches the original FM rollout.

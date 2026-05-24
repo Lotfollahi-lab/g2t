@@ -333,11 +333,64 @@ def test_heun_correction_endpoints(tol: float = 1e-5) -> None:
     print("[heun]  PASS\n")
 
 
+def test_v_prediction_conversion(tol: float = 1e-5) -> None:
+    """The LightningModule boundary converts a velocity-prediction
+    backbone output to an x_0-prediction so the loss/sampler stay
+    parameterization-agnostic. The math is::
+
+        x_0_pred = x_t − t · v_pred
+
+    Verify the two endpoints:
+
+      (a) At t = 0, x_0_pred = x_t regardless of v_pred (the noise
+          model and data ARE identical at t=0).
+      (b) When v_pred equals the true velocity v_target = (x_t−x_0)/t,
+          x_0_pred should round-trip back to x_0 exactly.
+
+    The conversion lives at scgg/src/diffusion_model.py — but the
+    formula is independent of any Lightning machinery, so we test it
+    arithmetically here.
+    """
+    torch.manual_seed(0)
+    B, N = 2, 16
+    x_0 = torch.randn(B, N, 2) * 0.3
+    x_0 = x_0 - x_0.mean(dim=1, keepdim=True)            # mean-center
+    x_1 = torch.randn(B, N, 2)
+    x_1 = x_1 - x_1.mean(dim=1, keepdim=True)
+
+    # (a) t = 0: x_t = x_0. Conversion gives x_0_pred = x_0 for ANY v_pred.
+    t_zero = torch.zeros(B, 1)
+    x_t = (1.0 - t_zero.unsqueeze(-1)) * x_0 + t_zero.unsqueeze(-1) * x_1
+    v_pred_arbitrary = torch.randn_like(x_0)
+    x_0_pred = x_t - t_zero.unsqueeze(-1) * v_pred_arbitrary
+    err_t0 = (x_0_pred - x_0).abs().max().item()
+    print(f"[v-pred]  t=0 conversion max-err vs x_0: {err_t0:.2e}")
+    if err_t0 > tol:
+        raise AssertionError(
+            f"At t=0, v_pred should not affect x_0_pred; got max-err {err_t0:.2e}."
+        )
+
+    # (b) Round-trip: feed in the TRUE velocity, recover the TRUE x_0.
+    t_mid = torch.full((B, 1), 0.5)
+    t_b = t_mid.unsqueeze(-1)
+    x_t_mid = (1.0 - t_b) * x_0 + t_b * x_1
+    v_target = x_1 - x_0                                  # ground-truth velocity
+    x_0_recovered = x_t_mid - t_b * v_target
+    err_rt = (x_0_recovered - x_0).abs().max().item()
+    print(f"[v-pred]  round-trip       max-err vs x_0: {err_rt:.2e}")
+    if err_rt > tol:
+        raise AssertionError(
+            f"v_pred=v_target should recover x_0 exactly; got max-err {err_rt:.2e}."
+        )
+    print("[v-pred]  PASS\n")
+
+
 def main() -> int:
     test_apply_noise_interpolation()
     test_euler_step_endpoints()
     test_full_sampling_loop()
     test_heun_correction_endpoints()
+    test_v_prediction_conversion()
     print("All flow-matching tests passed.")
     return 0
 

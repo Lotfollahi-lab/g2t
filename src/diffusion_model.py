@@ -63,6 +63,18 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.train_loss = LossFunction(cfg=cfg)
         self.val_loss = LossFunction(cfg=cfg)
 
+        # FM prediction parameterisation (read here so we can pass
+        # ``subtract_input_pos`` into the EGNN constructor and gate
+        # the v→x_0 conversion in self.forward).
+        if framework == "flow_matching":
+            fm_cfg = getattr(cfg.model, "flow_matching", None)
+            self._fm_prediction = (
+                str(getattr(fm_cfg, "prediction", "x0")).lower()
+                if fm_cfg is not None else "x0"
+            )
+        else:
+            self._fm_prediction = "x0"   # ignored for DDPM
+
         # Backbone selector: LUNA's stock transformer or scgg's
         # SE(2)-equivariant EGNN. The EGNN path is gated behind a
         # config knob so existing runs keep using the LUNA backbone
@@ -82,6 +94,19 @@ class FullDenoisingDiffusion(pl.LightningModule):
             # need EGNN's torch-geometric kNN code) keeps loading
             # fast even if torch-geometric's optional deps are flaky.
             from models.egnn import EGNNModel
+            # When the FM wrapper is in v-prediction mode, EGNN
+            # outputs the pure cumulative residual R = Σℓ Δxℓ rather
+            # than x_t + R. The LightningModule.forward below then
+            # interprets that residual as v_pred and converts to
+            # x_0_pred = x_t − t·v_pred. At init R ≈ 0 so
+            # v_pred ≈ 0 → x_0_pred ≈ x_t (sensible "don't move"
+            # starting point). Without this, the network would have
+            # to learn to output x_t + (large residual) when its
+            # output is interpreted as v_pred — fighting the
+            # residual-update inductive bias.
+            egnn_subtract = (
+                framework == "flow_matching" and self._fm_prediction == "v"
+            )
             self.model = EGNNModel(
                 input_dims=self.input_dims,
                 n_layers=cfg.model.n_layers,
@@ -89,6 +114,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 hidden_dims=cfg.model.hidden_dims,
                 output_dims=self.output_dims,
                 egnn_cfg=cfg.model.egnn,
+                subtract_input_pos=egnn_subtract,
             )
         else:
             raise ValueError(
@@ -149,7 +175,32 @@ class FullDenoisingDiffusion(pl.LightningModule):
     def forward(self, z_t: DataHolder) -> DataHolder:
         assert z_t.node_mask is not None
         model_input = z_t.copy()
-        return self.model(model_input)
+        pred = self.model(model_input)
+
+        # Parameterisation conversion at the FM/LightningModule
+        # boundary. When ``model.flow_matching.prediction == "v"``,
+        # the backbone's output (``pred.positions``) is interpreted
+        # as the velocity field v_pred; we convert to clean-position
+        # prediction here so the LOSS and SAMPLER stay
+        # parameterisation-agnostic (both still see x_0_pred vs
+        # x_0). The conversion uses the linear FM schedule
+        # x_t = (1−t)·x_0 + t·x_1  →  v = (x_t − x_0)/t  →
+        # x_0_pred = x_t − t·v_pred.
+        #
+        # For EGNN with this mode, the backbone has been built with
+        # ``subtract_input_pos=True`` so pred.positions is the pure
+        # cumulative residual R = Σℓ Δxℓ — exactly the right shape
+        # to interpret as v_pred (R ≈ 0 at init → v_pred ≈ 0 →
+        # x_0_pred = x_t). For the LUNA transformer in v-pred mode
+        # no architectural change is needed; its output magnitude is
+        # set by mlp_out_pos_norm and the network learns v directly.
+        if self._fm_prediction == "v":
+            # z_t.t shape: (B, 1). Broadcast to (B, 1, 1) for positions.
+            t_b = z_t.t.unsqueeze(-1)
+            v_pred = pred.positions
+            pred.positions = z_t.positions - t_b * v_pred
+            pred = pred.mask()
+        return pred
 
     def on_fit_start(self) -> None:
         self.train_iterations = 100
