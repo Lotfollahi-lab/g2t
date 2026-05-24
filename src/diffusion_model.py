@@ -276,15 +276,21 @@ class FullDenoisingDiffusion(pl.LightningModule):
             self._gene_recon_mask_ratio = float(getattr(recon_cfg, "mask_ratio", 0.15))
             self._gene_recon_weight = float(getattr(recon_cfg, "weight", 0.05))
             recon_hidden = int(getattr(recon_cfg, "hidden_dim", 256))
-            out_node_dim = int(self.output_dims["node_features_dimensions"])
-            # Input to the head: pred.node_features (out_node_dim) +
-            # pred.positions (2) — combining cell representation
-            # and predicted spatial position. Output: predicted
-            # masked-gene values at the original input dimensionality.
-            n_genes_for_recon = int(self.input_dims["node_features_dimensions"])
+            # pred.node_features (from the inner backbone) has width
+            # ``hidden_dims.output_features_to_pos_dims`` (default 4),
+            # NOT ``output_dims["node_features_dimensions"]`` which is
+            # the gene-input-side dim used elsewhere in the LUNA
+            # config. The head's input is that 4-D output concatenated
+            # with the 2-D predicted position = 6-D.
+            inner_out_dim = int(cfg.model.hidden_dims["output_features_to_pos_dims"])
+            # ORIGINAL gene dim (pre-self-cond-bump). The head
+            # predicts back to the masked input genes, which live
+            # in dataset_infos.input_dims, NOT the possibly-bumped
+            # self.input_dims.
+            n_genes_for_recon = int(dataset_infos.input_dims["node_features_dimensions"])
             import torch.nn as _nn_recon
             self.gene_recon_head = _nn_recon.Sequential(
-                _nn_recon.Linear(out_node_dim + 2, recon_hidden),
+                _nn_recon.Linear(inner_out_dim + 2, recon_hidden),
                 _nn_recon.SiLU(),
                 _nn_recon.Linear(recon_hidden, n_genes_for_recon),
             )
