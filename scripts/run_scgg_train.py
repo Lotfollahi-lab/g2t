@@ -373,6 +373,7 @@ def _build_luna_csv(
     files: List[Path],
     out_csv: Path,
     log2_normalize: bool = False,
+    embedding_field: Optional[str] = None,
 ) -> Dict[str, object]:
     """Concatenate per-section h5ads into one CSV in LUNA's input format.
 
@@ -392,6 +393,21 @@ def _build_luna_csv(
     on top compresses the input to [0, 8] and the model fails to learn —
     we verified this with ``compare_luna_csv_vs_h5ad.py``. Set
     ``log2_normalize=True`` only for ablations.
+
+    Pretrained gene encoder path
+    ----------------------------
+    When ``embedding_field`` is set (e.g. ``"pca_64"``,
+    ``"ae_128"``), the "gene" columns of the resulting CSV are
+    filled from ``adata.obsm[embedding_field]`` instead of
+    ``adata.X``. The downstream training pipeline doesn't need to
+    change — it sees a CSV with ``embedding_dim`` "gene" columns and
+    runs LUNA's standard gene encoder on top of them. The encoder
+    is now upstream of training: see ``precompute_embeddings.py``.
+    The synthetic "gene names" written into the CSV header (and
+    used by gene-panel-consistency checks) are
+    ``"<embedding_field>_<idx>"``; this stays unique across runs and
+    makes it obvious in downstream CSV inspection that you're not
+    looking at real gene names.
     """
     import anndata as ad
     import scipy.sparse as sp
@@ -412,22 +428,43 @@ def _build_luna_csv(
 
     for path in files:
         adata = ad.read_h5ad(path)
-        X = adata.X
-        if sp.issparse(X):
-            X = X.toarray()
-        # Preserve the h5ad's native precision (float64 after the
-        # build_h5ad_from_luna_csv float64 fix). Casting to float32
-        # here would introduce LSB rounding on top of LUNA's `.float()`.
-        X = np.asarray(X, dtype=np.float64)
-        if log2_normalize:
-            X = np.log2(X + 1.0)
+
+        # Choose the matrix that fills the "gene" columns of LUNA's
+        # CSV. Default is adata.X (raw gene counts). When the user
+        # asks for a pretrained encoder via ``embedding_field``, we
+        # instead read from adata.obsm[field] — same shape contract
+        # downstream, just (n_cells, embedding_dim) instead of
+        # (n_cells, n_genes).
+        if embedding_field is not None:
+            if embedding_field not in adata.obsm:
+                raise KeyError(
+                    f"--embedding_field={embedding_field!r} requested but "
+                    f"{path.name} has no adata.obsm[{embedding_field!r}]. "
+                    f"Run scripts/precompute_embeddings.py first to populate."
+                )
+            X = np.asarray(adata.obsm[embedding_field], dtype=np.float64)
+            local_gene_names = [
+                f"{embedding_field}_{i}" for i in range(X.shape[1])
+            ]
+        else:
+            X = adata.X
+            if sp.issparse(X):
+                X = X.toarray()
+            # Preserve the h5ad's native precision (float64 after the
+            # build_h5ad_from_luna_csv float64 fix). Casting to float32
+            # here would introduce LSB rounding on top of LUNA's `.float()`.
+            X = np.asarray(X, dtype=np.float64)
+            if log2_normalize:
+                X = np.log2(X + 1.0)
+            local_gene_names = list(adata.var_names)
 
         if gene_names is None:
-            gene_names = list(adata.var_names)
-        elif list(adata.var_names) != gene_names:
+            gene_names = local_gene_names
+        elif local_gene_names != gene_names:
             raise ValueError(
-                f"Gene panel mismatch in {path.name}: expected "
-                f"{len(gene_names)} genes, got {adata.n_vars}"
+                f"{'Embedding-dim' if embedding_field else 'Gene-panel'} "
+                f"mismatch in {path.name}: expected "
+                f"{len(gene_names)} columns, got {len(local_gene_names)}"
             )
 
         # Section label: prefer obs['cell_section'] (preserved verbatim
@@ -791,6 +828,7 @@ def run_benchmark(
     load_checkpoint: Optional[str] = None,
     make_plots: bool = False,
     output_subdir: Optional[str] = None,
+    embedding_field: Optional[str] = None,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
@@ -992,18 +1030,26 @@ def run_benchmark(
             head = pd.read_csv(train_csv_path, nrows=1, index_col=0)
             n_genes = len(head.columns) - 4
         else:
+            if embedding_field is not None:
+                logger.info(
+                    f"Using pretrained embeddings from "
+                    f"adata.obsm[{embedding_field!r}] in place of raw genes"
+                )
             logger.info(f"Writing train CSV -> {train_csv_path}")
             train_stats = _build_luna_csv(
                 train_files, train_csv_path, log2_normalize=log2_normalize,
+                embedding_field=embedding_field,
             )
             logger.info(
                 f"  train: {train_stats['n_rows']:,} rows, "
-                f"{train_stats['n_genes']} genes, "
+                f"{train_stats['n_genes']} "
+                f"{'embedding-dims' if embedding_field else 'genes'}, "
                 f"{train_stats['n_sections']} sections"
             )
             logger.info(f"Writing test CSV  -> {test_csv_path}")
             test_stats = _build_luna_csv(
                 test_files, test_csv_path, log2_normalize=log2_normalize,
+                embedding_field=embedding_field,
             )
             logger.info(
                 f"  test : {test_stats['n_rows']:,} rows, "
@@ -1347,6 +1393,18 @@ def main() -> int:
              "plots (svg) into <out_dir>/plots/. OFF by default during "
              "training; ON by default in inference_luna.py.",
     )
+    p.add_argument(
+        "--embedding_field", default=None,
+        help="adata.obsm key containing PRECOMPUTED per-cell embeddings "
+             "to use in place of raw gene counts (e.g. 'pca_64', "
+             "'ae_128', 'scgpt'). Run scripts/precompute_embeddings.py "
+             "first to populate this obsm field on every silver h5ad. "
+             "When set, the LUNA CSV's 'gene' columns are filled from "
+             "obsm[<field>] and the model trains on embeddings rather "
+             "than raw genes — the gene encoder becomes an adapter "
+             "over a pretrained representation. Default: None "
+             "(use raw genes, byte-equivalent to prior runs).",
+    )
     args = p.parse_args()
 
     try:
@@ -1370,6 +1428,7 @@ def main() -> int:
             skip_training=args.skip_training,
             load_checkpoint=args.load_checkpoint,
             make_plots=args.plots,
+            embedding_field=args.embedding_field,
         )
     except Exception:
         logger.exception("LUNA training failed")
