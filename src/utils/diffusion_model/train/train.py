@@ -126,9 +126,20 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
 
     z_t = self.noise_model.apply_noise(batched_data)
 
+    # Stash TRUE positions on the Lightning module so the
+    # CoarseToFineWrapper (if active) can use them for teacher
+    # forcing in its coarse-stage centroid conditioning. The wrapper
+    # reads this attribute in self.forward; non-c2f models ignore it.
+    self._c2f_true_positions = batched_data.positions
+
     # Forward pass through the model
 
-    pred = self.forward(z_t)
+    try:
+        pred = self.forward(z_t)
+    finally:
+        # Clear the stash so validation/test/inference forward calls
+        # don't accidentally see stale true positions.
+        self._c2f_true_positions = None
 
     # Compute the training loss
     loss, tl_log_dict = self.train_loss(

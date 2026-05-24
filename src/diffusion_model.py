@@ -63,6 +63,17 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.dataset_infos = dataset_infos
         self.input_dims = dataset_infos.input_dims
         self.output_dims = dataset_infos.output_dims
+
+        # Auto-enable the coarse_centroid_mse loss component when the
+        # CoarseToFineWrapper is in use, so the user only needs one
+        # --override (model.coarse_to_fine.enabled=true). Must happen
+        # BEFORE LossFunction construction reads the config.
+        _c2f_cfg = getattr(cfg.model, "coarse_to_fine", None)
+        _c2f_enabled = bool(getattr(_c2f_cfg, "enabled", False)) if _c2f_cfg else False
+        if _c2f_enabled:
+            if hasattr(cfg.model, "loss") and hasattr(cfg.model.loss, "coarse_centroid_mse"):
+                cfg.model.loss.coarse_centroid_mse.enabled = True
+
         # Pass the full cfg so the loss can read its `model.loss.*`
         # block and toggle components on/off. Default config keeps only
         # LUNA's pairwise-distance MSE on, so train-from-scratch
@@ -94,6 +105,23 @@ class FullDenoisingDiffusion(pl.LightningModule):
         hier_cfg = getattr(cfg.model, "hierarchical", None)
         hier_enabled = bool(getattr(hier_cfg, "enabled", False)) if hier_cfg else False
 
+        # Coarse-to-fine wrapper — toggled by
+        # cfg.model.coarse_to_fine.enabled. K-means clusters cells by
+        # gene expression and predicts each cluster's spatial centroid
+        # as an auxiliary output; the inner backbone receives the
+        # centroids as additional conditioning. Same backbone-
+        # constraint as hierarchical (LUNA transformer only for now).
+        c2f_cfg = getattr(cfg.model, "coarse_to_fine", None)
+        c2f_enabled = bool(getattr(c2f_cfg, "enabled", False)) if c2f_cfg else False
+        if c2f_enabled and hier_enabled:
+            raise ValueError(
+                "model.coarse_to_fine.enabled=true and "
+                "model.hierarchical.enabled=true are not yet wired "
+                "to stack — both wrappers re-instantiate the inner "
+                "Model with their own augmented input_dims. Pick "
+                "one for now."
+            )
+
         # Backbone selector: LUNA's stock transformer or scgg's
         # SE(2)-equivariant EGNN. The EGNN path is gated behind a
         # config knob so existing runs keep using the LUNA backbone
@@ -107,6 +135,22 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"backbone='luna_transformer' (got backbone={backbone!r}). "
                 f"EGNN+hierarchical needs an invariant reformulation of "
                 f"the patch centroid features — not yet implemented."
+            )
+        if c2f_enabled and backbone != "luna_transformer":
+            raise ValueError(
+                f"model.coarse_to_fine.enabled=true currently only supports "
+                f"backbone='luna_transformer' (got backbone={backbone!r}). "
+                f"The cluster-centroid conditioning concatenates 2-d "
+                f"coordinates to gene features; combining with EGNN "
+                f"requires an invariant reformulation."
+            )
+        if c2f_enabled and framework == "regression":
+            raise ValueError(
+                f"model.coarse_to_fine.enabled=true is incompatible with "
+                f"model.framework='regression' — coarse-to-fine's teacher "
+                f"forcing uses true positions during training, but "
+                f"regression mode zeros positions throughout. Disable "
+                f"one of the two."
             )
         if hier_enabled and framework == "regression":
             # The hierarchical wrapper bins cells by their positions.
@@ -135,6 +179,16 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     hidden_dims=cfg.model.hidden_dims,
                     output_dims=self.output_dims,
                     hierarchical_cfg=hier_cfg,
+                )
+            elif c2f_enabled:
+                from models.coarse_to_fine import CoarseToFineWrapper
+                self.model = CoarseToFineWrapper(
+                    input_dims=self.input_dims,
+                    n_layers=cfg.model.n_layers,
+                    hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                    hidden_dims=cfg.model.hidden_dims,
+                    output_dims=self.output_dims,
+                    c2f_cfg=c2f_cfg,
                 )
             else:
                 self.model = Model(
@@ -238,7 +292,18 @@ class FullDenoisingDiffusion(pl.LightningModule):
     def forward(self, z_t: DataHolder) -> DataHolder:
         assert z_t.node_mask is not None
         model_input = z_t.copy()
-        pred = self.model(model_input)
+
+        # Coarse-to-fine wrapper needs the TRUE positions to compute
+        # true cluster centroids for teacher-forcing during training.
+        # ``training_step_func`` (utils/diffusion_model/train/train.py)
+        # stashes them on ``self._c2f_true_positions`` before calling
+        # forward. At inference / validation / test the attribute
+        # isn't set and the wrapper falls back to predicted centroids.
+        if hasattr(self.model, "_c2f_uses_true_positions") or "CoarseToFineWrapper" in type(self.model).__name__:
+            true_pos = getattr(self, "_c2f_true_positions", None)
+            pred = self.model(model_input, true_positions=true_pos)
+        else:
+            pred = self.model(model_input)
 
         # Parameterisation conversion at the FM/LightningModule
         # boundary. When ``model.flow_matching.prediction == "v"``,

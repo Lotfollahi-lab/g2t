@@ -294,6 +294,26 @@ loss:
         #                   KeOps. Use for N ≫ 10k.
         backend: "tensorized"
 
+    # Coarse-cluster centroid MSE — automatically enabled by the
+    # coarse-to-fine wrapper, ignored otherwise.
+    #
+    # The CoarseToFineWrapper k-means-clusters cells by gene
+    # expression and predicts each cluster's spatial centroid. This
+    # loss term compares the predicted centroids against the true
+    # centroids (computed by averaging the TRUE cell positions within
+    # each cluster). It's automatically wired to the wrapper's coarse
+    # output via the LossFunction registry (the wrapper stashes the
+    # predicted centroids + cluster IDs on the returned DataHolder).
+    #
+    # Weight: 1.0 by default — same scale as the pairwise-distance
+    # MSE because centroid distances and pairwise distances live in
+    # the same coordinate scale. Lower this if the coarse signal
+    # dominates training; raise if cell-level loss is overwhelming
+    # the global signal.
+    coarse_centroid_mse:
+        enabled: false   # CoarseToFineWrapper construction flips this on automatically
+        weight: 1.0
+
 # ---------------------------------------------------------------------------
 # EGNN backbone hyperparameters. Only consulted when `backbone: "egnn"`.
 #
@@ -388,3 +408,76 @@ hierarchical:
     # gene-expression input is typically O(2000)-dim raw, so 64 is
     # 3% of the input width and unlikely to drown out gene signal.
     output_dim: 64
+
+# ---------------------------------------------------------------------------
+# Coarse-to-fine factorisation of the cell-position prediction.
+#
+# Toggleable via `coarse_to_fine.enabled = true`. Currently supported
+# with `backbone: "luna_transformer"` only (same constraint as the
+# hierarchical wrapper).
+#
+# Motivation
+# ----------
+# The single-stage FM has to learn a single mapping from
+# (gene_expression, noisy_position) → clean_position. That mapping
+# bundles two very different jobs: getting the GLOBAL tissue layout
+# right ("Layer 2/3 IT neurons go in the upper laminar band") and
+# getting the LOCAL placement right ("this cell is to the left of
+# that one within Layer 2/3"). These have different statistics —
+# the global one is data-determined by cell-type composition, the
+# local one is data-determined by tissue micro-structure.
+#
+# Coarse-to-fine factorisation handles them separately:
+#
+#   stage 1 (coarse, regression):
+#     • cluster cells by gene expression via k-means (K = n_clusters);
+#     • aggregate per-cluster gene features;
+#     • a small transformer over the K cluster tokens regresses each
+#       cluster's spatial CENTROID directly. No FM trajectory — the
+#       coarse stage only has K~16 points to predict, regression is
+#       well-matched.
+#
+#   stage 2 (fine, FM):
+#     • each cell is conditioned on its cluster's predicted centroid
+#       (concat to the cell's gene-expression features) before being
+#       fed to the existing cell-level FM machinery.
+#     • At TRAINING time, conditioning uses TRUE cluster centroids
+#       (teacher forcing — avoids error compounding while the coarse
+#       stage is still learning).
+#     • At INFERENCE time, conditioning uses PREDICTED centroids
+#       (the coarse regressor runs once per sampling-loop forward,
+#       which is cheap because it operates only on K cluster tokens).
+#
+# Loss: cell-level pairwise-MSE (existing) + coarse-centroid MSE
+# (the new component, added to model.loss as `coarse_centroid_mse`).
+# Weight the two so the coarse signal regularises but doesn't
+# dominate.
+#
+# Combines naturally with the hierarchical wrapper: hierarchical is
+# SPATIAL multi-scale (bins by current x_t positions), coarse-to-fine
+# is GENE multi-scale (clusters by gene expression). Two complementary
+# axes of multi-scale processing. Off by default; turn on with:
+#     --override model.coarse_to_fine.enabled=true
+# ---------------------------------------------------------------------------
+coarse_to_fine:
+    enabled: false
+    # Number of gene-clusters per slice. K=16 matches the hierarchical
+    # default (4×4 spatial patches), which makes the two wrappers
+    # behaviourally comparable. Cortex has ~6 cell-type laminar layers
+    # so 16 is finer than the biological clusters; that's intentional
+    # — we want coarse units smaller than the dominant cell types so
+    # the regression has something to learn.
+    n_clusters: 16
+    # Number of k-means iterations per forward pass. 10 is more than
+    # enough for K=16 — convergence is usually <5 iters.
+    kmeans_n_iters: 10
+    # Hidden width of the coarse regressor's transformer.
+    coarse_hidden_dim: 128
+    # Coarse regressor depth (transformer encoder layers).
+    coarse_n_layers: 2
+    # Attention heads for the coarse regressor.
+    coarse_n_heads: 4
+    # Pre-projection of raw gene expression for both clustering AND
+    # coarse-stage features. Smaller = lighter, larger = more
+    # expressive cluster aggregation.
+    gene_proj_dim: 128

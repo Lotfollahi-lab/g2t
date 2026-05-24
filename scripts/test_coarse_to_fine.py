@@ -1,0 +1,241 @@
+#!/usr/bin/env python
+"""Smoke tests for the coarse-to-fine wrapper.
+
+Run inside the scgg env::
+
+    source /nfs/team361/sb75/.venvs/scgg/bin/activate
+    python /nfs/team361/sb75/scgg/scripts/test_coarse_to_fine.py
+
+Exits 0 on pass, non-zero on the first failure. ~5 seconds.
+
+Four properties checked:
+
+  1. Gene clustering partitions real cells into K groups; masked
+     cells get cluster_id = -1.
+  2. CoarseRegressor outputs (B, K, 2) — one centroid per cluster.
+  3. Wrapper preserves the inner Model's DataHolder-in / DataHolder-
+     out contract; stashed coarse outputs are readable from the
+     returned object.
+  4. Gradient flows through BOTH the wrapper's own params (cluster
+     module + coarse regressor) AND the inner backbone params under
+     a joint position+centroid loss.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+def _setup_path() -> None:
+    here = Path(__file__).resolve()
+    scgg_src = here.parent.parent / "src"
+    if not scgg_src.exists():
+        raise FileNotFoundError(f"scgg/src not found at {scgg_src}")
+    sys.path.insert(0, str(scgg_src))
+
+
+_setup_path()
+
+import torch  # noqa: E402
+
+from utils.data.dataholder import DataHolder  # noqa: E402
+from models.coarse_to_fine import (  # noqa: E402
+    GeneClusterModule,
+    CoarseRegressor,
+    CoarseToFineWrapper,
+)
+
+
+def test_gene_clustering() -> None:
+    """Cluster IDs are in [0, K) for real cells, -1 for masked."""
+    torch.manual_seed(0)
+    B, N, F = 2, 64, 16
+    K = 8
+
+    module = GeneClusterModule(
+        gene_input_dim=F,
+        proj_dim=32,
+        n_clusters=K,
+        kmeans_n_iters=5,
+    ).eval()
+
+    node_features = torch.randn(B, N, F)
+    node_mask = torch.ones(B, N, dtype=torch.bool)
+    node_mask[0, 50:] = False
+
+    cluster_ids, cluster_features = module(node_features, node_mask)
+
+    if not (cluster_ids[0, 50:] == -1).all():
+        raise AssertionError("Masked cells must get cluster_id=-1.")
+    for b in range(B):
+        real = cluster_ids[b][node_mask[b]]
+        if not (real >= 0).all() or not (real < K).all():
+            raise AssertionError(
+                f"Slice {b}: cluster ids out of [0, {K})."
+            )
+    if cluster_features.shape != (B, K, 32):
+        raise AssertionError(
+            f"Cluster features shape mismatch: got {tuple(cluster_features.shape)}, "
+            f"expected ({B}, {K}, 32)."
+        )
+    print(f"[gene-clustering]  cluster_ids ∈ [0, {K}) ✓  cluster_features {tuple(cluster_features.shape)} ✓")
+    print("[gene-clustering]  PASS\n")
+
+
+def test_coarse_regressor() -> None:
+    """Outputs (B, K, 2) — one 2-D centroid per cluster."""
+    torch.manual_seed(0)
+    B, K, H = 2, 8, 32
+
+    regressor = CoarseRegressor(
+        cluster_feature_dim=H,
+        hidden_dim=64,
+        n_layers=2,
+        n_heads=4,
+    ).eval()
+
+    cluster_features = torch.randn(B, K, H)
+    centroids = regressor(cluster_features)
+    if centroids.shape != (B, K, 2):
+        raise AssertionError(
+            f"Coarse regressor output shape mismatch: {tuple(centroids.shape)}."
+        )
+    print(f"[coarse-regressor]  output {tuple(centroids.shape)} ✓")
+    print("[coarse-regressor]  PASS\n")
+
+
+def _build_wrapper():
+    input_dims = {
+        "node_features_dimensions": 16,
+        "diffusion_time_dimensions": 1,
+    }
+    hidden_mlp_dims = {"X": 32, "y": 32, "pos": 8}
+    hidden_dims = {
+        "dx": 32, "dy": 1, "num_heads": 4,
+        "dim_ffX": 32, "dim_ffy": 32, "dd": 16,
+        "output_features_to_pos_dims": 4,
+    }
+    output_dims = {
+        "node_features_dimensions": 16,
+        "diffusion_time_dimensions": 0,
+    }
+
+    class _C2FCfg:
+        n_clusters = 8
+        kmeans_n_iters = 5
+        coarse_hidden_dim = 32
+        coarse_n_layers = 1
+        coarse_n_heads = 2
+        gene_proj_dim = 32
+
+        def get(self, k, default=None):
+            return getattr(self, k, default)
+
+    return CoarseToFineWrapper(
+        input_dims=input_dims,
+        n_layers=2,
+        hidden_mlp_dims=hidden_mlp_dims,
+        hidden_dims=hidden_dims,
+        output_dims=output_dims,
+        c2f_cfg=_C2FCfg(),
+    )
+
+
+def test_wrapper_contract() -> None:
+    """The wrapper returns a DataHolder with the inner model's
+    expected positions shape, plus stashed coarse outputs."""
+    torch.manual_seed(0)
+    B, N, F = 2, 32, 16
+
+    model = _build_wrapper().eval()
+    data = DataHolder(
+        node_features=torch.randn(B, N, F),
+        positions=torch.randn(B, N, 2),
+        diffusion_time=torch.rand(B, 1),
+        node_mask=torch.ones(B, N, dtype=torch.bool),
+    )
+
+    with torch.no_grad():
+        out = model(data)
+
+    if not isinstance(out, DataHolder):
+        raise AssertionError(f"Expected DataHolder; got {type(out)}.")
+    if out.positions.shape != (B, N, 2):
+        raise AssertionError(
+            f"Output positions shape mismatch: {tuple(out.positions.shape)}."
+        )
+    # Stashed outputs.
+    if not hasattr(out, "_predicted_cluster_centroids"):
+        raise AssertionError("Missing _predicted_cluster_centroids on output.")
+    if out._predicted_cluster_centroids.shape != (B, model.n_clusters, 2):
+        raise AssertionError(
+            f"Centroids shape mismatch: {tuple(out._predicted_cluster_centroids.shape)}."
+        )
+    if not hasattr(out, "_cluster_ids"):
+        raise AssertionError("Missing _cluster_ids on output.")
+    if out._cluster_ids.shape != (B, N):
+        raise AssertionError(
+            f"cluster_ids shape mismatch: {tuple(out._cluster_ids.shape)}."
+        )
+    print(f"[wrapper-contract]  positions {tuple(out.positions.shape)} ✓ "
+          f"centroids {tuple(out._predicted_cluster_centroids.shape)} ✓")
+    print("[wrapper-contract]  PASS\n")
+
+
+def test_gradient_flow() -> None:
+    """Joint loss (positions + centroid) reaches BOTH wrapper-side
+    and inner-side parameters."""
+    torch.manual_seed(0)
+    B, N, F = 2, 32, 16
+
+    model = _build_wrapper().train()
+    data = DataHolder(
+        node_features=torch.randn(B, N, F),
+        positions=torch.randn(B, N, 2),
+        diffusion_time=torch.rand(B, 1),
+        node_mask=torch.ones(B, N, dtype=torch.bool),
+    )
+    # Provide true_positions so teacher-forcing path is exercised.
+    out = model(data, true_positions=data.positions)
+
+    target_pos = torch.randn_like(out.positions)
+    target_centroids = torch.randn_like(out._predicted_cluster_centroids)
+    loss = (
+        ((out.positions - target_pos) ** 2).mean()
+        + ((out._predicted_cluster_centroids - target_centroids) ** 2).mean()
+        + (out.node_features ** 2).mean()   # also touch the inner-feature output
+    )
+    loss.backward()
+
+    coarse_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in list(model.cluster_module.parameters())
+        + list(model.coarse_regressor.parameters())
+    )
+    inner_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.inner.parameters()
+    )
+    if not coarse_has_grad:
+        raise AssertionError(
+            "Coarse stage received zero gradient — wrapper not "
+            "propagating through cluster_module / coarse_regressor."
+        )
+    if not inner_has_grad:
+        raise AssertionError("Inner backbone received zero gradient.")
+    print("[grad]  coarse params ✓  inner params ✓")
+    print("[grad]  PASS\n")
+
+
+def main() -> int:
+    test_gene_clustering()
+    test_coarse_regressor()
+    test_wrapper_contract()
+    test_gradient_flow()
+    print("All coarse-to-fine tests passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

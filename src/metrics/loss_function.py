@@ -167,6 +167,17 @@ class LossFunction(nn.Module):
         # geomloss import cost.
         self._sk_loss_fn = None
 
+        # Coarse-cluster centroid MSE. Auto-enabled by the
+        # CoarseToFineWrapper; needs the wrapper to stash
+        # ``_predicted_cluster_centroids`` and ``_cluster_ids`` on
+        # the pred DataHolder.
+        self._cc_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                         "coarse_centroid_mse", "enabled",
+                                         default=False))
+        self._cc_weight = float(_cfg_get(cfg, "model", "loss",
+                                         "coarse_centroid_mse", "weight",
+                                         default=1.0))
+
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
         # ``compute_loss`` iterates this list — adding a new component
@@ -180,6 +191,8 @@ class LossFunction(nn.Module):
              self._compute_persistent_homology),
             ("sinkhorn", self._sk_enabled, self._sk_weight,
              self._compute_sinkhorn),
+            ("coarse_centroid_mse", self._cc_enabled, self._cc_weight,
+             self._compute_coarse_centroid_mse),
         ]
 
         # One-time summary so the train.log shows what's active.
@@ -208,6 +221,8 @@ class LossFunction(nn.Module):
                 )
                 if self._sk_subsample:
                     extra += f", subsample={self._sk_subsample}"
+            elif name == "coarse_centroid_mse":
+                extra = " (auto-wired by CoarseToFineWrapper)"
             active.append(f"{name}(w={w:.3g}{extra})")
         print(f"[LossFunction] active components: {', '.join(active) or '(none!)'}")
 
@@ -556,6 +571,81 @@ class LossFunction(nn.Module):
                     else torch.tensor(0.0))
             return zero
         return torch.mean(torch.stack(slice_losses))
+
+    def _compute_coarse_centroid_mse(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Auxiliary coarse-to-fine loss: MSE between the predicted
+        cluster centroids (from the CoarseToFineWrapper) and the
+        TRUE cluster centroids (computed from the true positions
+        and the wrapper-determined cluster assignments).
+
+        The wrapper stashes its outputs on the pred DataHolder:
+            masked_pred._predicted_cluster_centroids : (B, K, 2)
+            masked_pred._cluster_ids                  : (B, N) long
+            masked_pred._n_clusters                   : int K
+
+        We compute true centroids here by scatter-mean of
+        ``masked_true.positions`` into the same cluster bins.
+
+        The MSE is on PAIRWISE DISTANCES between centroids (same
+        rotation-invariant treatment as the cell-level loss), not
+        on raw 2-D coordinates — that keeps the coarse signal
+        consistent with the rest of the pipeline's translation/
+        rotation invariance.
+        """
+        # If the wrapper isn't in use, the stashed attributes won't
+        # exist. Return a graph-attached zero so downstream summation
+        # has something to add into.
+        pred_centroids = getattr(masked_pred, "_predicted_cluster_centroids", None)
+        cluster_ids = getattr(masked_pred, "_cluster_ids", None)
+        K = getattr(masked_pred, "_n_clusters", None)
+        if pred_centroids is None or cluster_ids is None or K is None:
+            return masked_pred.positions[0].sum() * 0.0
+
+        B, N = cluster_ids.shape
+        device = pred_centroids.device
+
+        # Compute true cluster centroids per slice.
+        safe_ids = cluster_ids.clamp(min=0)
+        valid = masked_true.node_mask & (cluster_ids >= 0)
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, N)
+        combined_id = (batch_idx * K + safe_ids).reshape(-1)
+        valid_f = valid.float().reshape(-1, 1)
+
+        pos_flat = masked_true.positions.reshape(B * N, 2) * valid_f
+        count_flat = valid.float().reshape(B * N)
+
+        sum_pos = pred_centroids.new_zeros(B * K, 2)
+        sum_cnt = pred_centroids.new_zeros(B * K)
+        sum_pos.scatter_add_(0, combined_id.unsqueeze(-1).expand(-1, 2), pos_flat)
+        sum_cnt.scatter_add_(0, combined_id, count_flat)
+
+        cnt_safe = sum_cnt.clamp(min=1.0)
+        true_centroids = (sum_pos / cnt_safe.unsqueeze(-1)).reshape(B, K, 2)
+        # Mask out empty clusters from the loss so they don't bias it.
+        # An empty cluster has sum_cnt = 0; mark it.
+        cluster_present = (sum_cnt > 0).reshape(B, K)                   # (B, K)
+
+        # Pairwise-distance MSE between centroid sets, per slice.
+        # Matches the rotation-invariance convention of the cell-level
+        # pairwise distance loss. Empty clusters (cluster_present=
+        # False) get dropped from the per-slice cdist by masking.
+        losses = []
+        for b in range(B):
+            mask_b = cluster_present[b]
+            if mask_b.sum().item() < 2:
+                # need at least 2 clusters to have any pairwise distance
+                continue
+            d_true = torch.cdist(true_centroids[b][mask_b],
+                                 true_centroids[b][mask_b], p=2)
+            d_pred = torch.cdist(pred_centroids[b][mask_b],
+                                 pred_centroids[b][mask_b], p=2)
+            losses.append(self.mse(d_pred, d_true))
+
+        if not losses:
+            return pred_centroids.sum() * 0.0
+        return torch.mean(torch.stack(losses))
 
     # ----------------------------- aggregation ----------------------------
 

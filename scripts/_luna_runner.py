@@ -351,6 +351,38 @@ def _patch_setup_callbacks() -> None:
         # should live one level up next to runtime.csv etc.
         run_dir = Path(cfg.general.local_saved_path)
         out_dir = run_dir.parent
+
+        # Force-pin ModelCheckpoint dirpaths to an absolute path under
+        # the Hydra run dir.
+        #
+        # LUNA's create_model_checkpoint_callbacks uses dirpath=
+        # "checkpoints" (relative). Lightning resolves relative
+        # dirpaths against Trainer.default_root_dir, which itself
+        # falls back to os.getcwd(). We've seen runs (notably the
+        # regression-framework smoke run) silently fail to write
+        # any checkpoint — the cwd at Trainer construction time
+        # doesn't always agree with where run_scgg_train.py expects
+        # to find them. Rewriting any relative dirpath to
+        # <luna_run>/checkpoints/ here eliminates the ambiguity:
+        # the file lands EXACTLY where _find_latest_checkpoint
+        # looks for it.
+        ckpt_target_dir = run_dir / "checkpoints"
+        ckpt_target_dir.mkdir(parents=True, exist_ok=True)
+        rewritten = 0
+        for cb in callbacks:
+            # Lazy import the type check so we don't grab a stale
+            # PL reference if pl_local was patched mid-import.
+            if isinstance(cb, pl_local.callbacks.ModelCheckpoint):
+                existing = getattr(cb, "dirpath", None)
+                if existing is None or not Path(str(existing)).is_absolute():
+                    cb.dirpath = str(ckpt_target_dir)
+                    rewritten += 1
+        if rewritten > 0:
+            logger.info(
+                f"[luna_runner] pinned {rewritten} ModelCheckpoint(s) to "
+                f"absolute dirpath {ckpt_target_dir}"
+            )
+
         metrics_csv = out_dir / "metrics.csv"
         callbacks.append(MetricsCsvCallback(metrics_csv))
         logger.info(
