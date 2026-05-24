@@ -64,6 +64,27 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.input_dims = dataset_infos.input_dims
         self.output_dims = dataset_infos.output_dims
 
+        # Self-conditioning (Chen 2023). When enabled, each cell's
+        # input is augmented with the previous step's x_0_pred (2-D)
+        # alongside its gene features. This requires bumping the
+        # inner backbone's input_dims BEFORE construction so all
+        # downstream wrappers (c2f / hierarchical) see the wider
+        # input and add their own augmentations on top.
+        sc_cfg = getattr(cfg.train, "self_conditioning", None)
+        self._self_cond_enabled = bool(
+            getattr(sc_cfg, "enabled", False)
+        ) if sc_cfg is not None else False
+        self._self_cond_prob = float(
+            getattr(sc_cfg, "prob", 0.5)
+        ) if sc_cfg is not None else 0.5
+        if self._self_cond_enabled:
+            # Bump input width by 2 (the self-cond x_0_pred channel).
+            # Convert to a mutable dict in case input_dims is frozen.
+            self.input_dims = dict(self.input_dims)
+            self.input_dims["node_features_dimensions"] = (
+                int(self.input_dims["node_features_dimensions"]) + 2
+            )
+
         # Auto-enable the coarse_centroid_mse loss component when the
         # CoarseToFineWrapper is in use, so the user only needs one
         # --override (model.coarse_to_fine.enabled=true). Must happen
@@ -243,6 +264,33 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"Expected 'luna_transformer' or 'egnn'."
             )
 
+        # Auxiliary gene-reconstruction head. Active iff
+        # cfg.train.gene_reconstruction.enabled. Takes the inner
+        # backbone's output node_features (out_node_dim) and predicts
+        # back to gene space. Trained jointly with the main loss.
+        recon_cfg = getattr(cfg.train, "gene_reconstruction", None)
+        self._gene_recon_enabled = bool(
+            getattr(recon_cfg, "enabled", False)
+        ) if recon_cfg is not None else False
+        if self._gene_recon_enabled:
+            self._gene_recon_mask_ratio = float(getattr(recon_cfg, "mask_ratio", 0.15))
+            self._gene_recon_weight = float(getattr(recon_cfg, "weight", 0.05))
+            recon_hidden = int(getattr(recon_cfg, "hidden_dim", 256))
+            out_node_dim = int(self.output_dims["node_features_dimensions"])
+            # Input to the head: pred.node_features (out_node_dim) +
+            # pred.positions (2) — combining cell representation
+            # and predicted spatial position. Output: predicted
+            # masked-gene values at the original input dimensionality.
+            n_genes_for_recon = int(self.input_dims["node_features_dimensions"])
+            import torch.nn as _nn_recon
+            self.gene_recon_head = _nn_recon.Sequential(
+                _nn_recon.Linear(out_node_dim + 2, recon_hidden),
+                _nn_recon.SiLU(),
+                _nn_recon.Linear(recon_hidden, n_genes_for_recon),
+            )
+        else:
+            self.gene_recon_head = None
+
         # Training paradigm: DDPM (LUNA default), rectified-flow FM,
         # or pure supervised regression. All three classes share the
         # SAME apply_noise / sample_limit_dist /
@@ -304,6 +352,23 @@ class FullDenoisingDiffusion(pl.LightningModule):
     def forward(self, z_t: DataHolder) -> DataHolder:
         assert z_t.node_mask is not None
         model_input = z_t.copy()
+
+        # Self-conditioning: prepend the 2-D x_0_pred channel (from
+        # the previous training-step inner pass OR previous sampling
+        # step) to node_features. The inner backbone's input_dims
+        # was bumped by 2 at construction time so the gene encoder
+        # accepts the wider input. When no self-cond has been
+        # stashed yet (very first forward of a sampling chain),
+        # default to zeros.
+        if self._self_cond_enabled:
+            sc = getattr(z_t, "_self_cond_x0", None)
+            if sc is None:
+                sc = torch.zeros_like(z_t.positions)
+            # Mask out padding cells so they contribute zeros.
+            sc = sc * z_t.node_mask.unsqueeze(-1).to(sc.dtype)
+            model_input.node_features = torch.cat(
+                [model_input.node_features, sc], dim=-1,
+            )
 
         # Coarse-to-fine wrapper needs the TRUE positions to compute
         # true cluster centroids for teacher-forcing during training.

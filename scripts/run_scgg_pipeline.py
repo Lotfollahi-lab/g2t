@@ -165,6 +165,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "representation as training.",
     )
 
+    # ---------------- Multi-sample inference ----------------
+    p.add_argument(
+        "--n_inference_samples", type=int, default=1,
+        help="Multi-sample inference ensembling. When > 1, both the "
+             "training's built-in test step AND the separate inference "
+             "subprocess draw N samples per slice and report per-cell "
+             "mean. Per-cell std is saved alongside for UQ.",
+    )
+
     # ---------------- Wrapper control ----------------
     p.add_argument(
         "--skip_inference", action="store_true",
@@ -219,6 +228,8 @@ def _build_train_cmd(
         cmd += ["--luna_repo", args.luna_repo]
     if args.embedding_field:
         cmd += ["--embedding_field", args.embedding_field]
+    if args.n_inference_samples and args.n_inference_samples != 1:
+        cmd += ["--n_inference_samples", str(args.n_inference_samples)]
     if args.override:
         cmd += ["--override", *args.override]
     return cmd
@@ -256,6 +267,8 @@ def _build_inference_cmd(
         cmd += ["--luna_repo", args.luna_repo]
     if args.embedding_field:
         cmd += ["--embedding_field", args.embedding_field]
+    if args.n_inference_samples and args.n_inference_samples != 1:
+        cmd += ["--n_inference_samples", str(args.n_inference_samples)]
     if args.no_inference_plots:
         cmd += ["--no_plots"]
     if args.inference_override:

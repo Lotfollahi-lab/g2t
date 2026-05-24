@@ -829,6 +829,7 @@ def run_benchmark(
     make_plots: bool = False,
     output_subdir: Optional[str] = None,
     embedding_field: Optional[str] = None,
+    n_inference_samples: int = 1,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
@@ -1115,6 +1116,11 @@ def run_benchmark(
     ]
     if lr is not None:
         overrides.append(f"train.lr={lr}")
+    if n_inference_samples != 1:
+        # Pipe the CLI value into Hydra so cfg.test.n_inference_samples
+        # is set correctly inside _luna_runner. The actual ensembling
+        # happens in utils/diffusion_model/test/test.py.
+        overrides.append(f"test.n_inference_samples={int(n_inference_samples)}")
     if skip_training:
         if load_checkpoint is None:
             raise ValueError(
@@ -1405,6 +1411,15 @@ def main() -> int:
              "over a pretrained representation. Default: None "
              "(use raw genes, byte-equivalent to prior runs).",
     )
+    p.add_argument(
+        "--n_inference_samples", type=int, default=1,
+        help="At inference, draw this many samples per slice and "
+             "report the per-cell mean as the final prediction. "
+             "Per-cell std is also saved to metadata_pred_std.csv "
+             "for uncertainty quantification. Default 1 (no "
+             "ensembling). Typical values: 5-10. Linearly scales "
+             "inference wall-clock.",
+    )
     args = p.parse_args()
 
     try:
@@ -1429,6 +1444,7 @@ def main() -> int:
             load_checkpoint=args.load_checkpoint,
             make_plots=args.plots,
             embedding_field=args.embedding_field,
+            n_inference_samples=args.n_inference_samples,
         )
     except Exception:
         logger.exception("LUNA training failed")

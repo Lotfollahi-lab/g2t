@@ -101,6 +101,14 @@ def main():
              "Run scripts/precompute_embeddings.py first to populate "
              "this obsm field on the inference h5ads.",
     )
+    p.add_argument(
+        "--n_inference_samples", type=int, default=1,
+        help="Multi-sample ensembling at inference. When > 1, draws "
+             "N samples per slice, reports per-cell mean as the "
+             "final prediction, saves per-cell std to "
+             "metadata_pred_std.csv for uncertainty estimation. "
+             "Linearly scales inference wall-clock.",
+    )
     args = p.parse_args()
 
     # Inference uses run_benchmark in skip-training mode. epochs/batch_size
@@ -125,6 +133,7 @@ def main():
             make_plots=not args.no_plots,
             output_subdir="scgg_inference",
             embedding_field=args.embedding_field,
+            n_inference_samples=args.n_inference_samples,
         )
     except Exception:
         run_scgg_train.logger.exception("LUNA inference failed")

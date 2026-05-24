@@ -93,12 +93,60 @@ def process_single_batch(self, batches, index, test_save_path):
 def sample_model_predictions(self, batch):
     """
     Samples predictions from the diffusion model.
+
+    Multi-sample ensembling: when ``cfg.test.n_inference_samples > 1``
+    the sampling is run N times per slice (different noise seeds)
+    and the final prediction is the per-cell mean. Per-cell std is
+    stashed on the module (``self._last_sample_std``) so the
+    downstream test code can write it out alongside the predictions.
+
+    For N=1 (default), this is byte-equivalent to the prior path:
+    one sampling run, no aggregation overhead.
     """
+    import torch
+    n_samples = int(getattr(self.cfg.test, "n_inference_samples", 1))
+    if n_samples <= 1:
+        start_time = time.time()
+        positions_pred_whole = sample_graphs(self, batch=batch, test=True)
+        sample_time = time.time() - start_time
+        print(f"Sampling on one graph took {sample_time} seconds.")
+        self._last_sample_std = None
+        return positions_pred_whole
+
+    print(f"Multi-sample inference: running {n_samples} samples per slice...")
     start_time = time.time()
-    positions_pred_whole = sample_graphs(self, batch=batch, test=True)
+    # Each sample_graphs() call returns a list (one entry per slice in
+    # the batch — usually batch_size=1 at test time, so one entry).
+    # We stack across samples and take the per-cell mean.
+    samples_per_slice = []
+    for s_idx in range(n_samples):
+        sample_list = sample_graphs(self, batch=batch, test=True)
+        samples_per_slice.append(sample_list)
     sample_time = time.time() - start_time
-    print(f"Sampling on one graph took {sample_time} seconds.")
-    return positions_pred_whole
+    print(
+        f"Multi-sample sampling on one graph took {sample_time:.2f}s "
+        f"({sample_time / n_samples:.2f}s per sample × {n_samples} samples)."
+    )
+
+    # Each sample_list is a list (or tensor) of per-slice predictions.
+    # Aggregate per-slice across samples.
+    # samples_per_slice[s_idx][slice_idx] = tensor of (N, 2) positions
+    n_slices_in_batch = len(samples_per_slice[0])
+    ensembled = []
+    per_cell_stds = []
+    for slice_idx in range(n_slices_in_batch):
+        stacked = torch.stack(
+            [samples_per_slice[s_idx][slice_idx] for s_idx in range(n_samples)],
+            dim=0,
+        )  # (n_samples, N, 2)
+        mean_pred = stacked.mean(dim=0)              # (N, 2)
+        std_pred = stacked.std(dim=0)                # (N, 2)
+        ensembled.append(mean_pred)
+        per_cell_stds.append(std_pred)
+    # Stash stds so process_single_sample can write them out next to
+    # the mean predictions.
+    self._last_sample_std = per_cell_stds
+    return ensembled
 
 
 def process_single_sample(self, batch, positions_pred, test_save_path, sample_index):
@@ -110,9 +158,20 @@ def process_single_sample(self, batch, positions_pred, test_save_path, sample_in
     node_mask = batch.node_mask[0].cpu().numpy()
     cell_ID = batch.cell_ID[0].cpu().numpy()
 
+    # Multi-sample inference: ``_last_sample_std`` was stashed by
+    # ``sample_model_predictions`` when n_inference_samples > 1.
+    # Pop it once per call so it isn't reused.
+    sample_std = getattr(self, "_last_sample_std", None)
+    if sample_std is not None and sample_index < len(sample_std):
+        sample_std_np = sample_std[sample_index].cpu().numpy()
+    else:
+        sample_std_np = None
+
     positions_pred, positions_true, cell_ID = mask_positions(
         positions_pred, positions_true, cell_ID, node_mask
     )
+    if sample_std_np is not None:
+        sample_std_np = sample_std_np[node_mask]
 
     mapping_dict, cell_class_decoder = get_mappings(self)
     corresponding_region = get_corresponding_region(mapping_dict, positions_pred)
@@ -124,6 +183,24 @@ def process_single_sample(self, batch, positions_pred, test_save_path, sample_in
     metadata_true, metadata_pred_normalized, unique_cell_classes = prepare_data(
         positions_pred, positions_true, cell_ID, cell_class, save_dir
     )
+
+    # Write per-cell standard deviation alongside the mean prediction
+    # when multi-sample inference was active. Same indexing as the
+    # written ``metadata_pred.csv``.
+    if sample_std_np is not None:
+        import pandas as pd_local
+        try:
+            n_cells = min(len(positions_true), sample_std_np.shape[0])
+            std_df = pd_local.DataFrame({
+                "std_x": sample_std_np[:n_cells, 0],
+                "std_y": sample_std_np[:n_cells, 1],
+                "std_l2": (sample_std_np[:n_cells] ** 2).sum(axis=1) ** 0.5,
+            }, index=cell_ID[:n_cells])
+            std_df.to_csv(os.path.join(save_dir, "metadata_pred_std.csv"))
+        except Exception:
+            # Defensive: don't let a stats-write hiccup break the
+            # main evaluation path.
+            pass
 
     log_dict = perform_evaluation(
         self.cfg.test.epoch_index,

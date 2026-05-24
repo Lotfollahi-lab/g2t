@@ -6,3 +6,12 @@ batch_size: 1 # Batch size for testing
 epoch_index: null
 checkpoint_path: null # only for 'test_only' mode, path to the checkpoint to test.
 test_save_parent_path: null # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
+
+# Multi-sample inference / ensembling. When > 1, the sampling loop
+# is run N times per slice with different noise seeds, and the
+# final prediction is the per-cell mean. Per-cell std is also
+# saved (metadata_pred_std.csv) for uncertainty quantification.
+# Pure inference-time setting — does not affect training. Works
+# for any framework (FM / DDPM); not useful for regression (which
+# is deterministic).
+n_inference_samples: 1

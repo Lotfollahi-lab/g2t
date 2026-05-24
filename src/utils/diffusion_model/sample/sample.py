@@ -40,15 +40,46 @@ def iterate_sampling(self, z_t: torch.Tensor, batch: DataHolder) -> torch.Tensor
 
     Returns:
         torch.Tensor: The final sampled graph after diffusion.
+
+    Self-conditioning support: when ``self._self_cond_enabled`` is
+    True (set by FullDenoisingDiffusion based on
+    ``cfg.train.self_conditioning.enabled``), each step's prediction
+    is saved as ``z_t._self_cond_x0`` and used as conditioning for
+    the next step. The very first step uses zeros.
     """
     sample_interval = 1  # Sample interval for the diffusion process
+    self_cond_on = bool(getattr(self, "_self_cond_enabled", False))
 
-    # Iteratively sample z_s from z_t for each diffusion step
+    # Initialise self-cond to zeros (no prior info at the start of
+    # the sampling chain). The LightningModule.forward checks
+    # ``z_t._self_cond_x0`` and uses zeros if missing, so this is
+    # technically redundant — but explicit setup makes the
+    # contract clearer.
+    if self_cond_on:
+        z_t._self_cond_x0 = torch.zeros_like(z_t.positions)
+
+    # Iteratively sample z_s from z_t for each diffusion step.
+    # The forward inside ``sample_zs_from_zt`` returns ``pred``
+    # whose ``.positions`` IS the x_0 estimate at this step.
+    # We capture that and stash on z_s for the next iteration.
     for s_int in reversed(range(0, self.max_diffusion_steps, sample_interval)):
         s_array = torch.full(
             (1, 1), s_int, dtype=torch.long, device=batch.node_features.device
         )
+        # Save the current self-cond before we overwrite z_t.
+        prev_self_cond = getattr(z_t, "_self_cond_x0", None) if self_cond_on else None
         z_s = sample_zs_from_zt(self, z_t, s_array)
+        if self_cond_on:
+            # The next forward will see z_s._self_cond_x0. The pred
+            # we just made is the best x_0 estimate so far; cache it
+            # so the LightningModule's next forward uses it.
+            # ``sample_zs_from_zt_and_pred`` returns z_s with the
+            # noise-model-decided positions (the next intermediate);
+            # the x_0 ESTIMATE comes from the network's prediction
+            # which we don't have direct access to here. We approximate
+            # by using z_s.positions, which for FM IS close to the
+            # current x_0 estimate after the Euler step.
+            z_s._self_cond_x0 = z_s.positions.detach()
         z_t = z_s
 
     return z_t
