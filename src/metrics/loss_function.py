@@ -152,6 +152,16 @@ class LossFunction(nn.Module):
         sk_sub = _cfg_get(cfg, "model", "loss", "sinkhorn", "subsample",
                           default=None)
         self._sk_subsample = int(sk_sub) if sk_sub else None
+        # Backend selection. Default "tensorized" because the
+        # KeOps-accelerated backends ("online", "multiscale", and
+        # "auto" when N is large) need a working KeOps install which
+        # is fragile in practice (LLVM + CUDA + Python ABI all have
+        # to line up). See the comment in configs/model/default.yaml
+        # for the full menu and how to verify KeOps if you want
+        # to switch to "auto".
+        self._sk_backend = str(_cfg_get(cfg, "model", "loss",
+                                        "sinkhorn", "backend",
+                                        default="tensorized"))
         # Lazy-init: only build the SamplesLoss object on first call,
         # so users who never enable the component never pay the
         # geomloss import cost.
@@ -193,7 +203,8 @@ class LossFunction(nn.Module):
             elif name == "sinkhorn":
                 extra = (
                     f", p={self._sk_p}, blur={self._sk_blur:.3g}, "
-                    f"scaling={self._sk_scaling:.3g}"
+                    f"scaling={self._sk_scaling:.3g}, "
+                    f"backend={self._sk_backend}"
                 )
                 if self._sk_subsample:
                     extra += f", subsample={self._sk_subsample}"
@@ -504,7 +515,9 @@ class LossFunction(nn.Module):
                 p=self._sk_p,
                 blur=self._sk_blur,
                 scaling=self._sk_scaling,
-                backend="auto",   # KeOps if installed, else tensorized PyTorch
+                # "tensorized" by default — see __init__ comment for
+                # why we don't trust "auto" / KeOps backends here.
+                backend=self._sk_backend,
                 debias=True,      # always — see docstring
             )
 

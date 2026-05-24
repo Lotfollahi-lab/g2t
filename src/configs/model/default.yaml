@@ -250,12 +250,35 @@ loss:
         # MSE convention); 1 = L¹ cost (sometimes more robust to
         # outliers). Stick with 2 unless ablating.
         p: 2
-        # subsample: null = use all cells per slice. Sinkhorn is O(N)
-        # memory + O(N·iters) compute via online Sinkhorn / multiscale,
-        # so cortex's ~7500 cells per slice is fine. Cap to e.g. 2000
-        # if you stack this with PH/kNN-rank and need the wall-clock
-        # back.
+        # subsample: null = use all cells per slice. With
+        # backend="tensorized" (default; see below) Sinkhorn is O(N²)
+        # memory — cortex's ~7500 cells per slice → ~450MB per
+        # slice for the cost matrix, fine on an H100 but tight on
+        # smaller GPUs. Cap to e.g. 2000 if memory-bound or if you
+        # stack this with PH/kNN-rank and need the wall-clock back.
         subsample: null
+        # geomloss backend.
+        # - "tensorized"  — pure PyTorch O(N²). No external deps.
+        #                   Works on any GPU. Default — chosen
+        #                   because the KeOps-accelerated backends
+        #                   ("online", "multiscale") need a working
+        #                   KeOps install (LLVM toolchain + correct
+        #                   CUDA version) and we hit a silent
+        #                   `generic_logsumexp` import failure when
+        #                   geomloss's "auto" backend tried to use
+        #                   them.
+        # - "auto"        — geomloss picks: "tensorized" for small N,
+        #                   "online" / "multiscale" (both KeOps) for
+        #                   larger N. Faster but only if KeOps is
+        #                   actually loadable. Verify with
+        #                   `python -c "import pykeops; pykeops.test_torch_bindings()"`
+        #                   before switching to "auto".
+        # - "online"      — explicit KeOps online Sinkhorn. O(N)
+        #                   memory; needs KeOps.
+        # - "multiscale"  — explicit KeOps multiscale Sinkhorn. O(N)
+        #                   memory + multiscale clustering; needs
+        #                   KeOps. Use for N ≫ 10k.
+        backend: "tensorized"
 
 # ---------------------------------------------------------------------------
 # EGNN backbone hyperparameters. Only consulted when `backbone: "egnn"`.
