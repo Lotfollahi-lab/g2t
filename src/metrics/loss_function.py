@@ -198,6 +198,37 @@ class LossFunction(nn.Module):
         # other components — the wrapper is the source of truth.
         self._cluster_balance_enabled = True
 
+        # EDM (Euclidean Distance Matrix) loss — scGG fundamental
+        # method #1. Reads ``masked_pred.edm_D`` (B, N, N squared
+        # distances) stashed by EDMOutputWrapper; compares to the
+        # SQUARED pairwise-distance matrix of masked_true.positions.
+        # Auto-enabled by the wrapper-config-patching in
+        # FullDenoisingDiffusion.__init__ when cfg.model.edm.enabled.
+        self._edm_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                          "edm_distance_mse", "enabled",
+                                          default=False))
+        self._edm_weight = float(_cfg_get(cfg, "model", "loss",
+                                          "edm_distance_mse", "weight",
+                                          default=1.0))
+
+        # k-NN graph loss — scGG fundamental method #4. Reads
+        # ``masked_pred.knn_logits`` (B, N, N edge logits) stashed by
+        # KNNGraphOutputWrapper; supervises with contrastive BCE on
+        # positive edges (true k-NN) vs sampled negatives. Auto-
+        # enabled by the wrapper-config-patching when
+        # cfg.model.knn_graph.enabled.
+        self._knn_graph_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                                "knn_graph_loss", "enabled",
+                                                default=False))
+        self._knn_graph_weight = float(_cfg_get(cfg, "model", "loss",
+                                                "knn_graph_loss", "weight",
+                                                default=1.0))
+        self._knn_graph_k = int(_cfg_get(cfg, "model", "loss",
+                                         "knn_graph_loss", "k", default=10))
+        self._knn_graph_n_neg = int(_cfg_get(cfg, "model", "loss",
+                                             "knn_graph_loss", "n_negatives",
+                                             default=20))
+
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
         # ``compute_loss`` iterates this list — adding a new component
@@ -221,6 +252,14 @@ class LossFunction(nn.Module):
             # forward it through.
             ("cluster_balance", self._cluster_balance_enabled, 1.0,
              self._compute_cluster_balance),
+            # scGG fundamental method #1 (EDM diffusion): MSE on the
+            # predicted pairwise-squared-distance matrix.
+            ("edm_distance_mse", self._edm_enabled, self._edm_weight,
+             self._compute_edm_distance_mse),
+            # scGG fundamental method #4 (k-NN graph): contrastive BCE
+            # on positive/negative edges drawn from true positions.
+            ("knn_graph_loss", self._knn_graph_enabled, self._knn_graph_weight,
+             self._compute_knn_graph_loss),
         ]
 
         # One-time summary so the train.log shows what's active.
@@ -253,6 +292,13 @@ class LossFunction(nn.Module):
                     extra += f", subsample={self._sk_subsample}"
             elif name == "coarse_centroid_mse":
                 extra = " (auto-wired by CoarseToFineWrapper)"
+            elif name == "edm_distance_mse":
+                extra = " (auto-wired by EDMOutputWrapper)"
+            elif name == "knn_graph_loss":
+                extra = (
+                    f" (auto-wired by KNNGraphOutputWrapper, "
+                    f"k={self._knn_graph_k}, n_neg={self._knn_graph_n_neg})"
+                )
             active.append(f"{name}(w={w:.3g}{extra})")
         print(f"[LossFunction] active components: {', '.join(active) or '(none!)'}")
 
@@ -995,6 +1041,155 @@ class LossFunction(nn.Module):
         if bal is None or weight <= 0.0:
             return masked_pred.positions[0].sum() * 0.0
         return weight * bal
+
+    # ------------------------------------------------------------------
+    # scGG fundamental method #1: EDM (squared-distance) MSE loss
+    # ------------------------------------------------------------------
+    def _compute_edm_distance_mse(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """MSE between predicted and true SQUARED pairwise-distance
+        matrices.
+
+        Reads ``masked_pred.edm_D`` (B, N, N) stashed by
+        EDMOutputWrapper. If it isn't there (wrapper disabled but loss
+        accidentally enabled), returns a graph-attached zero rather
+        than crashing — the bootstrap config patching in
+        FullDenoisingDiffusion.__init__ keeps this from happening in
+        practice, but defensive code here makes ablations safer.
+
+        Per-slice loop because each slice's valid count differs. Each
+        slice contributes the mean squared error of the upper-triangle
+        (i<j) of the squared-distance matrices on its valid cells.
+        Upper-triangle only to avoid double-counting the symmetric
+        (i,j) / (j,i) entries; the diagonal is 0 on both sides so
+        excluding it doesn't affect the loss value but tightens the
+        scale.
+        """
+        D_pred = getattr(masked_pred, "edm_D", None)
+        if D_pred is None:
+            # Wrapper not wired in. Return graph-attached zero so the
+            # backward pass still works through the rest of the loss.
+            return masked_pred.positions[0].sum() * 0.0
+
+        losses = []
+        for b in range(D_pred.shape[0]):
+            mask = masked_true.node_mask[b]
+            valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            n = int(valid_idx.numel())
+            if n < 2:
+                continue
+            # True squared distances on the valid sub-tensor.
+            true_pos_v = masked_true.positions[b].index_select(0, valid_idx)
+            diff_t = true_pos_v.unsqueeze(1) - true_pos_v.unsqueeze(0)
+            D_true_v = (diff_t * diff_t).sum(dim=-1)
+            # Predicted squared distances on the same sub-tensor.
+            D_pred_v = D_pred[b].index_select(0, valid_idx).index_select(1, valid_idx)
+            # Upper triangle (k=1 excludes diagonal).
+            triu_mask = torch.triu(
+                torch.ones(n, n, device=D_pred.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            losses.append(
+                self.mse(D_pred_v[triu_mask], D_true_v[triu_mask])
+            )
+        if not losses:
+            return masked_pred.positions[0].sum() * 0.0
+        return torch.mean(torch.stack(losses))
+
+    # ------------------------------------------------------------------
+    # scGG fundamental method #4: k-NN graph contrastive loss
+    # ------------------------------------------------------------------
+    def _compute_knn_graph_loss(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Contrastive BCE on the predicted edge logits.
+
+        For each cell, the k nearest TRUE spatial neighbours are
+        positive edges; ``n_negatives`` random cells (excluding self
+        and positives) are negative edges. The KNNGraphOutputWrapper
+        stashed the (B, N, N) edge logits on ``masked_pred.knn_logits``;
+        we gather positive and negative entries and apply BCE-with-
+        logits.
+
+        The positive set is fixed by the TRUE positions and computed
+        without gradient. The negatives are sampled fresh per call —
+        adds noise to the loss but is a standard contrastive-learning
+        trick that prevents the model from memorising specific
+        negatives.
+        """
+        logits = getattr(masked_pred, "knn_logits", None)
+        if logits is None:
+            return masked_pred.positions[0].sum() * 0.0
+
+        k = max(1, self._knn_graph_k)
+        n_neg = max(1, self._knn_graph_n_neg)
+        bce = torch.nn.functional.binary_cross_entropy_with_logits
+        losses = []
+        for b in range(logits.shape[0]):
+            mask = masked_true.node_mask[b]
+            valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            n = int(valid_idx.numel())
+            if n < (k + 2):
+                continue
+            # True spatial neighbours: top-k by Euclidean distance.
+            with torch.no_grad():
+                true_pos_v = masked_true.positions[b].index_select(0, valid_idx)
+                d_true = torch.cdist(true_pos_v, true_pos_v, p=2)
+                # Exclude self (diagonal = 0) by setting it to +inf.
+                d_true_self = d_true.clone()
+                d_true_self.fill_diagonal_(float("inf"))
+                k_eff = min(k, n - 1)
+                _, pos_idx_local = torch.topk(
+                    d_true_self, k=k_eff, largest=False, dim=1,
+                )                                       # (n, k_eff)
+                # Random negatives per cell: uniform over non-self,
+                # non-positive indices. Cheap rejection: sample 2x,
+                # mask out positives + self, take first n_neg.
+                cand = torch.randint(
+                    0, n, (n, 4 * n_neg), device=logits.device,
+                )
+                row_idx = torch.arange(n, device=logits.device).unsqueeze(-1)
+                is_self = cand == row_idx
+                # is_pos: O(n * 4*n_neg * k_eff) — fine for modest k.
+                is_pos = (
+                    cand.unsqueeze(-1) == pos_idx_local.unsqueeze(1)
+                ).any(dim=-1)
+                bad = is_self | is_pos
+                cand_safe = cand.masked_fill(bad, -1)
+                # Take the FIRST n_neg good candidates per row.
+                # Sort so valid (-1 sorts last) entries are first.
+                ordered, _ = torch.sort(cand_safe, dim=1, descending=True)
+                neg_idx_local = ordered[:, :n_neg]      # may include -1
+                # Mask out invalid (-1) entries from the BCE
+                neg_valid = neg_idx_local >= 0
+                # Replace -1 with 0 so the gather is valid; mask out
+                # the contribution below.
+                neg_idx_local = neg_idx_local.clamp(min=0)
+
+            # Gather logits at positive and negative indices.
+            logits_v = logits[b].index_select(0, valid_idx).index_select(1, valid_idx)
+            pos_logits = torch.gather(logits_v, 1, pos_idx_local)   # (n, k_eff)
+            neg_logits = torch.gather(logits_v, 1, neg_idx_local)   # (n, n_neg)
+
+            pos_targets = torch.ones_like(pos_logits)
+            neg_targets = torch.zeros_like(neg_logits)
+
+            # BCE-with-logits per entry. Average positives and
+            # negatives separately, then mean (so they're balanced
+            # regardless of k vs n_neg).
+            pos_loss = bce(pos_logits, pos_targets, reduction="mean")
+            # Mask invalid negatives (where we couldn't find enough
+            # non-self/non-positive candidates).
+            neg_loss_per = bce(neg_logits, neg_targets, reduction="none")
+            neg_loss_per = neg_loss_per * neg_valid.to(neg_loss_per.dtype)
+            n_valid_neg = neg_valid.sum().clamp_min(1).to(neg_loss_per.dtype)
+            neg_loss = neg_loss_per.sum() / n_valid_neg
+
+            losses.append(0.5 * (pos_loss + neg_loss))
+        if not losses:
+            return masked_pred.positions[0].sum() * 0.0
+        return torch.mean(torch.stack(losses))
 
     # ----------------------------- aggregation ----------------------------
 

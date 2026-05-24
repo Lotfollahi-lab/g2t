@@ -626,6 +626,221 @@ gene_reconstruction:
     hidden_dim: 256
 
 # ---------------------------------------------------------------------------
+# scGG fundamental method #1: EDM (Euclidean Distance Matrix) output head.
+#
+# Paradigm shift away from "predict 2D coordinates" toward "predict the
+# N×N pairwise-distance matrix; recover coordinates by MDS." Rather
+# than the network learning a frame-specific 2D layout (and depending
+# on data augmentation / pairwise-distance loss to fake rotation
+# invariance), we predict a relational object that's rigid-motion
+# invariant by construction.
+#
+# Mechanism
+# ---------
+# When ``enabled``, an ``EDMOutputWrapper`` is bolted on top of the
+# inner backbone (LUNA transformer / EGNN / etc.). At each forward:
+#   1. Inner backbone runs as usual, producing per-cell features.
+#   2. A learnable projector maps those features to ``embed_dim``-dim
+#      per-cell embeddings h_i ∈ R^k.
+#   3. Pairwise distance matrix D_ij = ‖h_i - h_j‖² is computed — this
+#      lies on the Euclidean Distance Matrix manifold by construction.
+#   4. At INFERENCE (and optionally training): D is projected back to
+#      2D via classical MDS (double-centred eigendecomposition); the
+#      resulting positions REPLACE ``pred.positions``. Procrustes-
+#      aligned to the current x_t frame so the FM/DDPM trajectory
+#      stays consistent across steps.
+#   5. The predicted D is stashed on pred.edm_D for the new
+#      ``edm_distance_mse`` loss component (auto-wired when this flag
+#      is on — supervises the FULL N² entries instead of pred.positions).
+#
+# Why this is fundamentally different from LUNA
+# ----------------------------------------------
+# - Output is a relational object (D), not a frame-specific tensor (X).
+# - Supervision signal: O(N²) entries per slice (every cell pair),
+#   not O(N) (every cell). For cortex with ~7k cells per slice this
+#   is roughly 50M supervised quantities per slice vs 14k.
+# - Rotation/reflection/translation invariance hold by construction.
+# - The embedding can be k > 2 (richer relational space), with MDS
+#   selecting the leading 2D projection.
+#
+# Compose with any framework (diffusion / flow_matching / regression).
+# Most natural pairing is regression (one-shot EDM prediction) for
+# the cleanest paradigm shift. Combinable with c2f/hierarchical/etc.
+# Defaults OFF for byte-equivalence.
+# ---------------------------------------------------------------------------
+edm:
+    enabled: false
+    # Per-cell embedding dimension k for h_i ∈ R^k. Higher k = richer
+    # relational manifold; MDS extracts the leading 2 PCs at inference
+    # so the wrapper still emits 2D positions. 8 is a reasonable
+    # default (4× the target dim — enough slack for the embedding to
+    # capture non-trivial relational structure).
+    embed_dim: 8
+    # Loss weight on the new edm_distance_mse component (D-MSE on the
+    # predicted pairwise-distance matrix). Defaults co-magnitude with
+    # the original pairwise_distance_mse so the two are roughly
+    # co-equal in scale. Note: edm_distance_mse compares SQUARED
+    # distances D, not Euclidean distances — units differ from
+    # pairwise_distance_mse, so this weight isn't directly comparable.
+    loss_weight: 1.0
+    # If true, the original ``pairwise_distance_mse`` component is
+    # automatically DISABLED when EDM is on — the edm_distance_mse
+    # serves as its replacement (both supervise pairwise distances).
+    # If false, both losses run in parallel.
+    replace_position_loss: true
+    # If true, the wrapper performs MDS on D and overwrites
+    # ``pred.positions`` with the canonical 2D layout (Procrustes-
+    # aligned to the current x_t frame). If false, pred.positions
+    # stays as the inner backbone's raw output (the EDM head then
+    # acts as a pure auxiliary loss). Default true: the canonical
+    # frame is the whole point.
+    mds_align: true
+
+# ---------------------------------------------------------------------------
+# scGG fundamental method #4: k-NN graph generation output head.
+#
+# Alternative output paradigm: instead of predicting absolute
+# coordinates, predict the spatial k-nearest-neighbours GRAPH directly.
+# Reframes the problem from "where is each cell" to "who is next to
+# whom in tissue" — which is what most downstream analyses (niche
+# enrichment, ligand-receptor inference) actually use.
+#
+# Mechanism
+# ---------
+# When ``enabled``, a ``KNNGraphOutputWrapper`` wraps the inner
+# backbone:
+#   1. Inner backbone runs as usual, producing per-cell features.
+#   2. A learnable projector maps features to ``embed_dim``-dim
+#      per-cell embeddings h_i ∈ R^k.
+#   3. Pairwise edge logits L_ij = -‖h_i - h_j‖² (negative squared
+#      distance — closer embedding → higher edge score). Symmetric
+#      by construction.
+#   4. Loss: contrastive BCE — for each cell, the true k spatial
+#      neighbours are POSITIVES; a sample of ``n_negatives`` non-
+#      neighbours are NEGATIVES. The model has to push positives'
+#      logits up and negatives' down.
+#   5. At INFERENCE: take top-k edges per cell to form the predicted
+#      graph; recover 2D coordinates via Laplacian eigenmaps (spectral
+#      embedding) for downstream visualisation / metrics. Positions
+#      live on pred.positions as usual so downstream code is unchanged.
+#
+# Why this is fundamentally different from LUNA
+# ----------------------------------------------
+# - Output space: discrete graph (or a ranking) instead of continuous
+#   coordinates. Naturally invariant to rigid motion AND to global
+#   scale.
+# - Learning target is RELATIVE ("which 10 cells are closest to me?")
+#   instead of ABSOLUTE ("where am I in 2D?"). Often easier on small
+#   datasets — the loss landscape is flatter.
+# - Directly aligned with downstream biology: niche analysis,
+#   cell-cell communication, lineage inference all consume the
+#   spatial graph, not coordinates.
+#
+# Mutually exclusive with ``edm.enabled`` (both replace the position
+# output path). Construction asserts this. Defaults OFF.
+# ---------------------------------------------------------------------------
+knn_graph:
+    enabled: false
+    # Per-cell embedding dim k for the edge-logit head.
+    embed_dim: 16
+    # Number of spatial nearest neighbours to recover per cell. Cortex
+    # tissue density makes k=10 a reasonable neighbourhood ball.
+    k: 10
+    # Negatives sampled per positive edge in the contrastive loss.
+    # Higher = stronger negative signal but more compute; 20 is the
+    # standard contrastive-learning default.
+    n_negatives: 20
+    # Weight of the k-NN graph loss in the total objective.
+    loss_weight: 1.0
+    # If true, the original ``pairwise_distance_mse`` component is
+    # auto-disabled when knn_graph is on (the graph loss replaces it).
+    # If false they run in parallel.
+    replace_position_loss: true
+    # At inference, derive 2D coordinates via Laplacian eigenmaps on
+    # the predicted graph. Required for downstream metrics that read
+    # pred.positions. If false, pred.positions stays as the inner
+    # backbone's raw output (useful for ablation: does the graph
+    # supervision alone help the backbone's positional prediction?).
+    spectral_layout: true
+
+# ---------------------------------------------------------------------------
+# scGG fundamental method #3 (scaffold): SE(2)-equivariant vector-neuron
+# transformer backbone.
+#
+# Status: CONFIG SCAFFOLD ONLY in this revision — the actual
+# ``vn_transformer`` module raises NotImplementedError. Selecting
+# ``backbone: "vn_transformer"`` fails fast with a clear message.
+# The plan: replace each scalar feature with a (scalar, vector) pair
+# and use vector-neuron primitives (VN-Linear / VN-ReLU / VN-Attention)
+# whose output co-rotates with the input by construction. Drops the
+# rotation-augmentation hack — equivariance holds by design.
+#
+# Selected via ``backbone: "vn_transformer"`` (alongside
+# luna_transformer / egnn).
+# ---------------------------------------------------------------------------
+vn_transformer:
+    # Scalar feature width (S, in Deng et al. 2021 notation).
+    scalar_dim: 256
+    # Number of vector channels (V). Each carries a 2D vector
+    # (since spatial transcriptomics is in R^2). Output positions
+    # are read off ONE of these vector channels.
+    vector_dim: 32
+    # Number of attention heads.
+    n_heads: 8
+    # Hidden width of the per-block feedforward MLP.
+    ff_hidden_dim: 512
+
+# ---------------------------------------------------------------------------
+# scGG fundamental method #2 (scaffold): cell-cell potentials / energy-
+# based generative framework.
+#
+# Status: CONFIG SCAFFOLD ONLY in this revision — the actual
+# ``energy_predictor`` raises NotImplementedError on instantiation.
+# Selecting ``framework: "energy"`` fails fast with a clear message.
+#
+# Mechanism (planned)
+# -------------------
+# Learn a pairwise potential Φ_θ(g_i, g_j, r_ij) → ℝ over (gene_i,
+# gene_j, pairwise_distance). Total tissue energy:
+#     E(x | g) = Σ_{i<j} Φ_θ(g_i, g_j, ‖x_i − x_j‖)
+# Training: denoising score matching — perturb x by Gaussian noise,
+# train ∇_x E to match (x_clean − x_noisy) / σ². Sampling: annealed
+# Langevin dynamics from random initialisation, decreasing σ over
+# multiple noise levels.
+#
+# Why this is fundamentally different from LUNA
+# ----------------------------------------------
+# - Different model class entirely: physics-informed generative model
+#   vs. black-box position predictor.
+# - Φ is INTERPRETABLE: ``Φ([gene_A], [gene_B], r)`` plotted against
+#   r gives the learned "attraction profile" between two cell types.
+#   Biological reviewers care about mechanistic insight, not just
+#   benchmark numbers.
+# - Generalises off-distribution by physical analogy: if A-B
+#   attraction was learned, the model reasons about unseen tissues
+#   with different A:B ratios automatically.
+#
+# Selected via ``framework: "energy"`` (alongside diffusion /
+# flow_matching / regression). Off by default.
+# ---------------------------------------------------------------------------
+energy:
+    # Hidden width of the pairwise potential MLP Φ_θ.
+    phi_hidden_dim: 128
+    # Number of MLP layers in Φ_θ.
+    phi_n_layers: 3
+    # Number of nearest gene-space neighbours each cell interacts
+    # with (kNN-restricted energy). Full O(N²) pairwise is too
+    # memory-heavy for slices with thousands of cells; kNN-restricted
+    # is the standard tractability trick. 50 mirrors the EGNN default.
+    interaction_k: 50
+    # Annealed Langevin sampling: noise level schedule (decreasing).
+    noise_levels: [1.0, 0.5, 0.25, 0.125, 0.0625]
+    # Langevin steps per noise level.
+    n_langevin_steps_per_level: 100
+    # Langevin step size (η in x ← x − η·∇E + √(2η)·ξ).
+    step_size: 0.01
+
+# ---------------------------------------------------------------------------
 # Self-conditioning for FM (Chen et al. 2023 trick).
 #
 # Under cfg.model (not cfg.train) because it bumps the inner

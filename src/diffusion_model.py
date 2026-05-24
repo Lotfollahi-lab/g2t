@@ -102,6 +102,66 @@ class FullDenoisingDiffusion(pl.LightningModule):
             if hasattr(cfg.model, "loss") and hasattr(cfg.model.loss, "coarse_centroid_mse"):
                 cfg.model.loss.coarse_centroid_mse.enabled = True
 
+        # Same pre-construction patching pattern for EDM (#1) and k-NN
+        # graph (#4) output heads — both auto-wire new loss components
+        # and optionally disable the original pairwise_distance_mse.
+        # The actual wrapper modules are bolted on AFTER the backbone
+        # is built (see the EDM/kNN block far below); here we only
+        # patch the loss config so LossFunction sees the right state
+        # at construction time.
+        _edm_cfg_early = getattr(cfg.model, "edm", None)
+        _edm_enabled_early = bool(
+            getattr(_edm_cfg_early, "enabled", False)
+        ) if _edm_cfg_early is not None else False
+        _knn_graph_cfg_early = getattr(cfg.model, "knn_graph", None)
+        _knn_graph_enabled_early = bool(
+            getattr(_knn_graph_cfg_early, "enabled", False)
+        ) if _knn_graph_cfg_early is not None else False
+        if _edm_enabled_early and _knn_graph_enabled_early:
+            raise ValueError(
+                "model.edm.enabled and model.knn_graph.enabled are mutually "
+                "exclusive — both replace the position output path. Enable "
+                "exactly one."
+            )
+        if _edm_enabled_early:
+            # Auto-disable original pairwise-distance MSE if requested.
+            if bool(getattr(_edm_cfg_early, "replace_position_loss", True)):
+                if hasattr(cfg.model.loss, "pairwise_distance_mse"):
+                    cfg.model.loss.pairwise_distance_mse.enabled = False
+            # Patch cfg so LossFunction registers the new component.
+            from omegaconf import OmegaConf as _OC
+            if not hasattr(cfg.model.loss, "edm_distance_mse"):
+                cfg.model.loss.edm_distance_mse = _OC.create({
+                    "enabled": True,
+                    "weight": float(getattr(_edm_cfg_early, "loss_weight", 1.0)),
+                })
+            else:
+                cfg.model.loss.edm_distance_mse.enabled = True
+                cfg.model.loss.edm_distance_mse.weight = float(
+                    getattr(_edm_cfg_early, "loss_weight", 1.0)
+                )
+        if _knn_graph_enabled_early:
+            if bool(getattr(_knn_graph_cfg_early, "replace_position_loss", True)):
+                if hasattr(cfg.model.loss, "pairwise_distance_mse"):
+                    cfg.model.loss.pairwise_distance_mse.enabled = False
+            from omegaconf import OmegaConf as _OC
+            if not hasattr(cfg.model.loss, "knn_graph_loss"):
+                cfg.model.loss.knn_graph_loss = _OC.create({
+                    "enabled": True,
+                    "weight": float(getattr(_knn_graph_cfg_early, "loss_weight", 1.0)),
+                    "k": int(getattr(_knn_graph_cfg_early, "k", 10)),
+                    "n_negatives": int(getattr(_knn_graph_cfg_early, "n_negatives", 20)),
+                })
+            else:
+                cfg.model.loss.knn_graph_loss.enabled = True
+                cfg.model.loss.knn_graph_loss.weight = float(
+                    getattr(_knn_graph_cfg_early, "loss_weight", 1.0)
+                )
+                cfg.model.loss.knn_graph_loss.k = int(getattr(_knn_graph_cfg_early, "k", 10))
+                cfg.model.loss.knn_graph_loss.n_negatives = int(
+                    getattr(_knn_graph_cfg_early, "n_negatives", 20)
+                )
+
         # Pass the full cfg so the loss can read its `model.loss.*`
         # block and toggle components on/off. Default config keeps only
         # LUNA's pairwise-distance MSE on, so train-from-scratch
@@ -238,6 +298,21 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     hidden_dims=cfg.model.hidden_dims,
                     output_dims=self.output_dims,
                 )
+        elif backbone == "vn_transformer":
+            # scGG fundamental method #3: SE(2)-equivariant vector-
+            # neuron transformer. Scaffold only — raises a clear
+            # NotImplementedError on construction. The config surface
+            # is real (cfg.model.vn_transformer.* is valid) so configs
+            # validate; the layers themselves are pending a focused
+            # implementation session.
+            from models.vn_transformer import VNTransformerBackbone
+            self.model = VNTransformerBackbone(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                vn_cfg=getattr(cfg.model, "vn_transformer", None),
+            )
         elif backbone == "egnn":
             # Local import so the LUNA-baseline path (which doesn't
             # need EGNN's torch-geometric kNN code) keeps loading
@@ -268,7 +343,71 @@ class FullDenoisingDiffusion(pl.LightningModule):
         else:
             raise ValueError(
                 f"Unknown model.backbone={backbone!r}. "
-                f"Expected 'luna_transformer' or 'egnn'."
+                f"Expected 'luna_transformer', 'egnn', or 'vn_transformer'."
+            )
+
+        # ------------------------------------------------------------------
+        # Output-head wrappers: EDM (#1) and k-NN graph (#4).
+        #
+        # Mutually exclusive — both replace the position output path.
+        # The mutex check + loss-config patching already ran earlier in
+        # __init__ (before LossFunction construction). Here we only
+        # bolt the wrapper module on top of self.model.
+        #
+        # Bolted on AFTER any c2f / hierarchical wrapping so EDM/kNN
+        # are the OUTERMOST layer and see the c2f-conditioned features.
+        # Both wrappers project from pred.node_features (whose width
+        # is hidden_dims['output_features_to_pos_dims']; LUNA Model
+        # outputs this dim, c2f/hier wrappers preserve it) +
+        # pred.positions (2D). The wrappers handle the +2 concat
+        # internally.
+        # ------------------------------------------------------------------
+        edm_cfg = getattr(cfg.model, "edm", None)
+        edm_enabled = bool(getattr(edm_cfg, "enabled", False)) if edm_cfg else False
+        knn_graph_cfg = getattr(cfg.model, "knn_graph", None)
+        knn_graph_enabled = bool(
+            getattr(knn_graph_cfg, "enabled", False)
+        ) if knn_graph_cfg else False
+
+        inner_out_dim = int(cfg.model.hidden_dims["output_features_to_pos_dims"])
+
+        if edm_enabled:
+            # EDM emits pred.positions as the MDS-projected layout, which
+            # IS the x_0 estimate. v-prediction would re-interpret that
+            # as a velocity field, producing garbage — guard explicitly.
+            if framework == "flow_matching" and self._fm_prediction == "v":
+                raise ValueError(
+                    "model.edm.enabled=true is incompatible with "
+                    "model.flow_matching.prediction='v'. The EDM head "
+                    "produces x_0-style positions (via MDS); the v-pred "
+                    "conversion would mis-interpret them. Use "
+                    "model.flow_matching.prediction='x0' with EDM, or "
+                    "disable EDM."
+                )
+            from models.edm_head import EDMOutputWrapper
+            self.model = EDMOutputWrapper(
+                inner_model=self.model,
+                inner_out_dim=inner_out_dim,
+                embed_dim=int(getattr(edm_cfg, "embed_dim", 8)),
+                mds_align=bool(getattr(edm_cfg, "mds_align", True)),
+            )
+
+        if knn_graph_enabled:
+            if framework == "flow_matching" and self._fm_prediction == "v":
+                raise ValueError(
+                    "model.knn_graph.enabled=true is incompatible with "
+                    "model.flow_matching.prediction='v'. The k-NN graph "
+                    "head produces x_0-style positions (via spectral "
+                    "layout); the v-pred conversion would mis-interpret "
+                    "them. Use prediction='x0' or disable knn_graph."
+                )
+            from models.knn_graph_head import KNNGraphOutputWrapper
+            self.model = KNNGraphOutputWrapper(
+                inner_model=self.model,
+                inner_out_dim=inner_out_dim,
+                embed_dim=int(getattr(knn_graph_cfg, "embed_dim", 16)),
+                spectral_layout=bool(getattr(knn_graph_cfg, "spectral_layout", True)),
+                k_for_layout=int(getattr(knn_graph_cfg, "k", 10)),
             )
 
         # Auxiliary gene-reconstruction head. Active iff
@@ -328,12 +467,23 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 RegressionPredictor,
             )
             self.noise_model = RegressionPredictor(cfg)
+        elif framework == "energy":
+            # scGG fundamental method #2: cell-cell-potentials / energy-
+            # based generative model. Scaffold only — raises a clear
+            # NotImplementedError on instantiation. The config surface
+            # (cfg.model.energy.*) is real so configs validate; the
+            # actual score-matching loop + annealed-Langevin sampler
+            # are pending a focused implementation session.
+            from utils.diffusion_model.diffusion.energy_predictor import (
+                EnergyPredictor,
+            )
+            self.noise_model = EnergyPredictor(cfg)
         elif framework == "diffusion":
             self.noise_model = NoiseModel(cfg)
         else:
             raise ValueError(
                 f"Unknown model.framework={framework!r}. "
-                f"Expected 'diffusion', 'flow_matching', or 'regression'."
+                f"Expected 'diffusion', 'flow_matching', 'regression', or 'energy'."
             )
 
     def on_train_epoch_start(self) -> None:
