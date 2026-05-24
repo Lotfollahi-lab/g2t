@@ -187,21 +187,41 @@ loss:
     # cell-density topology that pairwise MSE smears across all
     # N² pairs.
     #
-    # 1-dim PH (loop / region structure) is a natural follow-up but
-    # needs the alpha complex (gudhi) — not implemented in this
-    # pass; the 0-dim MST version is much cheaper and gives us a
-    # first signal on whether topological signals help here at all.
+    # 1-dim PH (loop / region structure) is supported via gudhi's
+    # Vietoris-Rips complex (dim=1). Where 0-dim PH penalises
+    # mismatched connectivity (MST edge length distribution),
+    # 1-dim PH penalises mismatched LOOPS — exactly the failure
+    # mode that produced donut-shaped predictions in the 0-dim
+    # experiments. The differentiable formulation follows the
+    # standard "fixed structure" trick (Hofer 2019,
+    # Bruel-Gabrielsson 2020): gudhi computes WHICH simplices form
+    # each persistence pair (non-differentiably), and we re-compute
+    # the (birth, death) VALUES from the gradient-bearing pairwise
+    # distance matrix. Matching between predicted and true
+    # persistence diagrams uses sorted-lifetime matching with
+    # diagonal padding (a tractable approximation to true
+    # Wasserstein-2² that's smooth in the input coordinates).
     #
-    # Implementation cost: scipy MST is CPU-side (~tens of ms for
-    # N=10k); we transfer the distance matrix once per slice per
-    # step. `subsample: N` caps the cell count per slice (random
-    # subsample at each step) if your slice is large enough to make
-    # this the bottleneck.
+    # Implementation cost: scipy MST (dim=0) is CPU-side (~tens of
+    # ms for N=10k). gudhi VR (dim=1) is more expensive because
+    # the complex has up to O(N³) simplices for max_dimension=2 —
+    # we limit it via ``max_edge_length`` to a fraction of the
+    # tissue scale, which makes the complex O(N · density · K²)
+    # in practice. ``subsample`` and ``frequency`` are stackable
+    # for further speedup.
     persistent_homology:
         enabled: false
         weight: 0.5       # same units as pairwise_distance_mse; 0.5 = roughly co-equal
         subsample: null   # null = use all cells; integer caps per-slice n for speed
-        dim: 0            # only 0-dim supported for now (MST). 1-dim TODO via gudhi.
+        dim: 0            # 0 = MST (scipy); 1 = loops (gudhi VR)
+        # Vietoris-Rips max edge length (in normalised coord units).
+        # Only consulted when dim=1. Limits the simplex tree to local
+        # edges, which is what loop structure cares about anyway and
+        # keeps the complex tractable. For cortex's [-0.5, 0.5]
+        # normalised positions, 0.2 captures laminar-scale loops
+        # without exploding memory. Lower → faster but may miss real
+        # large-scale loops; higher → slower, may include noise.
+        max_edge_length: 0.2
         # Speed knobs (all stackable):
         #
         # frequency: compute PH every N training steps. Other steps

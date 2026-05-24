@@ -124,17 +124,26 @@ class LossFunction(nn.Module):
         self._ph_cache_true = bool(_cfg_get(
             cfg, "model", "loss", "persistent_homology", "cache_true", default=True,
         ))
-        # Step counter for `frequency` knob; cache for true MST edges.
-        # Cache size is bounded by the dataset's slice count, which is
-        # small (LUNA cortex: 33; ABCA Animal-1: 147). No eviction
-        # needed.
+        # 1-dim PH only: Vietoris-Rips max edge length.
+        self._ph_max_edge_length = float(_cfg_get(
+            cfg, "model", "loss", "persistent_homology",
+            "max_edge_length", default=0.2,
+        ))
+        # Step counter for `frequency` knob; cache for true PD info.
+        # For dim=0 the cache stores sorted MST edge lengths; for
+        # dim=1 it stores the persistence-pair simplex indices so
+        # we can re-evaluate (birth, death) values from current
+        # true positions cheaply. Cache size is bounded by the
+        # dataset's slice count, which is small (LUNA cortex: 33;
+        # ABCA Animal-1: 147). No eviction needed.
         self._ph_step_counter = 0
         self._ph_true_cache: dict = {}
-        if self._ph_dim != 0:
+        if self._ph_dim not in (0, 1):
             raise NotImplementedError(
                 f"model.loss.persistent_homology.dim={self._ph_dim} not "
-                f"supported. Only 0-dim (MST formulation) is implemented; "
-                f"1-dim needs the alpha complex (gudhi) — TODO."
+                f"supported. Only 0-dim (MST formulation, scipy) and "
+                f"1-dim (loop structure, gudhi Vietoris-Rips) are "
+                f"implemented."
             )
 
         # Sinkhorn / OT divergence loss component.
@@ -207,6 +216,8 @@ class LossFunction(nn.Module):
                     extra += f", k={self._knn_k}"
             elif name == "persistent_homology":
                 extra = f", dim={self._ph_dim}"
+                if self._ph_dim == 1:
+                    extra += f", max_edge={self._ph_max_edge_length:.3g}"
                 if self._ph_frequency > 1:
                     extra += f", every {self._ph_frequency} steps"
                 if self._ph_cache_true:
@@ -355,6 +366,33 @@ class LossFunction(nn.Module):
     def _compute_persistent_homology(
         self, masked_pred: DataHolder, masked_true: DataHolder,
     ) -> torch.Tensor:
+        """Dispatch persistent-homology loss by configured dimension.
+
+        * ``dim=0`` — MST-based, scipy. The 0-dim persistence diagram
+          of a point cloud is exactly the multiset of MST edge
+          lengths; W2² between two equal-cardinality PD_0's reduces
+          to MSE between sorted edge-length vectors.
+        * ``dim=1`` — loops, gudhi Vietoris-Rips. The 1-dim PD
+          captures loop structure. Birth = filtration value of the
+          edge that creates the loop, death = filtration value of
+          the triangle that fills it; for VR, both reduce to edge
+          lengths between specific cell pairs (differentiable).
+
+        Frequency-skip and per-slice subsample logic apply to both
+        dims. The cache key, on the other hand, stores different
+        objects (sorted edge lengths for dim=0, simplex-index pairs
+        for dim=1).
+        """
+        if self._ph_dim == 0:
+            return self._compute_ph_dim0(masked_pred, masked_true)
+        elif self._ph_dim == 1:
+            return self._compute_ph_dim1(masked_pred, masked_true)
+        else:
+            raise NotImplementedError(self._ph_dim)
+
+    def _compute_ph_dim0(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
         """0-dim persistent homology loss via minimum spanning tree.
 
         Per slice: PD_0(true) = sorted MST-edge-lengths of true coords;
@@ -472,6 +510,233 @@ class LossFunction(nn.Module):
             # sorted edge vectors. (Both have n-1 entries by construction.)
             w2_sq = ((pred_edges_sorted - true_edges_sorted) ** 2).mean()
             slice_losses.append(w2_sq)
+
+        if not slice_losses:
+            return _zero()
+        return torch.mean(torch.stack(slice_losses))
+
+    # ------------------------------------------------------------------
+    # 1-dim PH (loop structure) via gudhi Vietoris-Rips
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_pd1_simplex_pairs(
+        positions_np, max_edge_length: float,
+    ) -> List[Tuple[Tuple[int, int], Tuple[int, int, int]]]:
+        """Run gudhi VR on a numpy point cloud, return the list of
+        (birth_edge_indices, death_triangle_indices) for 1-dim
+        persistence pairs.
+
+        Pure gudhi work — runs on CPU, no gradients.
+        Returns a list of ``((i, j), (a, b, c))`` tuples.
+        """
+        import gudhi
+        rips = gudhi.RipsComplex(
+            points=positions_np, max_edge_length=float(max_edge_length),
+        )
+        st = rips.create_simplex_tree(max_dimension=2)
+        # ``persistence`` MUST be called before ``persistence_pairs``
+        # so gudhi populates the diagram internally.
+        st.persistence(homology_coeff_field=2, min_persistence=0.0)
+        out: List[Tuple[Tuple[int, int], Tuple[int, int, int]]] = []
+        for birth_simplex, death_simplex in st.persistence_pairs():
+            # 1-dim feature: birth is an edge (2 vertices), death is
+            # a triangle (3 vertices). Skip 0-dim and infinite pairs.
+            if len(birth_simplex) != 2 or len(death_simplex) != 3:
+                continue
+            i, j = int(birth_simplex[0]), int(birth_simplex[1])
+            a, b, c = (int(death_simplex[0]),
+                       int(death_simplex[1]),
+                       int(death_simplex[2]))
+            out.append(((i, j), (a, b, c)))
+        return out
+
+    @staticmethod
+    def _pd1_values_from_pairs(
+        d_matrix: torch.Tensor,
+        simplex_pairs: List[Tuple[Tuple[int, int], Tuple[int, int, int]]],
+    ) -> torch.Tensor:
+        """Given a (gradient-bearing) ``cdist`` matrix and a list of
+        gudhi persistence-pair simplex indices, return a (M, 2)
+        tensor of (birth, death) values where:
+
+          * birth = edge length between the two vertices of the
+            birth simplex (the edge that creates the loop in the VR
+            filtration);
+          * death = MAX edge length among the three edges of the
+            death-triangle (VR-complex filtration value of a
+            triangle is the max of its edge filtration values).
+
+        Both values are differentiable functions of the input
+        positions via the cdist chain rule.
+        """
+        if not simplex_pairs:
+            return d_matrix.new_zeros((0, 2))
+        births: List[torch.Tensor] = []
+        deaths: List[torch.Tensor] = []
+        for (i, j), (a, b, c) in simplex_pairs:
+            births.append(d_matrix[i, j])
+            # max of the three edges of the death triangle
+            e_ab = d_matrix[a, b]
+            e_ac = d_matrix[a, c]
+            e_bc = d_matrix[b, c]
+            deaths.append(torch.stack([e_ab, e_ac, e_bc]).max())
+        return torch.stack(
+            [torch.stack(births), torch.stack(deaths)], dim=-1
+        )
+
+    @staticmethod
+    def _pad_pd_with_diagonal(
+        pd: torch.Tensor, target_len: int,
+    ) -> torch.Tensor:
+        """Pad a (M, 2) persistence diagram to (target_len, 2) using
+        diagonal points (birth = death = 0). Diagonal points have
+        zero lifetime so they sort to the end under lifetime-
+        descending order — they only get matched against unmatched
+        non-trivial features in the other PD, contributing their
+        own (birth-death)² / 2 to the loss (standard Wasserstein
+        with diagonal-slack convention).
+        """
+        m = pd.shape[0]
+        if m >= target_len:
+            return pd
+        pad = pd.new_zeros((target_len - m, 2))
+        return torch.cat([pd, pad], dim=0)
+
+    def _compute_ph_dim1(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """1-dim persistent homology loss via gudhi Vietoris-Rips.
+
+        Differentiability: gudhi computes the simplex structure of
+        the VR filtration non-differentiably; we then re-evaluate
+        the (birth, death) VALUES from the gradient-bearing cdist
+        matrix of the predicted positions. Gradient flows through
+        positions via cdist. Standard "fixed-structure" trick
+        (Hofer 2019, Bruel-Gabrielsson 2020) — same approach as
+        ``_compute_ph_dim0``.
+
+        Matching: predicted PD vs true PD are matched by sorted
+        lifetime (descending), padded to equal length with diagonal
+        points (birth=death=0, lifetime=0). The loss is the sum of
+        squared (birth, death) coordinate differences across the
+        matched pairs — a tractable approximation to true W2²
+        bottleneck matching, smooth in the input coordinates.
+
+        Speed: VR is heavier than scipy MST. The ``frequency`` and
+        ``cache_true`` knobs apply identically; ``cache_true`` stores
+        the simplex-index pairs (which depend ONLY on true positions
+        and thus are step-invariant).
+        """
+        try:
+            import gudhi  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "model.loss.persistent_homology.dim=1 requires "
+                "the gudhi package. Install via "
+                "`pip install gudhi`. Underlying error: " + str(e)
+            )
+
+        def _zero():
+            if len(masked_pred.positions) > 0:
+                return masked_pred.positions[0].sum() * 0.0
+            return torch.tensor(0.0)
+
+        # Same frequency-skip semantics as dim=0.
+        self._ph_step_counter += 1
+        if (self._ph_step_counter - 1) % self._ph_frequency != 0:
+            return _zero()
+
+        max_edge = float(self._ph_max_edge_length)
+        slice_losses: List[torch.Tensor] = []
+        subsample = self._ph_subsample
+
+        for true_pos, pred_pos, mask in zip(
+            masked_true.positions, masked_pred.positions, masked_true.node_mask,
+        ):
+            true_pos_m = true_pos[mask]
+            pred_pos_m = pred_pos[mask]
+            n = true_pos_m.shape[0]
+            # Need at least 4 points to even have a chance of a 1-cycle.
+            if n < 4:
+                continue
+
+            using_subsample = subsample is not None and n > subsample
+            if using_subsample:
+                with torch.no_grad():
+                    idx = torch.randperm(n, device=true_pos_m.device)[:subsample]
+                true_pos_m = true_pos_m[idx]
+                pred_pos_m = pred_pos_m[idx]
+                n = subsample
+
+            # ---- True PD_1 simplex pairs: cache by content fingerprint ----
+            cache_key = None
+            true_simplex_pairs = None
+            if self._ph_cache_true and not using_subsample:
+                with torch.no_grad():
+                    cache_key = (
+                        "ph1",
+                        n,
+                        float(true_pos_m[0, 0].item()),
+                        float(true_pos_m[-1, -1].item()),
+                        float(true_pos_m.sum().item()),
+                    )
+                true_simplex_pairs = self._ph_true_cache.get(cache_key)
+
+            if true_simplex_pairs is None:
+                true_pos_np = true_pos_m.detach().cpu().numpy()
+                true_simplex_pairs = self._extract_pd1_simplex_pairs(
+                    true_pos_np, max_edge,
+                )
+                if cache_key is not None:
+                    self._ph_true_cache[cache_key] = true_simplex_pairs
+
+            # ---- Pred PD_1 simplex pairs: re-extract every step ----
+            pred_pos_np = pred_pos_m.detach().cpu().numpy()
+            pred_simplex_pairs = self._extract_pd1_simplex_pairs(
+                pred_pos_np, max_edge,
+            )
+
+            # If neither cloud has any 1-dim feature within max_edge,
+            # there's nothing to compare. Skip this slice — but DON'T
+            # let the loss silently become a no-op. Add a tiny detached
+            # zero so the loss term is still tracked for logging.
+            if not true_simplex_pairs and not pred_simplex_pairs:
+                slice_losses.append(_zero())
+                continue
+
+            # ---- Compute (birth, death) values from current positions ----
+            d_true = torch.cdist(true_pos_m, true_pos_m, p=2)
+            d_pred = torch.cdist(pred_pos_m, pred_pos_m, p=2)
+            with torch.no_grad():
+                true_pd = self._pd1_values_from_pairs(
+                    d_true.detach(), true_simplex_pairs,
+                )                                                       # (M_true, 2)
+            pred_pd = self._pd1_values_from_pairs(
+                d_pred, pred_simplex_pairs,
+            )                                                           # (M_pred, 2) — grad-bearing
+
+            # Pad to equal length so we can match by sorted lifetime.
+            target_len = max(true_pd.shape[0], pred_pd.shape[0])
+            true_padded = self._pad_pd_with_diagonal(true_pd, target_len)
+            pred_padded = self._pad_pd_with_diagonal(pred_pd, target_len)
+
+            # Sort by lifetime descending. Lifetime = death - birth.
+            with torch.no_grad():
+                true_lifetimes = true_padded[:, 1] - true_padded[:, 0]
+                true_order = torch.argsort(true_lifetimes, descending=True)
+            pred_lifetimes = pred_padded[:, 1] - pred_padded[:, 0]
+            pred_order = torch.argsort(
+                pred_lifetimes.detach(), descending=True,
+            )
+
+            true_sorted = true_padded[true_order]
+            pred_sorted = pred_padded[pred_order]
+
+            # Sum of squared coord differences — approximation to W2²
+            # under the sorted-lifetime matching.
+            slice_loss = ((true_sorted - pred_sorted) ** 2).sum(dim=-1).mean()
+            slice_losses.append(slice_loss)
 
         if not slice_losses:
             return _zero()
