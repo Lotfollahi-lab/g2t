@@ -37,17 +37,50 @@ def filter_nan_inf(array: np.ndarray) -> np.ndarray:
 
 def compute_kabsch_rotation(
     metadata_true: np.ndarray, metadata_pred: np.ndarray
-) -> Tuple[np.ndarray, float, float]:
-    """Apply the Kabsch algorithm to compute the optimal rotation."""
+) -> Tuple[object, float, float]:
+    """Apply the Kabsch algorithm to compute the optimal rotation.
+
+    Robustness fixes vs the upstream LUNA implementation:
+
+    1. **Degenerate-set guard.** ``compute_RSSD`` calls this function
+       per cell-class subset of a slice (see
+       ``compute_RSSD`` below). Rare cell types can have only 0 or
+       1 cell in a given slice, but ``R.align_vectors`` needs at
+       least 2 vector pairs to fit a rotation. We short-circuit
+       those cases to ``NaN`` rather than crashing the whole test
+       phase.
+
+    2. **No sensitivity matrix.** The original code passed
+       ``return_sensitivity=True`` to ``align_vectors`` and then
+       discarded the ``sens`` output at every call site. Requesting
+       it forces a stricter N>=2 + finite-weight precondition
+       inside scipy and was the root cause of the
+       "Cannot return sensitivity matrix with an infinite weight
+       or one vector pair" ValueError. Dropping that flag is a
+       free fix.
+
+    3. **Broader exception catch.** ``np.linalg.LinAlgError`` only
+       covers SVD non-convergence; the upstream code missed other
+       scipy ValueErrors (degenerate vectors, NaN weights, etc.).
+       Catch both, return ``+inf`` so the downstream NaN/Inf
+       filter in ``compute_RSSD`` drops the slice from the
+       aggregate.
+    """
+    # Guard 1: empty or single-vector input — Kabsch is undefined.
+    n_true = int(np.asarray(metadata_true).shape[0])
+    n_pred = int(np.asarray(metadata_pred).shape[0])
+    if n_true < 2 or n_pred < 2:
+        return np.eye(3), float("nan"), float("nan")
     try:
-        rot, rssd, sens = R.align_vectors(
-            metadata_true, metadata_pred, return_sensitivity=True
-        )
-        
-    except np.linalg.LinAlgError:
-        print("SVD did not converge.")
-        return +np.inf, +np.inf, +np.inf
-    return rot, rssd, sens
+        # Guard 2: drop return_sensitivity=True — sens is unused at
+        # every call site and demanding it adds a scipy precondition
+        # we don't need.
+        rot, rssd = R.align_vectors(metadata_true, metadata_pred)
+    except (np.linalg.LinAlgError, ValueError) as e:
+        print(f"Kabsch alignment failed ({type(e).__name__}: {e}); "
+              f"returning +inf to be filtered downstream.")
+        return np.eye(3), float("inf"), float("inf")
+    return rot, float(rssd), float("nan")
 
 
 def prepare_metadata_for_kabsch(
@@ -200,8 +233,21 @@ def compute_RSSD(
             classes_rsd.append(rssd)
             num_cells_per_class.append(len(metadata_true_c))
 
-    sum_rssd = np.sum(classes_rsd)
-    mean_rssd = np.mean(classes_rsd)
+    # Filter NaN / Inf out of the aggregation. compute_kabsch_rotation
+    # returns NaN for degenerate cell-class subsets (1 or 0 cells)
+    # and Inf for SVD failure; either would poison np.sum / np.mean
+    # if left in. Falling back to NaN for whole-slice RSSD when ALL
+    # classes are degenerate (genuinely uninformative slice).
+    classes_rsd_valid = [
+        r for r in classes_rsd
+        if r is not None and not (np.isnan(r) or np.isinf(r))
+    ]
+    if classes_rsd_valid:
+        sum_rssd = float(np.sum(classes_rsd_valid))
+        mean_rssd = float(np.mean(classes_rsd_valid))
+    else:
+        sum_rssd = float("nan")
+        mean_rssd = float("nan")
 
     return sum_rssd, mean_rssd, absolute_rssd
 
