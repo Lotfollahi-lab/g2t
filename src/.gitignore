@@ -18,8 +18,12 @@ __pycache__/*
 ./utils/diffusion_model/train/__pycache__/*
 ./utils/diffusion_model/validation/__pycache__/*
 
-data
-data/*
-data/*/*
+# Top-level data dir only — anchored to src/ so it doesn't
+# also match the Python module at src/utils/data/, which contains
+# DataHolder, AbstractDataModule, load.py, etc. (the unanchored
+# `data` pattern silently dropped that whole directory from git).
+/data
+/data/*
+/data/*/*
 ./data
 ./data/*
