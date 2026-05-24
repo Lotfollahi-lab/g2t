@@ -85,24 +85,51 @@ def test_gene_clustering() -> None:
 
 
 def test_coarse_regressor() -> None:
-    """Outputs (B, K, 2) — one 2-D centroid per cluster."""
+    """Outputs (B, K, 2) — one 2-D centroid per cluster.
+    Also verifies the new ``forward_with_embeddings`` returns
+    both centroids AND the pre-head hidden state."""
     torch.manual_seed(0)
     B, K, H = 2, 8, 32
+    hidden = 64
 
     regressor = CoarseRegressor(
         cluster_feature_dim=H,
-        hidden_dim=64,
+        hidden_dim=hidden,
         n_layers=2,
         n_heads=4,
     ).eval()
 
     cluster_features = torch.randn(B, K, H)
+
+    # Backward-compat: forward() returns just centroids.
     centroids = regressor(cluster_features)
     if centroids.shape != (B, K, 2):
         raise AssertionError(
             f"Coarse regressor output shape mismatch: {tuple(centroids.shape)}."
         )
-    print(f"[coarse-regressor]  output {tuple(centroids.shape)} ✓")
+
+    # New: forward_with_embeddings returns (centroids, hidden).
+    centroids2, embeddings = regressor.forward_with_embeddings(cluster_features)
+    if centroids2.shape != (B, K, 2):
+        raise AssertionError(
+            f"forward_with_embeddings centroid shape mismatch: "
+            f"{tuple(centroids2.shape)}."
+        )
+    if embeddings.shape != (B, K, hidden):
+        raise AssertionError(
+            f"forward_with_embeddings hidden shape mismatch: "
+            f"{tuple(embeddings.shape)}, expected (B, K, hidden={hidden})."
+        )
+    # Centroids returned by both paths must agree exactly (same
+    # graph + eval mode = same numerics).
+    err = (centroids - centroids2).abs().max().item()
+    if err > 1e-7:
+        raise AssertionError(
+            f"forward() and forward_with_embeddings() disagree on "
+            f"centroids: max-err {err:.2e}."
+        )
+    print(f"[coarse-regressor]  forward {tuple(centroids.shape)} ✓ "
+          f"forward_with_embeddings hidden {tuple(embeddings.shape)} ✓")
     print("[coarse-regressor]  PASS\n")
 
 

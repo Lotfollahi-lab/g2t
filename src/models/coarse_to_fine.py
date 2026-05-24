@@ -229,17 +229,37 @@ class CoarseRegressor(nn.Module):
         self.centroid_head = nn.Linear(hidden_dim, 2)
 
     def forward(self, cluster_features: torch.Tensor) -> torch.Tensor:
+        """Backward-compatible wrapper: returns only centroids.
+
+        Prefer ``forward_with_embeddings`` for callers that also want
+        the rich per-cluster hidden state as conditioning input —
+        keeping that 128-D signal (rather than throwing it away after
+        projecting to the 2-D centroid) is a substantial improvement
+        in the c2f wrapper's effective conditioning capacity.
+        """
+        centroids, _ = self.forward_with_embeddings(cluster_features)
+        return centroids
+
+    def forward_with_embeddings(
+        self, cluster_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             cluster_features: (B, K, cluster_feature_dim)
 
         Returns:
-            predicted_centroids: (B, K, 2)
+            predicted_centroids:  (B, K, 2) — through the centroid head.
+            cluster_embeddings:   (B, K, hidden_dim) — pre-head
+                transformer output. Encodes the same info the
+                centroid prediction depends on plus richer context
+                that the centroid projection compresses away. Used
+                by the c2f wrappers as a per-cell conditioning
+                signal (broadcast to cells via cluster_ids).
         """
         h = self.input_proj(cluster_features)                       # (B, K, hidden)
         h = self.transformer(h)                                     # (B, K, hidden)
         centroids = self.centroid_head(h)                           # (B, K, 2)
-        return centroids
+        return centroids, h
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +328,17 @@ class CoarseToFineWrapper(nn.Module):
         )
 
         # Inner Model takes augmented input: original gene features
-        # + 2-d cluster-centroid conditioning per cell.
+        # + 2-d cluster-centroid + ``coarse_hidden_dim``-d cluster
+        # embedding (the pre-centroid-head hidden state of the
+        # coarse transformer, broadcast to each cell of the cluster).
+        # The richer embedding signal is the main improvement over a
+        # bare 2-D centroid: at gene_in≈2000, raw centroid is only
+        # ~0.1% of input width and gets drowned out, but the 128-D
+        # embedding is ~6% — substantial enough that the inner
+        # encoder can't ignore it.
+        self.cond_dim = 2 + self.coarse_hidden_dim
         augmented_input_dims = dict(input_dims)
-        augmented_input_dims["node_features_dimensions"] = gene_in + 2
+        augmented_input_dims["node_features_dimensions"] = gene_in + self.cond_dim
 
         from models.model import Model
         self.inner = Model(
@@ -365,10 +393,30 @@ class CoarseToFineWrapper(nn.Module):
         node_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Each cell gets its cluster's centroid as a 2-d feature.
-        Masked cells get a zero vector."""
+        Masked cells get a zero vector. Thin wrapper around
+        ``_broadcast_per_cluster`` for backward compatibility (the
+        2-D-specific helper that used hardcoded ``expand(B, N, 2)``).
+        """
+        return CoarseToFineWrapper._broadcast_per_cluster(
+            centroids, cluster_ids, node_mask,
+        )
+
+    @staticmethod
+    def _broadcast_per_cluster(
+        features: torch.Tensor,
+        cluster_ids: torch.Tensor,
+        node_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generic per-cluster → per-cell broadcast. Takes a
+        ``(B, K, F)`` tensor and returns ``(B, N, F)`` where each
+        cell receives its cluster's feature vector. Masked cells
+        get zeros. Used for BOTH the 2-D centroid AND the
+        ``coarse_hidden_dim``-D cluster-embedding broadcasts.
+        """
         B, N = cluster_ids.shape
-        safe_ids = cluster_ids.clamp(min=0).unsqueeze(-1).expand(B, N, 2)
-        broadcast = torch.gather(centroids, 1, safe_ids)            # (B, N, 2)
+        F = features.shape[-1]
+        safe_ids = cluster_ids.clamp(min=0).unsqueeze(-1).expand(B, N, F)
+        broadcast = torch.gather(features, 1, safe_ids)             # (B, N, F)
         broadcast = broadcast * node_mask.unsqueeze(-1).float()
         return broadcast
 
@@ -400,11 +448,20 @@ class CoarseToFineWrapper(nn.Module):
             data.node_features, data.node_mask,
         )
 
-        # 3. Coarse regressor → predicted cluster centroids.
-        predicted_centroids = self.coarse_regressor(cluster_features)  # (B, K, 2)
+        # 3. Coarse regressor → predicted cluster centroids AND the
+        # 128-D pre-head embeddings (the transformer hidden states
+        # that produced the centroids). We use BOTH as conditioning:
+        # the centroid for the auxiliary loss + a thin spatial
+        # anchor signal, the embeddings for rich per-cluster
+        # identity context that the gene encoder can't drown out.
+        predicted_centroids, cluster_embeddings = (
+            self.coarse_regressor.forward_with_embeddings(cluster_features)
+        )                                                              # (B, K, 2), (B, K, H)
 
-        # 4+5. Choose conditioning centroids: true at training time
-        # (teacher forcing), predicted at inference time.
+        # 4+5. Centroid conditioning: teacher-forced (true) at
+        # training time, predicted at inference. Cluster embeddings
+        # are ALWAYS the regressor's output (no ground truth exists
+        # for them — they're a learned representation).
         if self.training and true_positions is not None:
             cond_centroids = self._compute_true_centroids(
                 true_positions, cluster_ids, data.node_mask, self.n_clusters,
@@ -412,15 +469,19 @@ class CoarseToFineWrapper(nn.Module):
         else:
             cond_centroids = predicted_centroids
 
-        cell_centroids = self._broadcast_centroids(
+        cell_centroids = self._broadcast_per_cluster(
             cond_centroids, cluster_ids, data.node_mask,
         )                                                              # (B, N, 2)
+        cell_cluster_emb = self._broadcast_per_cluster(
+            cluster_embeddings, cluster_ids, data.node_mask,
+        )                                                              # (B, N, H)
 
-        # 6. Concatenate centroid conditioning to gene features and
-        # call the inner backbone.
+        # 6. Concatenate genes + centroid + cluster_embedding and
+        # call the inner backbone. The inner Model was built with
+        # input_dims bumped by ``self.cond_dim`` = 2 + H.
         data_aug = data.copy()
         data_aug.node_features = torch.cat(
-            [data.node_features, cell_centroids], dim=-1,
+            [data.node_features, cell_centroids, cell_cluster_emb], dim=-1,
         )
         out = self.inner(data_aug)
 
@@ -541,11 +602,15 @@ class HierarchicalCoarseToFineWrapper(nn.Module):
             n_layers=coarse_layers,
             n_heads=coarse_heads,
         )
+        self._coarse_hidden = coarse_hidden  # used in forward()
 
-        # -------- Inner Model: receives [genes, centroid_2, patch_ctx_64] --------
+        # -------- Inner Model: receives [genes, centroid_2, cluster_emb_H, patch_ctx_64] --------
+        # The cluster_emb_H term is the c2f regressor's pre-head
+        # transformer hidden state — much richer conditioning than
+        # the 2-D centroid alone (see CoarseToFineWrapper comment).
         augmented_input_dims = dict(input_dims)
         augmented_input_dims["node_features_dimensions"] = (
-            gene_in + 2 + patch_out_dim
+            gene_in + 2 + coarse_hidden + patch_out_dim
         )
 
         from models.model import Model
@@ -566,7 +631,11 @@ class HierarchicalCoarseToFineWrapper(nn.Module):
         cluster_ids, cluster_features = self.cluster_module(
             data.node_features, data.node_mask,
         )
-        predicted_centroids = self.coarse_regressor(cluster_features)
+        # Get BOTH centroids (for aux loss + thin spatial anchor)
+        # AND the 128-D cluster embeddings (rich identity signal).
+        predicted_centroids, cluster_embeddings = (
+            self.coarse_regressor.forward_with_embeddings(cluster_features)
+        )
 
         if self.training and true_positions is not None:
             cond_centroids = CoarseToFineWrapper._compute_true_centroids(
@@ -575,25 +644,30 @@ class HierarchicalCoarseToFineWrapper(nn.Module):
         else:
             cond_centroids = predicted_centroids
 
-        cell_centroids = CoarseToFineWrapper._broadcast_centroids(
+        cell_centroids = CoarseToFineWrapper._broadcast_per_cluster(
             cond_centroids, cluster_ids, data.node_mask,
         )                                                              # (B, N, 2)
+        cell_cluster_emb = CoarseToFineWrapper._broadcast_per_cluster(
+            cluster_embeddings, cluster_ids, data.node_mask,
+        )                                                              # (B, N, H)
 
         # --- Hierarchical stage ---
         # Patch module takes the RAW gene features + CURRENT positions
         # (not the c2f-augmented features). This keeps the two
         # augmentations conceptually independent: hierarchical sees
         # spatial neighborhood structure on the genes, c2f sees
-        # gene-similarity clusters with spatial centroids — and the
-        # inner Model gets to combine both via attention.
+        # gene-similarity clusters with spatial centroids + rich
+        # cluster identity — and the inner Model gets to combine
+        # both via attention.
         patch_ctx = self.patch_module(
             data.node_features, data.positions, data.node_mask,
         )                                                              # (B, N, patch_out_dim)
 
         # --- Concatenate everything and call the inner Model ---
+        # Layout: [genes, centroid_2, cluster_emb_H, patch_ctx_64]
         data_aug = data.copy()
         data_aug.node_features = torch.cat(
-            [data.node_features, cell_centroids, patch_ctx], dim=-1,
+            [data.node_features, cell_centroids, cell_cluster_emb, patch_ctx], dim=-1,
         )
         out = self.inner(data_aug)
 
