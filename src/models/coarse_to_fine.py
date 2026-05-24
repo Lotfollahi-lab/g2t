@@ -430,3 +430,175 @@ class CoarseToFineWrapper(nn.Module):
         out._cluster_ids = cluster_ids
         out._n_clusters = self.n_clusters
         return out
+
+
+# ---------------------------------------------------------------------------
+# Combined hierarchical + coarse-to-fine wrapper
+# ---------------------------------------------------------------------------
+
+
+class HierarchicalCoarseToFineWrapper(nn.Module):
+    """Composes spatial-hierarchical and gene-coarse-to-fine into a
+    SINGLE wrapper around one inner LUNA Model.
+
+    Why both at once
+    ----------------
+    Hierarchical mixes SPATIAL neighborhoods (bins cells by current
+    x_t positions → per-patch context). Coarse-to-fine factorizes
+    by GENE similarity (k-means clusters cells by gene expression →
+    per-cluster spatial centroid). These are conceptually orthogonal:
+
+        hierarchical  : "I know what's spatially near me"
+        coarse-to-fine: "I know which biological group I belong to
+                          and where that group should go"
+
+    Each individually gave a measurable bump on cortex. Stacking
+    them lets the network use BOTH signals simultaneously without
+    one swallowing the other.
+
+    Composition
+    -----------
+    We can't simply nest the two existing wrappers because each one
+    re-instantiates its inner Model with its own input_dims bump,
+    so naive nesting would produce a Model that doesn't know about
+    the other wrapper's augmentation. Instead, this class:
+
+      1. Constructs both module pieces (PatchContextModule from
+         the hierarchical wrapper, GeneClusterModule + CoarseRegressor
+         from the c2f wrapper) on the SAME raw input dim.
+      2. Constructs ONE inner Model with input_dims bumped by BOTH
+         output dims (centroid_2 + patch_output_dim).
+      3. Per forward, runs both augmentations on the raw features,
+         concatenates everything, and calls the inner Model once.
+
+    Stash semantics
+    ---------------
+    The output DataHolder carries the c2f stash attributes
+    (predicted cluster centroids, cluster IDs, n_clusters) so the
+    LossFunction's ``_compute_coarse_centroid_mse`` works without
+    modification. The hierarchical wrapper has no auxiliary loss
+    component, so nothing extra needs to be stashed for it.
+    """
+
+    def __init__(
+        self,
+        input_dims: Dict[str, int],
+        n_layers: int,
+        hidden_mlp_dims: Dict[str, int],
+        hidden_dims: Dict[str, int],
+        output_dims: Dict[str, int],
+        hier_cfg,
+        c2f_cfg,
+    ):
+        super().__init__()
+
+        # Local import to avoid circular import at module load time
+        # (hierarchical.py is in the same package).
+        from models.hierarchical import PatchContextModule
+
+        def _g(cfg_obj, k, default):
+            return (
+                cfg_obj.get(k, default)
+                if hasattr(cfg_obj, "get")
+                else getattr(cfg_obj, k, default)
+            )
+
+        # -------- Hierarchical pieces --------
+        n_patches_axis = int(_g(hier_cfg, "n_patches_per_axis", 4))
+        patch_hidden = int(_g(hier_cfg, "patch_hidden_dim", 128))
+        patch_layers = int(_g(hier_cfg, "patch_n_layers", 2))
+        patch_heads = int(_g(hier_cfg, "patch_n_heads", 4))
+        patch_out_dim = int(_g(hier_cfg, "output_dim", 64))
+
+        gene_in = int(input_dims["node_features_dimensions"])
+        self.patch_module = PatchContextModule(
+            cell_input_dim=gene_in,
+            n_patches_per_axis=n_patches_axis,
+            patch_hidden_dim=patch_hidden,
+            patch_n_layers=patch_layers,
+            patch_n_heads=patch_heads,
+            output_dim=patch_out_dim,
+        )
+        self._patch_out_dim = patch_out_dim
+
+        # -------- Coarse-to-fine pieces --------
+        self.n_clusters = int(_g(c2f_cfg, "n_clusters", 16))
+        self.kmeans_n_iters = int(_g(c2f_cfg, "kmeans_n_iters", 10))
+        coarse_hidden = int(_g(c2f_cfg, "coarse_hidden_dim", 128))
+        coarse_layers = int(_g(c2f_cfg, "coarse_n_layers", 2))
+        coarse_heads = int(_g(c2f_cfg, "coarse_n_heads", 4))
+        gene_proj_dim = int(_g(c2f_cfg, "gene_proj_dim", 128))
+
+        self.cluster_module = GeneClusterModule(
+            gene_input_dim=gene_in,
+            proj_dim=gene_proj_dim,
+            n_clusters=self.n_clusters,
+            kmeans_n_iters=self.kmeans_n_iters,
+        )
+        self.coarse_regressor = CoarseRegressor(
+            cluster_feature_dim=gene_proj_dim,
+            hidden_dim=coarse_hidden,
+            n_layers=coarse_layers,
+            n_heads=coarse_heads,
+        )
+
+        # -------- Inner Model: receives [genes, centroid_2, patch_ctx_64] --------
+        augmented_input_dims = dict(input_dims)
+        augmented_input_dims["node_features_dimensions"] = (
+            gene_in + 2 + patch_out_dim
+        )
+
+        from models.model import Model
+        self.inner = Model(
+            input_dims=augmented_input_dims,
+            n_layers=n_layers,
+            hidden_mlp_dims=hidden_mlp_dims,
+            hidden_dims=hidden_dims,
+            output_dims=output_dims,
+        )
+
+    def forward(
+        self,
+        data: DataHolder,
+        true_positions: Optional[torch.Tensor] = None,
+    ) -> DataHolder:
+        # --- Coarse-to-fine stage ---
+        cluster_ids, cluster_features = self.cluster_module(
+            data.node_features, data.node_mask,
+        )
+        predicted_centroids = self.coarse_regressor(cluster_features)
+
+        if self.training and true_positions is not None:
+            cond_centroids = CoarseToFineWrapper._compute_true_centroids(
+                true_positions, cluster_ids, data.node_mask, self.n_clusters,
+            )
+        else:
+            cond_centroids = predicted_centroids
+
+        cell_centroids = CoarseToFineWrapper._broadcast_centroids(
+            cond_centroids, cluster_ids, data.node_mask,
+        )                                                              # (B, N, 2)
+
+        # --- Hierarchical stage ---
+        # Patch module takes the RAW gene features + CURRENT positions
+        # (not the c2f-augmented features). This keeps the two
+        # augmentations conceptually independent: hierarchical sees
+        # spatial neighborhood structure on the genes, c2f sees
+        # gene-similarity clusters with spatial centroids — and the
+        # inner Model gets to combine both via attention.
+        patch_ctx = self.patch_module(
+            data.node_features, data.positions, data.node_mask,
+        )                                                              # (B, N, patch_out_dim)
+
+        # --- Concatenate everything and call the inner Model ---
+        data_aug = data.copy()
+        data_aug.node_features = torch.cat(
+            [data.node_features, cell_centroids, patch_ctx], dim=-1,
+        )
+        out = self.inner(data_aug)
+
+        # Stash for the loss (only c2f has an auxiliary loss term).
+        out._predicted_cluster_centroids = predicted_centroids
+        out._cluster_ids = cluster_ids
+        out._n_clusters = self.n_clusters
+        return out

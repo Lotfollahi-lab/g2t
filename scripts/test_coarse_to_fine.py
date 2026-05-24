@@ -44,6 +44,7 @@ from models.coarse_to_fine import (  # noqa: E402
     GeneClusterModule,
     CoarseRegressor,
     CoarseToFineWrapper,
+    HierarchicalCoarseToFineWrapper,
 )
 
 
@@ -228,11 +229,152 @@ def test_gradient_flow() -> None:
     print("[grad]  PASS\n")
 
 
+def _build_combined_wrapper():
+    """Smallest possible HierarchicalCoarseToFineWrapper for testing.
+    Mirrors the dim contract from diffusion_model.py."""
+    input_dims = {
+        "node_features_dimensions": 16,
+        "diffusion_time_dimensions": 1,
+    }
+    hidden_mlp_dims = {"X": 32, "y": 32, "pos": 8}
+    hidden_dims = {
+        "dx": 32, "dy": 1, "num_heads": 4,
+        "dim_ffX": 32, "dim_ffy": 32, "dd": 16,
+        "output_features_to_pos_dims": 4,
+    }
+    output_dims = {
+        "node_features_dimensions": 16,
+        "diffusion_time_dimensions": 0,
+    }
+
+    class _HierCfg:
+        n_patches_per_axis = 4
+        patch_hidden_dim = 32
+        patch_n_layers = 1
+        patch_n_heads = 2
+        output_dim = 16
+
+        def get(self, k, default=None):
+            return getattr(self, k, default)
+
+    class _C2FCfg:
+        n_clusters = 8
+        kmeans_n_iters = 5
+        coarse_hidden_dim = 32
+        coarse_n_layers = 1
+        coarse_n_heads = 2
+        gene_proj_dim = 32
+
+        def get(self, k, default=None):
+            return getattr(self, k, default)
+
+    return HierarchicalCoarseToFineWrapper(
+        input_dims=input_dims,
+        n_layers=2,
+        hidden_mlp_dims=hidden_mlp_dims,
+        hidden_dims=hidden_dims,
+        output_dims=output_dims,
+        hier_cfg=_HierCfg(),
+        c2f_cfg=_C2FCfg(),
+    )
+
+
+def test_combined_wrapper_contract() -> None:
+    """HierarchicalCoarseToFineWrapper preserves the DataHolder
+    contract AND stashes the c2f outputs for the loss."""
+    torch.manual_seed(0)
+    B, N, F = 2, 32, 16
+
+    model = _build_combined_wrapper().eval()
+    data = DataHolder(
+        node_features=torch.randn(B, N, F),
+        positions=torch.randn(B, N, 2),
+        diffusion_time=torch.rand(B, 1),
+        node_mask=torch.ones(B, N, dtype=torch.bool),
+    )
+    with torch.no_grad():
+        out = model(data)
+
+    if not isinstance(out, DataHolder):
+        raise AssertionError(f"Expected DataHolder; got {type(out)}.")
+    if out.positions.shape != (B, N, 2):
+        raise AssertionError(
+            f"Combined output positions shape mismatch: "
+            f"{tuple(out.positions.shape)}."
+        )
+    # c2f stash MUST survive composition.
+    if not hasattr(out, "_predicted_cluster_centroids"):
+        raise AssertionError("Combined wrapper missing _predicted_cluster_centroids.")
+    if out._predicted_cluster_centroids.shape != (B, 8, 2):
+        raise AssertionError(
+            f"Centroids shape mismatch: {tuple(out._predicted_cluster_centroids.shape)}."
+        )
+    print(f"[combined-contract]  positions {tuple(out.positions.shape)} ✓ "
+          f"centroids {tuple(out._predicted_cluster_centroids.shape)} ✓")
+    print("[combined-contract]  PASS\n")
+
+
+def test_combined_gradient_flow() -> None:
+    """Gradient must reach all THREE components: patch_module,
+    coarse pieces (cluster_module + coarse_regressor), and the
+    inner Model."""
+    torch.manual_seed(0)
+    B, N, F = 2, 32, 16
+
+    model = _build_combined_wrapper().train()
+    data = DataHolder(
+        node_features=torch.randn(B, N, F),
+        positions=torch.randn(B, N, 2),
+        diffusion_time=torch.rand(B, 1),
+        node_mask=torch.ones(B, N, dtype=torch.bool),
+    )
+    out = model(data, true_positions=data.positions)
+
+    target_pos = torch.randn_like(out.positions)
+    target_centroids = torch.randn_like(out._predicted_cluster_centroids)
+    loss = (
+        ((out.positions - target_pos) ** 2).mean()
+        + ((out._predicted_cluster_centroids - target_centroids) ** 2).mean()
+        + (out.node_features ** 2).mean()
+    )
+    loss.backward()
+
+    patch_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.patch_module.parameters()
+    )
+    coarse_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in list(model.cluster_module.parameters())
+        + list(model.coarse_regressor.parameters())
+    )
+    inner_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in model.inner.parameters()
+    )
+    if not patch_has_grad:
+        raise AssertionError(
+            "patch_module received zero gradient in combined wrapper."
+        )
+    if not coarse_has_grad:
+        raise AssertionError(
+            "Coarse stage received zero gradient in combined wrapper."
+        )
+    if not inner_has_grad:
+        raise AssertionError(
+            "Inner Model received zero gradient in combined wrapper."
+        )
+    print("[combined-grad]  patch ✓  coarse ✓  inner ✓")
+    print("[combined-grad]  PASS\n")
+
+
 def main() -> int:
     test_gene_clustering()
     test_coarse_regressor()
     test_wrapper_contract()
     test_gradient_flow()
+    test_combined_wrapper_contract()
+    test_combined_gradient_flow()
     print("All coarse-to-fine tests passed.")
     return 0
 

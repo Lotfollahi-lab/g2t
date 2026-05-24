@@ -113,14 +113,12 @@ class FullDenoisingDiffusion(pl.LightningModule):
         # constraint as hierarchical (LUNA transformer only for now).
         c2f_cfg = getattr(cfg.model, "coarse_to_fine", None)
         c2f_enabled = bool(getattr(c2f_cfg, "enabled", False)) if c2f_cfg else False
-        if c2f_enabled and hier_enabled:
-            raise ValueError(
-                "model.coarse_to_fine.enabled=true and "
-                "model.hierarchical.enabled=true are not yet wired "
-                "to stack — both wrappers re-instantiate the inner "
-                "Model with their own augmented input_dims. Pick "
-                "one for now."
-            )
+        # If BOTH wrappers are enabled, we route through the combined
+        # ``HierarchicalCoarseToFineWrapper`` (in coarse_to_fine.py)
+        # which composes both augmentations on a single inner Model.
+        # The c2f-only and hier-only branches further below are then
+        # short-circuited; we set this flag to drive the routing.
+        combined_enabled = c2f_enabled and hier_enabled
 
         # Backbone selector: LUNA's stock transformer or scgg's
         # SE(2)-equivariant EGNN. The EGNN path is gated behind a
@@ -170,7 +168,21 @@ class FullDenoisingDiffusion(pl.LightningModule):
             )
 
         if backbone == "luna_transformer":
-            if hier_enabled:
+            if combined_enabled:
+                # Composed multi-scale: spatial-hierarchical patches +
+                # gene-coarse-to-fine clusters, both feeding ONE inner
+                # Model. See HierarchicalCoarseToFineWrapper.
+                from models.coarse_to_fine import HierarchicalCoarseToFineWrapper
+                self.model = HierarchicalCoarseToFineWrapper(
+                    input_dims=self.input_dims,
+                    n_layers=cfg.model.n_layers,
+                    hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                    hidden_dims=cfg.model.hidden_dims,
+                    output_dims=self.output_dims,
+                    hier_cfg=hier_cfg,
+                    c2f_cfg=c2f_cfg,
+                )
+            elif hier_enabled:
                 from models.hierarchical import HierarchicalModelWrapper
                 self.model = HierarchicalModelWrapper(
                     input_dims=self.input_dims,
