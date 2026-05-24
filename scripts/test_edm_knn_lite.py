@@ -200,6 +200,62 @@ def test_edm_multi_step_stable() -> None:
             assert torch.isfinite(p).all(), f"Parameter went NaN at step {step}"
 
 
+def test_edm_mds_align_with_full_loss_chain_stable() -> None:
+    """Regression for the eigh-backward NaN poisoning bug.
+
+    With ``mds_align=True``, the wrapper sets pred.positions to the MDS
+    eigendecomposition output. If autograd traces backward through
+    that path (e.g. via cluster_balance's
+    ``pred.positions.sum() * 0.0`` fallback), the eigh backward
+    formula's ``1/(λ_i − λ_j)`` term produces inf for near-degenerate
+    eigenvalues, and ``0 × inf = NaN`` poisons every parameter's
+    gradient.
+
+    This test simulates that exact chain: full EDM forward with
+    mds_align=True, then a loss that includes BOTH the EDM term AND
+    a ``pred.positions.sum() * 0.0`` term (mimicking
+    cluster_balance's graph-attached zero). All parameters must stay
+    finite for 30 steps.
+
+    With the detach() fix in EDMOutputWrapper.forward, the MDS path
+    is removed from the gradient graph — the ``0 × ...`` term sees
+    a non-tracked tensor and contributes ZERO gradient.
+    """
+    B, N = 1, 32
+    inner = _StubInner(in_features=16, out_features=4)
+    wrap = EDMOutputWrapper(inner_model=inner, inner_out_dim=4, embed_dim=8, mds_align=True)
+    data = _build_data(B=B, N=N)
+    data.positions = data.positions * 50.0
+    optimizer = torch.optim.AdamW(wrap.parameters(), lr=5e-4)
+    eps = 1e-8
+
+    for step in range(30):
+        optimizer.zero_grad()
+        pred = wrap(data)
+        d_true = torch.cdist(data.positions[0], data.positions[0], p=2)
+        d_pred = (pred.edm_D[0] + eps).sqrt()
+        edm_loss = ((d_pred - d_true) ** 2).mean()
+        # Mimic the cluster_balance fallback: a graph-attached zero
+        # through pred.positions. Without the detach fix this path
+        # injects NaN via eigh backward.
+        fallback_zero = pred.positions[0].sum() * 0.0
+        loss = edm_loss + fallback_zero
+        assert torch.isfinite(loss), f"Loss non-finite at step {step}: {loss}"
+        loss.backward()
+        # Critical assertion: gradients should also be finite. The bug
+        # produced finite loss but NaN gradients via eigh backward.
+        for name, p in wrap.named_parameters():
+            if p.grad is not None:
+                assert torch.isfinite(p.grad).all(), (
+                    f"NaN gradient at step {step} on parameter {name}"
+                )
+        optimizer.step()
+        for name, p in wrap.named_parameters():
+            assert torch.isfinite(p).all(), (
+                f"Parameter {name} went NaN at step {step}"
+            )
+
+
 def test_edm_zero_ref_no_crash() -> None:
     """When framework=regression zeroes positions, Procrustes ref is
     zero — the guard should kick in and use the raw MDS frame."""
@@ -337,6 +393,8 @@ def main() -> int:
         ("EDM forward shapes + finiteness",            test_edm_forward_shapes_and_finite),
         ("EDM gradient flow",                          test_edm_gradient_flows_through_projector_and_inner),
         ("EDM 30-step stability with raw-scale positions", test_edm_multi_step_stable),
+        ("EDM mds_align + cluster_balance fallback (eigh-backward NaN regression)",
+                                                       test_edm_mds_align_with_full_loss_chain_stable),
         ("EDM zero-ref guard (regression framework)",  test_edm_zero_ref_no_crash),
         ("kNN graph forward",                          test_knn_graph_forward),
         ("kNN graph gradient flow",                    test_knn_graph_gradient),

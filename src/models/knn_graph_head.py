@@ -202,11 +202,22 @@ class KNNGraphOutputWrapper(nn.Module):
         pred.knn_logits = logits
 
         if self.spectral_layout:
-            new_pos = self._spectral_layout(logits, pred.positions, data.node_mask)
+            # DETACH the spectral-layout path from autograd for the
+            # same reason as EDM's MDS detach (see edm_head.py): the
+            # Laplacian eigenmaps eigh has the same near-degenerate-
+            # eigenvalue backward issue (1/(λ_i − λ_j) → inf), and
+            # the cluster_balance loss-component fallback path
+            # ``pred.positions.sum() * 0.0`` would then propagate
+            # ``0 × inf = NaN`` to every parameter. The k-NN loss
+            # reads ``pred.knn_logits`` directly (not pred.positions),
+            # so we don't need gradient through this path; inference
+            # doesn't backward at all.
+            with torch.no_grad():
+                new_pos = self._spectral_layout(
+                    logits.detach(), pred.positions.detach(), data.node_mask,
+                )
+            new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
             pred.positions = new_pos
-            pred.positions = pred.positions * data.node_mask.unsqueeze(-1).to(
-                pred.positions.dtype
-            )
 
         return pred
 

@@ -195,13 +195,27 @@ class EDMOutputWrapper(nn.Module):
         pred.edm_h = h
 
         if self.mds_align:
-            new_pos = self._mds_align_positions(D_sq, pred.positions, data.node_mask)
+            # DETACH the MDS path from autograd. The MDS step uses
+            # ``torch.linalg.eigh``, whose backward formula has
+            # ``1/(λ_i − λ_j)`` terms that diverge to ±inf when
+            # eigenvalues are close. Even paths that produce a
+            # gradient of 0 at the OUTPUT (e.g. the cluster_balance
+            # fallback ``pred.positions.sum() * 0.0``) then compute
+            # ``0 × inf = NaN`` in autograd's chain-rule traversal,
+            # which poisons the entire backward. We don't need
+            # gradient through MDS anyway: the EDM loss reads
+            # ``pred.edm_D`` directly (no MDS in that path), and
+            # FM/DDPM Euler steps consume ``pred.positions`` only
+            # at inference (no backward). Setting requires_grad=False
+            # on the MDS output makes the gradient graph through this
+            # path explicitly empty, sidestepping the eigh-backward
+            # numerical issue.
+            with torch.no_grad():
+                new_pos = self._mds_align_positions(
+                    D_sq.detach(), pred.positions.detach(), data.node_mask,
+                )
+            new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
             pred.positions = new_pos
-            # Don't re-center in mask() since MDS positions are already
-            # canonical-centred; just ensure padding stays zero.
-            pred.positions = pred.positions * data.node_mask.unsqueeze(-1).to(
-                pred.positions.dtype
-            )
 
         return pred
 
