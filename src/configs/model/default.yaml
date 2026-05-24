@@ -1,4 +1,4 @@
-# Generative framework selector.
+# Training paradigm / generative framework selector.
 # - "diffusion"      — LUNA's original DDPM. Forward: x_t = sqrt(αₜ)·x_0
 #   + sqrt(1−αₜ)·ε with the cosine β schedule. Reverse: 1000 sequential
 #   denoising steps. This is the default — `luna_train.py` always uses
@@ -11,13 +11,27 @@
 #   ODE solve instead of 1000 DDPM steps — that's the 20× wall-clock
 #   win at inference. Training cost per step is the same; the
 #   simpler loss landscape often converges in fewer epochs.
+# - "regression"     — NO generative process. Direct supervised
+#   prediction: backbone maps (gene_expression, mask) → positions,
+#   loss is the same pairwise-distance MSE (+ any opt-in components).
+#   Diagnostic experiment: does the generative paradigm actually
+#   help on small datasets like cortex's 6 slices, or is it just
+#   wrapping the predictor in a sample-inefficient framework?
+#   Generative models need to learn the FULL conditional p(pos|gene)
+#   from finite data; regression only needs the conditional MEAN —
+#   often much more sample-efficient on tiny datasets. Implementation
+#   reuses the same Lightning machinery: a ``RegressionPredictor``
+#   exposes the SAME 3-method interface as the noise models, but
+#   ``apply_noise`` returns zeroed positions at t=1 (network sees
+#   no positional info — must predict positions from genes alone),
+#   and the "sampling loop" iterates exactly once (max_diffusion_
+#   steps=1) → one forward → return the prediction.
 #
-#   Implementation contract: FlowMatchingModel exposes the SAME methods
-#   as NoiseModel (apply_noise / sample_limit_dist /
-#   sample_zs_from_zt_and_pred) so the diffusion-model Lightning class,
-#   training_step, and sampling loop are all framework-agnostic — the
-#   only branch point is which class fills `self.noise_model` at
-#   __init__.
+#   Implementation contract: all three classes expose the SAME
+#   methods (apply_noise / sample_limit_dist /
+#   sample_zs_from_zt_and_pred) so the Lightning class, training
+#   step, and sampling loop are framework-agnostic — the only branch
+#   point is which class fills `self.noise_model` at __init__.
 framework: "diffusion"
 
 # Backbone architecture selector (independent of `framework`).

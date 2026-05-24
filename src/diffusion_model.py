@@ -49,6 +49,13 @@ class FullDenoisingDiffusion(pl.LightningModule):
             fm_cfg = getattr(cfg.model, "flow_matching", None)
             n_steps = int(getattr(fm_cfg, "n_sampling_steps", 50)) if fm_cfg is not None else 50
             self.max_diffusion_steps = n_steps
+        elif framework == "regression":
+            # Direct supervised regression: the "sampling loop" runs
+            # exactly once (one backbone forward = the prediction).
+            # RegressionPredictor.max_diffusion_steps is also 1; we
+            # mirror it on the Lightning module so sample.py's outer
+            # ``reversed(range(0, max_diffusion_steps))`` iterates once.
+            self.max_diffusion_steps = 1
         else:
             self.max_diffusion_steps = cfg.model.diffusion_steps
         self.log_every_steps = True
@@ -100,6 +107,22 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"backbone='luna_transformer' (got backbone={backbone!r}). "
                 f"EGNN+hierarchical needs an invariant reformulation of "
                 f"the patch centroid features — not yet implemented."
+            )
+        if hier_enabled and framework == "regression":
+            # The hierarchical wrapper bins cells by their positions.
+            # In regression mode, positions are zeroed at both
+            # training and inference time (the network sees no
+            # positional info), so all cells would land in the same
+            # patch — defeats the purpose of multi-scale processing.
+            # A regression-compatible hierarchical would bin cells by
+            # GENE features instead; not implemented.
+            raise ValueError(
+                f"model.hierarchical.enabled=true is incompatible with "
+                f"model.framework='regression' — the hierarchical wrapper "
+                f"bins cells by positions, but regression feeds the "
+                f"backbone zero positions. Disable one of the two "
+                f"options, or implement a gene-feature-based patch "
+                f"assignment for the regression case."
             )
 
         if backbone == "luna_transformer":
@@ -154,10 +177,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"Expected 'luna_transformer' or 'egnn'."
             )
 
-        # Generative framework: DDPM (LUNA default) or rectified-flow
-        # FM. Both classes share the same apply_noise /
-        # sample_limit_dist / sample_zs_from_zt_and_pred interface so
-        # the training step and sampling loop are unchanged.
+        # Training paradigm: DDPM (LUNA default), rectified-flow FM,
+        # or pure supervised regression. All three classes share the
+        # SAME apply_noise / sample_limit_dist /
+        # sample_zs_from_zt_and_pred interface so the training step
+        # and sampling loop are framework-agnostic.
         if framework == "flow_matching":
             # Local import keeps the DDPM path import-cost identical
             # for runs that don't opt into FM (parity with how the
@@ -166,12 +190,19 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 FlowMatchingModel,
             )
             self.noise_model = FlowMatchingModel(cfg)
+        elif framework == "regression":
+            # Direct supervised regression — no noise, no iterative
+            # sampling. See module docstring of regression_predictor.
+            from utils.diffusion_model.diffusion.regression_predictor import (
+                RegressionPredictor,
+            )
+            self.noise_model = RegressionPredictor(cfg)
         elif framework == "diffusion":
             self.noise_model = NoiseModel(cfg)
         else:
             raise ValueError(
                 f"Unknown model.framework={framework!r}. "
-                f"Expected 'diffusion' or 'flow_matching'."
+                f"Expected 'diffusion', 'flow_matching', or 'regression'."
             )
 
     def on_train_epoch_start(self) -> None:
