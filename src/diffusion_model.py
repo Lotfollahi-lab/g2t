@@ -70,7 +70,14 @@ class FullDenoisingDiffusion(pl.LightningModule):
         # inner backbone's input_dims BEFORE construction so all
         # downstream wrappers (c2f / hierarchical) see the wider
         # input and add their own augmentations on top.
-        sc_cfg = getattr(cfg.train, "self_conditioning", None)
+        #
+        # Lives under cfg.model (not cfg.train) so that the
+        # inference-side ``load_model_config`` (which only restores
+        # cfg.model from the training-time snapshot) picks it up
+        # automatically. Otherwise the inference subprocess would
+        # build the model with default (off) settings and the
+        # state_dict load would fail on shape mismatch.
+        sc_cfg = getattr(cfg.model, "self_conditioning", None)
         self._self_cond_enabled = bool(
             getattr(sc_cfg, "enabled", False)
         ) if sc_cfg is not None else False
@@ -265,10 +272,14 @@ class FullDenoisingDiffusion(pl.LightningModule):
             )
 
         # Auxiliary gene-reconstruction head. Active iff
-        # cfg.train.gene_reconstruction.enabled. Takes the inner
+        # cfg.model.gene_reconstruction.enabled. Takes the inner
         # backbone's output node_features (out_node_dim) and predicts
         # back to gene space. Trained jointly with the main loss.
-        recon_cfg = getattr(cfg.train, "gene_reconstruction", None)
+        # Lives under cfg.model (not cfg.train) for the same reason
+        # as self-conditioning above — the head is a Lightning module
+        # parameter, so the checkpoint format depends on this flag,
+        # so it has to survive the inference-side config restore.
+        recon_cfg = getattr(cfg.model, "gene_reconstruction", None)
         self._gene_recon_enabled = bool(
             getattr(recon_cfg, "enabled", False)
         ) if recon_cfg is not None else False

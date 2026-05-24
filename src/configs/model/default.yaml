@@ -602,3 +602,45 @@ coarse_to_fine:
     # coarse-stage features. Smaller = lighter, larger = more
     # expressive cluster aggregation.
     gene_proj_dim: 128
+
+# ---------------------------------------------------------------------------
+# Auxiliary gene-reconstruction multi-task. At each train step, a
+# fraction of each cell's gene values are masked (zeroed in the
+# input). An auxiliary head decodes the masked values from the
+# inner backbone's output representation. Multi-task SSL — novel
+# for spatial coordinate prediction.
+#
+# Lives under cfg.model (not cfg.train) because the head module is
+# part of the LightningModule's parameter set, so the checkpoint
+# saves/loads it. cfg.train.* doesn't survive the inference-side
+# config restore; cfg.model.* does.
+# ---------------------------------------------------------------------------
+gene_reconstruction:
+    enabled: false
+    # Fraction of gene VALUES to mask per cell per training step
+    # (Bernoulli per gene element). 0.15 matches BERT.
+    mask_ratio: 0.15
+    # Weight of the reconstruction loss in the total objective.
+    weight: 0.05
+    # Hidden width of the reconstruction head MLP.
+    hidden_dim: 256
+
+# ---------------------------------------------------------------------------
+# Self-conditioning for FM (Chen et al. 2023 trick).
+#
+# Under cfg.model (not cfg.train) because it bumps the inner
+# backbone's ``input_dims["node_features_dimensions"]`` by 2 — i.e.
+# the model's architecture differs depending on this flag's value,
+# and the checkpoint format depends on it being consistent at train
+# and inference time.
+#
+# At training with probability ``prob``: two-pass forward — first
+# pass with zero self-cond, detach x_0_pred, then second pass
+# conditions on it. At inference, each sampling step's prediction
+# conditions the next step.
+# ---------------------------------------------------------------------------
+self_conditioning:
+    enabled: false
+    # Probability of doing the two-pass training step (vs single-pass
+    # with zero self-cond). 0.5 is the canonical value.
+    prob: 0.5

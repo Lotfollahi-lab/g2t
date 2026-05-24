@@ -65,53 +65,14 @@ ema_decay: 0.0            # 0 disables the EMA callback entirely
 ema_every_n_steps: 1      # update EMA every N optimizer steps; >1 saves a
                           # tiny bit of compute, almost never used
 
-# ---------------------------------------------------------------------------
-# Auxiliary gene-reconstruction multi-task loss.
-#
-# At each training step, a fraction of each cell's gene values are
-# masked (zeroed in the input). An auxiliary head decodes the
-# masked values from the inner backbone's output representation.
-# The reconstruction loss is added to the main loss with the given
-# weight. Forces the network to learn rich gene-context relationships
-# between cells; novel for spatial coordinate prediction.
-#
-# All knobs are gated by ``enabled=true``; defaults are no-op.
-# ---------------------------------------------------------------------------
-gene_reconstruction:
-    enabled: false
-    # Fraction of gene VALUES to mask per cell per training step
-    # (Bernoulli per gene element, not per cell). 0.15 matches BERT.
-    mask_ratio: 0.15
-    # Weight of the reconstruction loss in the total objective. The
-    # reconstruction task is on the input-gene scale; pairwise-distance
-    # MSE is on the (much smaller) coordinate scale. Keep this small
-    # (0.01-0.1) so reconstruction doesn't dominate the position
-    # objective.
-    weight: 0.05
-    # Hidden width of the reconstruction head MLP.
-    hidden_dim: 256
-
-# ---------------------------------------------------------------------------
-# Self-conditioning for flow matching (Chen et al. 2023 trick).
-#
-# At each train step with probability ``prob`` (0.5 in the paper):
-#   1. First forward pass with self_cond = zeros → x_0_pred_first.
-#   2. Detach x_0_pred_first.
-#   3. Second forward pass with self_cond = x_0_pred_first.
-#   4. Loss is computed on the SECOND pass.
-#
-# At inference, the previous sampling step's prediction conditions
-# the current step. Initialised to zeros at t=1 (no prior info).
-#
-# The conditioning is fed as 2 extra dims concatenated to each
-# cell's gene features — when self-cond is enabled, the input_dim
-# of the inner backbone is bumped by 2 at construction time.
-#
-# Typical gain in FM literature: +1-2pp. Composable with c2f /
-# hierarchical / gene_reconstruction.
-# ---------------------------------------------------------------------------
-self_conditioning:
-    enabled: false
-    # Probability of doing the two-pass training step (vs single-pass
-    # with zero self-cond). 0.5 is the canonical value (Chen 2023).
-    prob: 0.5
+# NOTE: ``gene_reconstruction`` and ``self_conditioning`` USED to live
+# here in cfg.train, but they affect the MODEL'S ARCHITECTURE (the
+# self-cond bump changes the inner backbone's input_dim; the
+# gene-recon head is a module on the LightningModule). The inference
+# pipeline restores ``cfg.model`` from the training snapshot but
+# NOT ``cfg.train`` — so train-side knobs that change architecture
+# break checkpoint loading at inference. They've been moved to
+# ``cfg.model.{self_conditioning, gene_reconstruction}`` (see
+# configs/model/default.yaml) so the snapshot-restore picks them up
+# automatically. Same pattern as ``cfg.model.coarse_to_fine`` and
+# ``cfg.model.hierarchical``.
