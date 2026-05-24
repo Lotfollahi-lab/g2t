@@ -34,6 +34,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils.data.dataholder import DataHolder
 
@@ -44,13 +45,32 @@ from utils.data.dataholder import DataHolder
 
 
 class GeneClusterModule(nn.Module):
-    """K-means clustering on gene-expression embeddings + per-cluster
-    feature aggregation.
+    """Cluster cells by gene expression + per-cluster feature aggregation.
 
-    The clustering itself is non-differentiable (hard assignment), but
-    the per-cluster aggregation IS differentiable in the projected
-    cell features. Gradients flow into ``gene_proj`` through the
-    aggregation, not through the cluster-assignment indices.
+    Two clustering modes are supported via ``cluster_mode``:
+
+    * ``"kmeans"`` (default, backward-compatible). Hard k-means on
+      the projected gene embeddings, recomputed per forward.
+      Non-differentiable; gradients flow into ``gene_proj`` only
+      through the per-cluster aggregation, not the cluster
+      assignment itself.
+
+    * ``"gumbel"``. A small learnable ``cluster_head`` predicts soft
+      logits per cell over the K clusters. Gumbel-softmax with
+      ``hard=True`` produces a one-hot assignment in the forward
+      pass (matches k-means semantics for downstream computation),
+      and the straight-through estimator routes gradients through
+      the soft weights back into the cluster head + ``gene_proj``.
+      Cluster boundaries can then co-adapt with the downstream
+      spatial-prediction loss.
+
+    Both modes return the SAME (cluster_ids, cluster_features) tuple
+    so the wrapper code is unchanged:
+
+      * ``cluster_ids``: ``(B, N)`` long, ``[0, K)`` for real cells,
+        ``-1`` for masked.
+      * ``cluster_features``: ``(B, K, proj_dim)`` mean per-cluster
+        embedding, gradient-bearing.
     """
 
     def __init__(
@@ -59,12 +79,21 @@ class GeneClusterModule(nn.Module):
         proj_dim: int,
         n_clusters: int,
         kmeans_n_iters: int = 10,
+        cluster_mode: str = "kmeans",
+        gumbel_tau: float = 1.0,
     ):
         super().__init__()
         if n_clusters < 2:
             raise ValueError(f"n_clusters must be ≥ 2; got {n_clusters}.")
+        cluster_mode = str(cluster_mode).lower()
+        if cluster_mode not in ("kmeans", "gumbel"):
+            raise ValueError(
+                f"cluster_mode must be 'kmeans' or 'gumbel'; got {cluster_mode!r}"
+            )
         self.n_clusters = int(n_clusters)
         self.kmeans_n_iters = int(kmeans_n_iters)
+        self.cluster_mode = cluster_mode
+        self.gumbel_tau = float(gumbel_tau)
 
         # Light projection of raw gene expression for clustering AND
         # downstream coarse-stage features. Kept small (default 128)
@@ -73,6 +102,17 @@ class GeneClusterModule(nn.Module):
         self.gene_proj = nn.Sequential(
             nn.Linear(gene_input_dim, proj_dim),
             nn.SiLU(),
+        )
+
+        # Learned cluster head — only used when cluster_mode='gumbel'.
+        # We allocate it unconditionally so the parameter set is stable
+        # across runs that switch modes, but it stays untouched (zero
+        # gradient) in kmeans mode. Tiny cost — proj_dim × K ≈ 128 × 16
+        # = 2k params.
+        self.cluster_head = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim),
+            nn.SiLU(),
+            nn.Linear(proj_dim, n_clusters),
         )
 
     @torch.no_grad()
@@ -162,6 +202,23 @@ class GeneClusterModule(nn.Module):
         cell_emb = self.gene_proj(node_features)                    # (B, N, H)
         H = cell_emb.shape[-1]
 
+        if self.cluster_mode == "gumbel":
+            cluster_ids, cluster_features = self._cluster_gumbel(
+                cell_emb, node_mask, B, N, K, H,
+            )
+        else:  # kmeans
+            cluster_ids, cluster_features = self._cluster_kmeans(
+                cell_emb, node_mask, B, N, K, H, device,
+            )
+
+        return cluster_ids, cluster_features
+
+    # ------------------------------------------------------------------
+    # Hard k-means (default; backward-compatible)
+    # ------------------------------------------------------------------
+    def _cluster_kmeans(
+        self, cell_emb, node_mask, B, N, K, H, device,
+    ):
         # Per-slice k-means; loop over B is fine for typical B≤8.
         cluster_ids = torch.full((B, N), -1, dtype=torch.long, device=device)
         for b in range(B):
@@ -179,7 +236,7 @@ class GeneClusterModule(nn.Module):
         safe_ids = cluster_ids.clamp(min=0)
         valid = node_mask & (cluster_ids >= 0)
 
-        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, N)
+        batch_idx = torch.arange(B, device=cell_emb.device).unsqueeze(1).expand(B, N)
         combined_id = (batch_idx * K + safe_ids).reshape(-1)
         valid_f = valid.float().reshape(-1, 1)
 
@@ -193,6 +250,79 @@ class GeneClusterModule(nn.Module):
 
         cnt_safe = sum_cnt.clamp(min=1.0)
         cluster_features = (sum_emb / cnt_safe.unsqueeze(-1)).reshape(B, K, H)
+
+        return cluster_ids, cluster_features
+
+    # ------------------------------------------------------------------
+    # Gumbel-softmax (learnable, differentiable)
+    # ------------------------------------------------------------------
+    def _cluster_gumbel(
+        self, cell_emb, node_mask, B, N, K, H,
+    ):
+        """Soft cluster assignment with straight-through Gumbel-softmax.
+
+        Forward pass: ``F.gumbel_softmax(..., hard=True)`` returns a
+        one-hot ``(B, N, K)`` tensor. The "hard" output makes the
+        cluster_features computation behave exactly like a hard-
+        clustering scatter-mean (each cell contributes its full weight
+        to exactly ONE cluster), so the downstream coarse_regressor
+        sees the same kind of input as in k-means mode.
+
+        Backward pass: the straight-through estimator routes gradients
+        through the soft probabilities, so the cluster head and
+        ``gene_proj`` learn to choose cluster boundaries that minimise
+        the downstream spatial-prediction loss. This is the whole
+        point — cluster boundaries that are right for THE TASK rather
+        than for unsupervised gene-space K-means.
+
+        Inference: deterministic argmax (no Gumbel noise) for
+        reproducibility. We still build a one-hot to keep the
+        aggregation code path identical.
+        """
+        # (B, N, K) logits — pure function of the projected gene embeddings.
+        logits = self.cluster_head(cell_emb)
+
+        if self.training:
+            # ``hard=True`` straight-through: forward is one-hot,
+            # backward uses soft weights.
+            weights = F.gumbel_softmax(
+                logits, tau=self.gumbel_tau, hard=True, dim=-1,
+            )                                                       # (B, N, K)
+        else:
+            # Deterministic argmax for inference. We still build a
+            # one-hot tensor so the aggregation einsum below is
+            # identical to the training path.
+            argmax_idx = logits.argmax(dim=-1)                      # (B, N)
+            weights = F.one_hot(argmax_idx, num_classes=K).to(cell_emb.dtype)
+
+        # Zero out padding cells so they don't contribute to any
+        # cluster. This is the right thing to do regardless of mode —
+        # padded cells have no real gene content.
+        weights = weights * node_mask.unsqueeze(-1).to(cell_emb.dtype)
+
+        # Aggregate per cluster: cluster_features[b, k] = sum_n
+        # cell_emb[b, n] · weights[b, n, k] / sum_n weights[b, n, k].
+        # einsum here is differentiable end-to-end.
+        sum_emb = torch.einsum("bnk,bnh->bkh", weights, cell_emb)    # (B, K, H)
+        counts = weights.sum(dim=1)                                  # (B, K)
+        # Cluster might be empty (all cells assigned to other clusters);
+        # clamp avoids div-by-zero. The cluster's downstream centroid
+        # prediction will then just inherit whatever the cluster head
+        # was producing — fine because the loss has nothing to compare
+        # against (the true centroid for that cluster has count=0 too).
+        counts_safe = counts.clamp(min=1e-6).unsqueeze(-1)
+        cluster_features = sum_emb / counts_safe
+
+        # Hard cluster_ids (argmax, gradient-free) for downstream
+        # uses that need an integer per cell: true-centroid scatter
+        # in CoarseToFineWrapper._compute_true_centroids, and the
+        # broadcast in _broadcast_per_cluster. Padded cells get -1.
+        with torch.no_grad():
+            cluster_ids = logits.argmax(dim=-1)
+            cluster_ids = torch.where(
+                node_mask, cluster_ids,
+                torch.full_like(cluster_ids, -1),
+            )
 
         return cluster_ids, cluster_features
 
@@ -310,6 +440,8 @@ class CoarseToFineWrapper(nn.Module):
         self.coarse_n_layers = int(_g("coarse_n_layers", 2))
         self.coarse_n_heads = int(_g("coarse_n_heads", 4))
         self.gene_proj_dim = int(_g("gene_proj_dim", 128))
+        self.cluster_mode = str(_g("cluster_mode", "kmeans")).lower()
+        self.gumbel_tau = float(_g("gumbel_tau", 1.0))
 
         gene_in = int(input_dims["node_features_dimensions"])
 
@@ -318,6 +450,8 @@ class CoarseToFineWrapper(nn.Module):
             proj_dim=self.gene_proj_dim,
             n_clusters=self.n_clusters,
             kmeans_n_iters=self.kmeans_n_iters,
+            cluster_mode=self.cluster_mode,
+            gumbel_tau=self.gumbel_tau,
         )
 
         self.coarse_regressor = CoarseRegressor(
@@ -589,12 +723,16 @@ class HierarchicalCoarseToFineWrapper(nn.Module):
         coarse_layers = int(_g(c2f_cfg, "coarse_n_layers", 2))
         coarse_heads = int(_g(c2f_cfg, "coarse_n_heads", 4))
         gene_proj_dim = int(_g(c2f_cfg, "gene_proj_dim", 128))
+        self.cluster_mode = str(_g(c2f_cfg, "cluster_mode", "kmeans")).lower()
+        self.gumbel_tau = float(_g(c2f_cfg, "gumbel_tau", 1.0))
 
         self.cluster_module = GeneClusterModule(
             gene_input_dim=gene_in,
             proj_dim=gene_proj_dim,
             n_clusters=self.n_clusters,
             kmeans_n_iters=self.kmeans_n_iters,
+            cluster_mode=self.cluster_mode,
+            gumbel_tau=self.gumbel_tau,
         )
         self.coarse_regressor = CoarseRegressor(
             cluster_feature_dim=gene_proj_dim,

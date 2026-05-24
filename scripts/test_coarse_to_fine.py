@@ -49,39 +49,91 @@ from models.coarse_to_fine import (  # noqa: E402
 
 
 def test_gene_clustering() -> None:
-    """Cluster IDs are in [0, K) for real cells, -1 for masked."""
+    """Cluster IDs are in [0, K) for real cells, -1 for masked.
+    Tests both 'kmeans' (default) and 'gumbel' modes."""
     torch.manual_seed(0)
     B, N, F = 2, 64, 16
     K = 8
 
+    for mode in ("kmeans", "gumbel"):
+        module = GeneClusterModule(
+            gene_input_dim=F,
+            proj_dim=32,
+            n_clusters=K,
+            kmeans_n_iters=5,
+            cluster_mode=mode,
+            gumbel_tau=1.0,
+        ).eval()
+
+        node_features = torch.randn(B, N, F)
+        node_mask = torch.ones(B, N, dtype=torch.bool)
+        node_mask[0, 50:] = False
+
+        cluster_ids, cluster_features = module(node_features, node_mask)
+
+        if not (cluster_ids[0, 50:] == -1).all():
+            raise AssertionError(
+                f"[{mode}] Masked cells must get cluster_id=-1."
+            )
+        for b in range(B):
+            real = cluster_ids[b][node_mask[b]]
+            if not (real >= 0).all() or not (real < K).all():
+                raise AssertionError(
+                    f"[{mode}] Slice {b}: cluster ids out of [0, {K})."
+                )
+        if cluster_features.shape != (B, K, 32):
+            raise AssertionError(
+                f"[{mode}] Cluster features shape mismatch: got "
+                f"{tuple(cluster_features.shape)}, expected ({B}, {K}, 32)."
+            )
+        print(f"[gene-clustering/{mode}]  cluster_ids ∈ [0, {K}) ✓  "
+              f"cluster_features {tuple(cluster_features.shape)} ✓")
+    print("[gene-clustering]  PASS\n")
+
+
+def test_gumbel_gradient_flow() -> None:
+    """In Gumbel mode, gradients MUST reach the cluster_head (which
+    is dead in k-means mode). This is the whole point of the
+    soft-clustering option."""
+    torch.manual_seed(0)
+    B, N, F_in = 2, 32, 16
+    K = 8
+
     module = GeneClusterModule(
-        gene_input_dim=F,
+        gene_input_dim=F_in,
         proj_dim=32,
         n_clusters=K,
-        kmeans_n_iters=5,
-    ).eval()
+        cluster_mode="gumbel",
+        gumbel_tau=1.0,
+    ).train()
 
-    node_features = torch.randn(B, N, F)
+    node_features = torch.randn(B, N, F_in, requires_grad=True)
     node_mask = torch.ones(B, N, dtype=torch.bool)
-    node_mask[0, 50:] = False
 
-    cluster_ids, cluster_features = module(node_features, node_mask)
+    _, cluster_features = module(node_features, node_mask)
+    loss = cluster_features.pow(2).mean()
+    loss.backward()
 
-    if not (cluster_ids[0, 50:] == -1).all():
-        raise AssertionError("Masked cells must get cluster_id=-1.")
-    for b in range(B):
-        real = cluster_ids[b][node_mask[b]]
-        if not (real >= 0).all() or not (real < K).all():
-            raise AssertionError(
-                f"Slice {b}: cluster ids out of [0, {K})."
-            )
-    if cluster_features.shape != (B, K, 32):
+    head_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in module.cluster_head.parameters()
+    )
+    proj_has_grad = any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in module.gene_proj.parameters()
+    )
+    if not head_has_grad:
         raise AssertionError(
-            f"Cluster features shape mismatch: got {tuple(cluster_features.shape)}, "
-            f"expected ({B}, {K}, 32)."
+            "Gumbel mode: cluster_head received zero gradient. "
+            "Likely the straight-through Gumbel-softmax isn't routing "
+            "gradients (check F.gumbel_softmax hard=True call)."
         )
-    print(f"[gene-clustering]  cluster_ids ∈ [0, {K}) ✓  cluster_features {tuple(cluster_features.shape)} ✓")
-    print("[gene-clustering]  PASS\n")
+    if not proj_has_grad:
+        raise AssertionError(
+            "Gumbel mode: gene_proj received zero gradient — wrapper bug."
+        )
+    print("[gumbel-grad]  cluster_head ✓  gene_proj ✓")
+    print("[gumbel-grad]  PASS\n")
 
 
 def test_coarse_regressor() -> None:
@@ -397,6 +449,7 @@ def test_combined_gradient_flow() -> None:
 
 def main() -> int:
     test_gene_clustering()
+    test_gumbel_gradient_flow()
     test_coarse_regressor()
     test_wrapper_contract()
     test_gradient_flow()

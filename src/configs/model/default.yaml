@@ -490,7 +490,33 @@ coarse_to_fine:
     n_clusters: 16
     # Number of k-means iterations per forward pass. 10 is more than
     # enough for K=16 — convergence is usually <5 iters.
+    # Only consulted when ``cluster_mode == "kmeans"``.
     kmeans_n_iters: 10
+    # Cluster assignment method.
+    # - "kmeans" — hard k-means on the projected gene embeddings,
+    #              recomputed per forward. Non-differentiable; gradients
+    #              flow into ``gene_proj`` only through the per-cluster
+    #              aggregation, not the cluster boundary itself.
+    # - "gumbel" — a learnable ``cluster_head`` predicts soft logits per
+    #              cell, then Gumbel-softmax with ``hard=True`` produces
+    #              a one-hot assignment (matches k-means semantics for
+    #              downstream code) BUT the straight-through estimator
+    #              routes gradients through the soft weights back into
+    #              the cluster head + ``gene_proj``. The result is that
+    #              cluster boundaries co-adapt with the downstream
+    #              spatial-prediction loss instead of being fixed by
+    #              gene-space K-means.
+    #
+    # Default kmeans for byte-equivalence with prior runs. Turn on
+    # gumbel via ``--override model.coarse_to_fine.cluster_mode=gumbel``.
+    cluster_mode: "kmeans"
+    # Gumbel-softmax temperature. Only consulted when
+    # ``cluster_mode == "gumbel"``. Lower = more peaked / decisive
+    # logits but harder optimisation; higher = smoother gradient
+    # signal. 1.0 is the canonical Gumbel-softmax default. Constant
+    # for now; annealing would be a natural follow-up if convergence
+    # is slow.
+    gumbel_tau: 1.0
     # Hidden width of the coarse regressor's transformer.
     coarse_hidden_dim: 128
     # Coarse regressor depth (transformer encoder layers).
