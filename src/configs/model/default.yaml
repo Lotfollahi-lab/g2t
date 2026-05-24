@@ -204,6 +204,59 @@ loss:
         # whatever `frequency` gives you. Default on (pure win).
         cache_true: true
 
+    # Sinkhorn-regularized optimal-transport divergence between
+    # predicted and true cell point clouds (per slice).
+    #
+    # The pairwise-distance MSE already in this stack averages over
+    # all N² cell-pair distances — it sees "the network has roughly
+    # the right distances on average" but is BLIND to which cells are
+    # in the wrong places. Sinkhorn divergence (Feydy et al. 2019)
+    # computes the entropic OT cost between the two clouds: it
+    # explicitly matches predicted cells to true cells via an optimal
+    # transport plan, then sums the residual displacement under that
+    # plan. This catches the failure mode where pairwise distances
+    # are right "in distribution" but individual cells are
+    # mispositioned — exactly the failure mode pairwise MSE smears
+    # away.
+    #
+    # Used here as a SECONDARY loss component, weighted small
+    # (~0.1 × pairwise_distance_mse) so it acts as a regulariser
+    # rather than fighting the pairwise term for dominance. Combined
+    # interpretation: pairwise MSE pins the global pairwise structure,
+    # Sinkhorn enforces correct cell placement WITHIN that structure.
+    #
+    # Implementation: thin wrapper over geomloss.SamplesLoss with
+    # ``loss="sinkhorn"``, which returns the DEBIASED Sinkhorn
+    # divergence S_ε(α, β) = L_ε(α, β) − ½(L_ε(α, α) + L_ε(β, β)).
+    # Debiasing makes it ZERO when the clouds match (no bias from
+    # the entropic regularizer) and gradient-friendly.
+    #
+    # Dependency: ``pip install geomloss`` (already in scgg env).
+    # Auto-uses KeOps backend if installed for ~10× speedup on
+    # large clouds.
+    sinkhorn:
+        enabled: false
+        weight: 0.1       # regulariser scale; co-magnitude with pairwise MSE at ~0.1
+        # blur: entropic regularisation strength. Smaller = closer
+        # to exact Wasserstein but slower convergence + possible
+        # NaNs. 0.01 is right for our normalised position scale
+        # ([-0.5, 0.5] cube). Bump to 0.05 if you see NaN loss.
+        blur: 0.01
+        # scaling: epsilon-annealing factor across Sinkhorn iterations.
+        # 0.5 = fast / coarse; 0.99 = slow / precise. 0.9 is the
+        # standard quality/speed compromise.
+        scaling: 0.9
+        # p: Wasserstein-p exponent. 2 = L² cost (matches our pairwise
+        # MSE convention); 1 = L¹ cost (sometimes more robust to
+        # outliers). Stick with 2 unless ablating.
+        p: 2
+        # subsample: null = use all cells per slice. Sinkhorn is O(N)
+        # memory + O(N·iters) compute via online Sinkhorn / multiscale,
+        # so cortex's ~7500 cells per slice is fine. Cap to e.g. 2000
+        # if you stack this with PH/kNN-rank and need the wall-clock
+        # back.
+        subsample: null
+
 # ---------------------------------------------------------------------------
 # EGNN backbone hyperparameters. Only consulted when `backbone: "egnn"`.
 #

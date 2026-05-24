@@ -137,6 +137,26 @@ class LossFunction(nn.Module):
                 f"1-dim needs the alpha complex (gudhi) — TODO."
             )
 
+        # Sinkhorn / OT divergence loss component.
+        self._sk_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                         "sinkhorn", "enabled",
+                                         default=False))
+        self._sk_weight = float(_cfg_get(cfg, "model", "loss",
+                                         "sinkhorn", "weight", default=0.1))
+        self._sk_blur = float(_cfg_get(cfg, "model", "loss",
+                                       "sinkhorn", "blur", default=0.01))
+        self._sk_scaling = float(_cfg_get(cfg, "model", "loss",
+                                          "sinkhorn", "scaling", default=0.9))
+        self._sk_p = int(_cfg_get(cfg, "model", "loss",
+                                  "sinkhorn", "p", default=2))
+        sk_sub = _cfg_get(cfg, "model", "loss", "sinkhorn", "subsample",
+                          default=None)
+        self._sk_subsample = int(sk_sub) if sk_sub else None
+        # Lazy-init: only build the SamplesLoss object on first call,
+        # so users who never enable the component never pay the
+        # geomloss import cost.
+        self._sk_loss_fn = None
+
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
         # ``compute_loss`` iterates this list — adding a new component
@@ -148,6 +168,8 @@ class LossFunction(nn.Module):
              self._compute_knn_rank),
             ("persistent_homology", self._ph_enabled, self._ph_weight,
              self._compute_persistent_homology),
+            ("sinkhorn", self._sk_enabled, self._sk_weight,
+             self._compute_sinkhorn),
         ]
 
         # One-time summary so the train.log shows what's active.
@@ -168,6 +190,13 @@ class LossFunction(nn.Module):
                     extra += ", cache_true=on"
                 if self._ph_subsample:
                     extra += f", subsample={self._ph_subsample}"
+            elif name == "sinkhorn":
+                extra = (
+                    f", p={self._sk_p}, blur={self._sk_blur:.3g}, "
+                    f"scaling={self._sk_scaling:.3g}"
+                )
+                if self._sk_subsample:
+                    extra += f", subsample={self._sk_subsample}"
             active.append(f"{name}(w={w:.3g}{extra})")
         print(f"[LossFunction] active components: {', '.join(active) or '(none!)'}")
 
@@ -420,6 +449,99 @@ class LossFunction(nn.Module):
 
         if not slice_losses:
             return _zero()
+        return torch.mean(torch.stack(slice_losses))
+
+    def _compute_sinkhorn(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Sinkhorn-regularized OT divergence between predicted and true
+        cell point clouds.
+
+        Computes the *debiased* Sinkhorn divergence
+        ``S_ε(α, β) = L_ε(α, β) − ½(L_ε(α, α) + L_ε(β, β))``
+        between the two N-cell clouds per slice, then averages across
+        slices. Debiasing makes ``S_ε`` zero when the clouds are equal
+        (the entropic-regularizer bias cancels out), so the loss
+        landscape behaves like vanilla Wasserstein near optimum.
+
+        Complementary to ``_compute_pairwise_distance_mse``:
+          * pairwise MSE matches the *distribution of pair distances*
+            but is blind to which cell is where (a permutation of the
+            cells with the same pairwise structure gets zero loss);
+          * Sinkhorn matches the *cells themselves* via an optimal
+            transport plan — penalises individual cell misplacement
+            within an otherwise-correct overall structure.
+
+        With weight ~0.1× the pairwise term it acts as a regulariser:
+        pairwise pins global structure, Sinkhorn pins placement.
+
+        Implementation: lazy-imports ``geomloss.SamplesLoss``. Each
+        slice is processed independently because slices have different
+        cell counts (geomloss SamplesLoss supports batched dispatch
+        only when all clouds in the batch share an ``N``).
+
+        Gradient: flows through ``pred_pos`` via SamplesLoss's
+        differentiable implementation (Feydy et al. 2019). ``true_pos``
+        is treated as the target; geomloss handles it as a non-leaf
+        constant.
+        """
+        if self._sk_loss_fn is None:
+            try:
+                from geomloss import SamplesLoss
+            except ImportError as e:
+                raise ImportError(
+                    "model.loss.sinkhorn.enabled=true requires the "
+                    "geomloss package. Install via `pip install geomloss` "
+                    "(installs KeOps too — recommended for GPU speed). "
+                    f"Underlying error: {e}"
+                )
+            # Cached for the lifetime of the LossFunction. The object
+            # is stateless (it's just a callable wrapper around the
+            # Sinkhorn iteration scheme), so reuse across batches is
+            # fine.
+            self._sk_loss_fn = SamplesLoss(
+                loss="sinkhorn",
+                p=self._sk_p,
+                blur=self._sk_blur,
+                scaling=self._sk_scaling,
+                backend="auto",   # KeOps if installed, else tensorized PyTorch
+                debias=True,      # always — see docstring
+            )
+
+        slice_losses: List[torch.Tensor] = []
+        for true_pos, pred_pos, mask in zip(
+            masked_true.positions, masked_pred.positions, masked_true.node_mask,
+        ):
+            true_real = true_pos[mask]          # (n, 2), gradient-free target
+            pred_real = pred_pos[mask]          # (n, 2), gradient-bearing
+            n = true_real.shape[0]
+            # Sinkhorn needs at least a couple of points to define a
+            # non-degenerate transport plan; skip pathological tiny
+            # slices the same way the other components do.
+            if n < 4:
+                continue
+
+            # Optional subsampling for very large slices. The
+            # subsample indices MUST be the same for true and pred,
+            # otherwise we'd be comparing different cell subsets and
+            # the loss becomes a distribution comparison rather than
+            # an alignment comparison.
+            if self._sk_subsample is not None and n > self._sk_subsample:
+                with torch.no_grad():
+                    idx = torch.randperm(n, device=true_real.device)[:self._sk_subsample]
+                true_real = true_real[idx]
+                pred_real = pred_real[idx]
+
+            # SamplesLoss(x, y) with x, y of shape (N, D) returns a
+            # 0-dim tensor — the divergence between the two clouds
+            # under uniform weights. Gradient flows back through x.
+            slice_losses.append(self._sk_loss_fn(pred_real, true_real))
+
+        if not slice_losses:
+            zero = (masked_pred.positions[0].sum() * 0.0
+                    if len(masked_pred.positions) > 0
+                    else torch.tensor(0.0))
+            return zero
         return torch.mean(torch.stack(slice_losses))
 
     # ----------------------------- aggregation ----------------------------
