@@ -1073,7 +1073,15 @@ def run_benchmark(
         f"general.name={run_name}",
         f"general.seed={seed}",
         f"general.wandb={wandb_mode}",
-        f"general.wandb_project={wandb_project or 'luna'}",
+        # Hydra '+' prefix: append-or-update. ``wandb_project`` is NOT
+        # declared in LUNA's upstream ``general`` config — it's a
+        # scgg-runner-side patch (see scripts/_luna_runner.py docstring,
+        # ``_patch_setup_wandb``). Without ``+``, Hydra's struct mode
+        # rejects this override with ConfigAttributeError ("Key
+        # 'wandb_project' is not in struct"). The ``+`` syntax adds
+        # the key on the fly and is harmless if a future LUNA version
+        # ever declares it upstream.
+        f"+general.wandb_project={wandb_project or 'luna'}",
         f"dataset.train_data_path={_h(train_csv.resolve())}",
         f"dataset.test_data_path={_h(test_csv.resolve())}",
         "dataset.gene_columns_start=0",

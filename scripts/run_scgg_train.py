@@ -1104,7 +1104,13 @@ def run_benchmark(
         f"general.name={run_name}",
         f"general.seed={seed}",
         f"general.wandb={wandb_mode}",
-        f"general.wandb_project={wandb_project or 'scgg'}",
+        # Hydra '+' prefix: append-or-update. ``wandb_project`` is a
+        # runner-side patch (see scripts/_luna_runner.py docstring),
+        # not declared in the upstream LUNA ``general`` config schema.
+        # The scgg-vendored config happens to declare it today, but
+        # using ``+`` is strictly safer (works regardless) and
+        # matches the LUNA-side runner's fix.
+        f"+general.wandb_project={wandb_project or 'scgg'}",
         f"dataset.train_data_path={_h(train_csv.resolve())}",
         f"dataset.test_data_path={_h(test_csv.resolve())}",
         "dataset.gene_columns_start=0",
