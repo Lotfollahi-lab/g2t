@@ -131,11 +131,13 @@ class EDMOutputWrapper(nn.Module):
         inner_out_dim: int,
         embed_dim: int = 8,
         mds_align: bool = True,
+        anisotropic_gating: bool = False,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
         self.embed_dim = int(embed_dim)
         self.mds_align = bool(mds_align)
+        self.anisotropic_gating = bool(anisotropic_gating)
 
         # Projector: per-cell (inner-features + position) → embedding.
         # We concat positions to inner features so the head sees the
@@ -150,6 +152,23 @@ class EDMOutputWrapper(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, self.embed_dim),
         )
+
+        # Architectural extension #1 — anisotropic / Mahalanobis gating.
+        # Learnable (k, k) matrix W such that M = Wᵀ W is positive
+        # semi-definite by construction. Then:
+        #     D_ij = (h_i − h_j)ᵀ M (h_i − h_j) = ‖W (h_i − h_j)‖²
+        # Initialise W = I so the initial behaviour is byte-identical
+        # to the isotropic D = ‖h_i − h_j‖² (Mahalanobis with M = I).
+        # The optimizer is then free to deviate from identity if some
+        # embedding dimensions are more spatially-informative than
+        # others. See the config block for the full motivation.
+        if self.anisotropic_gating:
+            self.gating_W = nn.Parameter(torch.eye(self.embed_dim))
+        else:
+            # Register as None (not a Parameter) so state_dicts of
+            # anisotropic-off and anisotropic-on runs differ
+            # predictably (one has the key, the other doesn't).
+            self.gating_W = None
 
         # Propagate the c2f teacher-forcing marker through the wrapper
         # chain. The LightningModule's forward checks
@@ -176,13 +195,22 @@ class EDMOutputWrapper(nn.Module):
         mask = data.node_mask.to(h.dtype).unsqueeze(-1)
         h = h * mask                                # (B, N, k)
 
-        # Pairwise squared distances: D_ij = ‖h_i - h_j‖².
-        # cdist gives Euclidean distance; square it.
-        # cdist's gradient is well-defined except at d=0; padding is
-        # all zeros so d=0 for padding pairs — we zero those entries
-        # post-hoc which kills the bad gradient before backward.
+        # Pairwise squared distances:
+        #   isotropic case   (default): D_ij = ‖h_i − h_j‖²
+        #   anisotropic case (#1 flag): D_ij = ‖W (h_i − h_j)‖²
+        #                              = (h_i − h_j)ᵀ Wᵀ W (h_i − h_j)
+        # where M = Wᵀ W is the learned Mahalanobis kernel. Init W = I
+        # makes the anisotropic case start byte-identical to the
+        # isotropic one; the optimizer is free to deviate.
         diff = h.unsqueeze(2) - h.unsqueeze(1)     # (B, N, N, k)
-        D_sq = (diff * diff).sum(dim=-1)           # (B, N, N)
+        if self.gating_W is not None:
+            # Apply W to each diff vector: scaled[..., j] = sum_l W[j, l] diff[..., l]
+            # einsum is the cleanest way to express this batch-of-3D-arrays
+            # × (k, k) matrix contraction.
+            scaled = torch.einsum("bnmk,jk->bnmj", diff, self.gating_W)
+            D_sq = (scaled * scaled).sum(dim=-1)   # (B, N, N)
+        else:
+            D_sq = (diff * diff).sum(dim=-1)       # (B, N, N)
 
         # Mask padding rows/cols to zero (so they don't enter the loss).
         m1 = data.node_mask                        # (B, N)

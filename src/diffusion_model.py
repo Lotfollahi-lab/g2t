@@ -324,6 +324,34 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 output_dims=self.output_dims,
                 vn_cfg=getattr(cfg.model, "vn_transformer", None),
             )
+        elif backbone == "dit":
+            # Architectural extension #2 — DiT-style backbone.
+            # Per-cell tokens (gene + position) → adaLN-Zero time-
+            # conditioned transformer → (node_features, positions).
+            # Output contract matches LUNA Model so downstream
+            # wrappers (EDM, c2f, gene_recon) work unchanged.
+            from models.dit_backbone import DiTBackbone
+            self.model = DiTBackbone(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                dit_cfg=getattr(cfg.model, "dit", None),
+            )
+        elif backbone == "perceiver":
+            # Architectural extension #3 — Perceiver-IO style backbone.
+            # K learnable anchor tokens; cells↔anchors cross-attention
+            # replaces O(N²) cell-cell attention with O(N·K).
+            from models.perceiver_backbone import PerceiverBackbone
+            self.model = PerceiverBackbone(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                perceiver_cfg=getattr(cfg.model, "perceiver", None),
+            )
         elif backbone == "egnn":
             # Local import so the LUNA-baseline path (which doesn't
             # need EGNN's torch-geometric kNN code) keeps loading
@@ -353,8 +381,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
             )
         else:
             raise ValueError(
-                f"Unknown model.backbone={backbone!r}. "
-                f"Expected 'luna_transformer', 'egnn', or 'vn_transformer'."
+                f"Unknown model.backbone={backbone!r}. Expected "
+                f"'luna_transformer', 'egnn', 'vn_transformer', "
+                f"'dit', or 'perceiver'."
             )
 
         # ------------------------------------------------------------------
@@ -401,6 +430,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 inner_out_dim=inner_out_dim,
                 embed_dim=int(getattr(edm_cfg, "embed_dim", 8)),
                 mds_align=bool(getattr(edm_cfg, "mds_align", True)),
+                anisotropic_gating=bool(
+                    getattr(edm_cfg, "anisotropic_gating", False)
+                ),
             )
 
         if knn_graph_enabled:
@@ -465,13 +497,32 @@ class FullDenoisingDiffusion(pl.LightningModule):
         # sample_zs_from_zt_and_pred interface so the training step
         # and sampling loop are framework-agnostic.
         if framework == "flow_matching":
-            # Local import keeps the DDPM path import-cost identical
-            # for runs that don't opt into FM (parity with how the
-            # EGNN backbone is imported on demand above).
-            from utils.diffusion_model.diffusion.flow_matching_model import (
-                FlowMatchingModel,
+            # Architectural extension #4 — True EDM diffusion (FM in
+            # the k-D embedding space). When BOTH edm.enabled=true
+            # AND edm.diffuse_in_embed_space=true, we route through
+            # EDMFlowMatchingModel instead of FlowMatchingModel. The
+            # interface is identical so the rest of the framework
+            # machinery is unchanged; only the noise application and
+            # FM Euler step are reinterpreted in h-space.
+            _edm_cfg_fm = getattr(cfg.model, "edm", None)
+            _edm_hspace = (
+                _edm_cfg_fm is not None
+                and bool(getattr(_edm_cfg_fm, "enabled", False))
+                and bool(getattr(_edm_cfg_fm, "diffuse_in_embed_space", False))
             )
-            self.noise_model = FlowMatchingModel(cfg)
+            if _edm_hspace:
+                from utils.diffusion_model.diffusion.edm_fm_model import (
+                    EDMFlowMatchingModel,
+                )
+                self.noise_model = EDMFlowMatchingModel(cfg)
+            else:
+                # Local import keeps the DDPM path import-cost identical
+                # for runs that don't opt into FM (parity with how the
+                # EGNN backbone is imported on demand above).
+                from utils.diffusion_model.diffusion.flow_matching_model import (
+                    FlowMatchingModel,
+                )
+                self.noise_model = FlowMatchingModel(cfg)
         elif framework == "regression":
             # Direct supervised regression — no noise, no iterative
             # sampling. See module docstring of regression_predictor.
@@ -490,12 +541,23 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 EnergyPredictor,
             )
             self.noise_model = EnergyPredictor(cfg)
+        elif framework == "latent_diffusion":
+            # Architectural extension #5: Stable-Diffusion-style
+            # latent diffusion model. Scaffold only — raises a clear
+            # NotImplementedError on instantiation. Real implementation
+            # needs a tissue-level VAE + two-phase training + latent-
+            # space sampling, which is multi-session work.
+            from utils.diffusion_model.diffusion.latent_diffusion_model import (
+                LatentDiffusionModel,
+            )
+            self.noise_model = LatentDiffusionModel(cfg)
         elif framework == "diffusion":
             self.noise_model = NoiseModel(cfg)
         else:
             raise ValueError(
-                f"Unknown model.framework={framework!r}. "
-                f"Expected 'diffusion', 'flow_matching', 'regression', or 'energy'."
+                f"Unknown model.framework={framework!r}. Expected "
+                f"'diffusion', 'flow_matching', 'regression', 'energy', "
+                f"or 'latent_diffusion'."
             )
 
     def on_train_epoch_start(self) -> None:

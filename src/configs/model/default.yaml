@@ -749,6 +749,44 @@ edm:
     # acts as a pure auxiliary loss). Default true: the canonical
     # frame is the whole point.
     mds_align: true
+    # ---- Architectural extension #1 — bilinear / anisotropic gating ----
+    # When true, the EDM head computes a learned Mahalanobis-style
+    # distance D_ij = (h_i − h_j)^T M (h_i − h_j) with M = W^T W
+    # (positive semi-definite by construction, k×k learnable). W is
+    # initialised to the identity matrix so initial behaviour is
+    # byte-identical to the current isotropic D = ‖h_i − h_j‖²; the
+    # optimizer then deviates from identity if anisotropic weighting
+    # helps.
+    #
+    # Why: with isotropic D, every embedding dimension contributes
+    # equally to spatial distance. For cells, not every gene-derived
+    # feature is equally informative about position (a neuron-type
+    # marker is more spatially-relevant than a housekeeping gene).
+    # Anisotropic gating lets the model express "these embedding
+    # dimensions predict position, those don't" without growing the
+    # embedding dimension itself.
+    #
+    # Cost: tiny — a single (k, k) parameter tensor. k=8 default =
+    # 64 extra weights. No effect on inference latency.
+    anisotropic_gating: false
+    # ---- Architectural extension #4 — True EDM diffusion ----
+    # When true, the FM trajectory operates in the k-D embedding
+    # space (not in 2D position space): h_t = (1−t)·h_0 + t·noise
+    # with h_0 the classical-MDS embedding of true positions into k
+    # dimensions, and the inner Model trained to denoise h_0 from h_t
+    # at each step. Final MDS at sample-end recovers 2D positions.
+    #
+    # Differs from the current setup (FM in 2D position space, EDM
+    # head as output projection) by operating in the embedding space
+    # *throughout* the trajectory rather than only at the output. The
+    # "true diffusion on the EDM manifold" pitch from the May
+    # ablation menu.
+    #
+    # Requires ``framework=flow_matching`` (we only support FM-on-h
+    # for this flag, not DDPM-on-h). The mds_align step at inference
+    # is still active and operates on D = ‖h_0_i − h_0_j‖²
+    # at the end of the reverse trajectory.
+    diffuse_in_embed_space: false
 
 # ---------------------------------------------------------------------------
 # scGG fundamental method #4: k-NN graph generation output head.
@@ -907,6 +945,109 @@ energy:
     n_langevin_steps_per_level: 100
     # Langevin step size (η in x ← x − η·∇E + √(2η)·ξ).
     step_size: 0.01
+
+# ---------------------------------------------------------------------------
+# Architectural extension #2 — DiT-style backbone
+# (Peebles & Xie 2022, "Scalable Diffusion Models with Transformers")
+#
+# Selected via ``backbone: "dit"`` (alongside luna_transformer / egnn /
+# vn_transformer). Replaces LUNA's 3-stream attention with a standard
+# transformer over per-cell tokens, plus adaLN-Zero time conditioning
+# (each block learns six modulation vectors — scale/shift/gate × MSA/MLP
+# — from the time embedding; gates init to 0 so each block starts as
+# identity).
+#
+# Why it might win on top of EDM-FM: DiT is the SoTA for image
+# diffusion (consistently +5-10% over U-Net baselines). adaLN-Zero is
+# specifically designed for FM/diffusion time conditioning. EDM head
+# composes cleanly: DiT produces per-cell features, EDM head projects
+# to embedding for distance prediction.
+# ---------------------------------------------------------------------------
+dit:
+    # Per-token hidden width. 256 matches LUNA's hidden_dims.dx so the
+    # parameter budget is roughly comparable.
+    hidden_dim: 256
+    # Number of DiT blocks. 8 matches model.n_layers above.
+    n_layers: 8
+    # Attention heads. Standard DiT uses hidden_dim/64 (so 4 for 256).
+    # We use 8 to match LUNA's 16-head config more closely (compromise
+    # between LUNA's heavy attention and DiT's lighter).
+    n_heads: 8
+    # FFN expansion factor. Standard DiT uses 4x; we use 4 too.
+    mlp_ratio: 4
+    # Time embedding width (sinusoidal embedding dim, projected to
+    # hidden_dim for adaLN-Zero conditioning).
+    time_embed_dim: 256
+
+# ---------------------------------------------------------------------------
+# Architectural extension #3 — Perceiver-style backbone
+# (Jaegle et al. 2021, "Perceiver IO: A General Architecture for
+# Structured Inputs & Outputs")
+#
+# Selected via ``backbone: "perceiver"``. Drops cell-cell attention's
+# O(N²) cost by routing all interactions through K << N learnable
+# "anchor" tokens: cells → anchors via cross-attention (anchors absorb
+# tissue context), anchors → anchors via self-attention (K² is tiny),
+# anchors → cells via cross-attention (cells read back). Anchors act
+# like learned global features any cell can reference.
+#
+# Beyond the compute saving (~100× cheaper attention for cortex's
+# ~7k cells), the anchor bottleneck is implicit regularisation — the
+# model has to summarise tissue context through K dimensions, which
+# is exactly the "less overfitting on 6 slices" inductive bias EDM
+# already provides at the output side.
+# ---------------------------------------------------------------------------
+perceiver:
+    # Number of anchor (latent) tokens. 32 is the Perceiver-IO default
+    # for moderately-sized inputs; bump to 64 if cortex-scale slices
+    # are under-summarised.
+    n_anchors: 32
+    # Hidden width of anchor tokens.
+    anchor_dim: 256
+    # Hidden width of cell tokens (input/output).
+    cell_dim: 256
+    # Number of anchor↔anchor self-attention blocks between the
+    # cells→anchors and anchors→cells cross-attention layers.
+    n_anchor_blocks: 6
+    # Attention heads (used for cross- and self-attention alike).
+    n_heads: 8
+    # FFN expansion factor in the anchor self-attention blocks.
+    mlp_ratio: 4
+    # Time embedding width — fed into the anchor stream via adaLN
+    # (same primitive as the DiT backbone uses).
+    time_embed_dim: 256
+
+# ---------------------------------------------------------------------------
+# Architectural extension #5 (scaffold) — Latent Diffusion
+# (Rombach et al. 2022, "High-Resolution Image Synthesis with Latent
+# Diffusion Models" — the Stable Diffusion architecture)
+#
+# Status: CONFIG SCAFFOLD ONLY in this revision. Selecting
+# ``framework: "latent_diffusion"`` raises a clear
+# NotImplementedError. A working LDM for scgg needs:
+#   1. A tissue-level VAE that encodes (gene_expression, positions)
+#      → z ∈ R^d (one latent per slice OR one latent per cell);
+#   2. Two-phase training (train VAE first, freeze; then diffuse in
+#      latent space);
+#   3. Decoder that recovers per-cell positions from the latent.
+#
+# This is ~1-2 weeks of careful design + implementation work — the
+# VAE's compression has to preserve enough positional structure that
+# the diffusion model can reconstruct it. Scaffold + follow-up task
+# rather than trying to crash a full implementation into this pass.
+# ---------------------------------------------------------------------------
+latent_diffusion:
+    # Latent dimensionality. 64-256 typical for image LDM; for
+    # tissue-level latent the right number depends heavily on what
+    # the VAE actually compresses (per-cell features vs whole-slice
+    # summary). Placeholder default until the VAE is built.
+    latent_dim: 128
+    # VAE-side knobs (placeholders).
+    vae_hidden_dim: 256
+    vae_n_layers: 4
+    # Diffusion-side knobs (placeholders).
+    n_diffusion_steps: 50
+    epsilon_t: 1.0e-3
 
 # ---------------------------------------------------------------------------
 # Self-conditioning for FM (Chen et al. 2023 trick).
