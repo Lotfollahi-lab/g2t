@@ -61,7 +61,14 @@ augment_reflection: false # if true, also flip x-axis with p=0.5 (full O(2)
 # (decay over ~1k steps, "fast" EMA), 0.9999 (decay over ~10k
 # steps, "slow" EMA — only use for long runs).
 # ---------------------------------------------------------------------------
-ema_decay: 0.0            # 0 disables the EMA callback entirely
+# DEFAULT FLIPPED 2026-05-25 from 0.0 to 0.95. EMA at decay 0.95
+# (~14-step half-life across cortex's ~6000 total steps) was a
+# consistent positive on top of every other ablation, including
+# EDM-FM (the new default model framework). It composes orthogonally
+# with EDM and adds no parameters. Pass
+# ``--override train.ema_decay=0.0`` to disable EMA (e.g. for byte-
+# equivalence with the original LUNA baseline).
+ema_decay: 0.95           # 0 disables the EMA callback entirely
 ema_every_n_steps: 1      # update EMA every N optimizer steps; >1 saves a
                           # tiny bit of compute, almost never used
 

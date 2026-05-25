@@ -32,7 +32,12 @@
 #   sample_zs_from_zt_and_pred) so the Lightning class, training
 #   step, and sampling loop are framework-agnostic — the only branch
 #   point is which class fills `self.noise_model` at __init__.
-framework: "diffusion"
+# DEFAULT FLIPPED 2026-05-25 from "diffusion" to "flow_matching" after the
+# scgg_mmc_edm_fm series became the best-performing config — running EDM on
+# top of the FM trajectory was the winning combination on cortex and is now
+# the default starting point. Pass ``--override model.framework=diffusion``
+# to reproduce the original LUNA-style DDPM baseline.
+framework: "flow_matching"
 
 # Backbone architecture selector (independent of `framework`).
 # - "luna_transformer" — LUNA's original architecture: 3-stream
@@ -122,7 +127,16 @@ hidden_dims:
     dim_ffX: 256 # hidden dimension of the cellular features feedforward network in the transformer
     dim_ffy: 256 # hidden dimension of the diffusion time feedforward network in the transformer
     dd: 64 # hidden dimension of the MLP for positions
-    output_features_to_pos_dims: 4 # hidden dimension of the MLP for the output features to positions
+    # DEFAULT FLIPPED 2026-05-25 from 4 to 32. The 4-D bottleneck was a
+    # LUNA-side choice driven by the position-MLP's needs (it only needed
+    # enough channels to feed mlp_out_pos_norm); for EDM the same channel
+    # also feeds the projector that produces the per-cell relational
+    # embedding, and 4 was starving it. Widening to 32 (the
+    # ``scgg_mmc_edm_fm_outwidth32`` run) was the strongest single-knob
+    # win in the latest ablation sweep. Pass ``--override
+    # model.hidden_dims.output_features_to_pos_dims=4`` for LUNA-byte-
+    # equivalent baselining.
+    output_features_to_pos_dims: 32 # hidden dim of the MLP for the output features to positions
 
 # ---------------------------------------------------------------------------
 # Loss components (scgg ablation knobs).
@@ -700,7 +714,16 @@ gene_reconstruction:
 # Defaults OFF for byte-equivalence.
 # ---------------------------------------------------------------------------
 edm:
-    enabled: false
+    # DEFAULT FLIPPED 2026-05-25 from false to true. EDM (predict the
+    # pairwise distance matrix via per-cell relational embeddings, MDS
+    # to recover 2D positions) was the best-performing fundamental
+    # method change in the cortex ablation sweep — see scgg_mmc_edm_fm
+    # series. It composes naturally with flow_matching (the new default
+    # framework above) and with EMA 0.95 (the new default in
+    # configs/train/default.yaml). Pass ``--override
+    # model.edm.enabled=false`` to disable EDM and run plain LUNA-
+    # transformer position prediction.
+    enabled: true
     # Per-cell embedding dimension k for h_i ∈ R^k. Higher k = richer
     # relational manifold; MDS extracts the leading 2 PCs at inference
     # so the wrapper still emits 2D positions. 8 is a reasonable
