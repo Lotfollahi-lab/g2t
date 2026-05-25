@@ -62,9 +62,11 @@ import argparse
 import csv
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -83,8 +85,225 @@ logger = logging.getLogger("luna_train")
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Resource sampling helpers — used by ``_RuntimeTracker`` to track peak
+# GPU memory and process-tree RSS per phase. Both helpers are fail-soft:
+# they return ``None`` when the relevant tool isn't available
+# (``nvidia-smi`` missing → no GPU tracking; ``psutil`` missing → fall
+# back to ``resource.getrusage``), so the same tracker works on CPU
+# hosts, GPU hosts without psutil, and the novosparc venv.
+# ---------------------------------------------------------------------------
+
+
+def _sample_gpu_mib_via_nvidia_smi() -> Optional[float]:
+    """Sum of ``memory.used`` across CUDA-visible GPUs, in MiB.
+
+    Reads ``CUDA_VISIBLE_DEVICES`` to scope the report to the GPUs
+    this job actually has access to (multi-tenant nodes otherwise
+    report every physical GPU). Returns ``None`` when ``nvidia-smi``
+    isn't on PATH, fails, or produces unparseable output — i.e. on
+    CPU-only hosts this silently disables itself.
+
+    Note: nvidia-smi reports system-wide GPU usage, NOT per-process.
+    For dedicated GPU jobs (the usual setup) that's exactly the same
+    number; on shared GPUs this catches other tenants too, which is
+    arguably what you want for a "memory we have to coexist with"
+    peak.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    per_gpu: Dict[int, float] = {}
+    for line in result.stdout.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            per_gpu[int(parts[0])] = float(parts[1])
+        except (ValueError, TypeError):
+            continue
+    if not per_gpu:
+        return None
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if vis:
+        try:
+            visible_idx = {int(x) for x in vis.split(",") if x.strip()}
+            filtered = {k: v for k, v in per_gpu.items() if k in visible_idx}
+            if filtered:
+                return sum(filtered.values())
+        except ValueError:
+            pass
+    # No CUDA_VISIBLE_DEVICES (or unparseable) — return total of all
+    # physical GPUs. Whoever reads the CSV can decide whether that's
+    # the number they wanted.
+    return sum(per_gpu.values())
+
+
+def _get_gpu_name_and_count() -> Tuple[Optional[str], int]:
+    """Return ``(gpu_name, n_visible_gpus)`` from ``nvidia-smi``.
+
+    ``gpu_name`` is the first visible GPU's product name (e.g.
+    "NVIDIA H100 80GB HBM3"); for the usual dedicated-1-GPU job this
+    is the only one. ``n_visible_gpus`` is the count of GPUs in
+    ``CUDA_VISIBLE_DEVICES`` (or all physical GPUs if unset). Returns
+    ``(None, 0)`` when ``nvidia-smi`` isn't available — same fail-
+    soft pattern as the memory sampler.
+
+    Used by ``_RuntimeTracker.write_compute_requirements_csv`` to
+    stamp the compute_requirements.csv with hardware identity so a
+    paper table can show "LUNA on H100 used 18GB, scgg on H100 used
+    14GB" without needing the caller to know what host it landed on.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,name",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None, 0
+    if result.returncode != 0:
+        return None, 0
+    per_gpu: Dict[int, str] = {}
+    for line in result.stdout.splitlines():
+        # split with maxsplit=1 because some GPU names contain commas
+        # (e.g. "NVIDIA H100 80GB HBM3, MIG 1g.10gb"). Index is always
+        # the first comma-separated token.
+        parts = [x.strip() for x in line.split(",", 1)]
+        if len(parts) != 2:
+            continue
+        try:
+            per_gpu[int(parts[0])] = parts[1]
+        except (ValueError, TypeError):
+            continue
+    if not per_gpu:
+        return None, 0
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if vis:
+        try:
+            visible_idx = sorted(int(x) for x in vis.split(",") if x.strip())
+            visible_names = [per_gpu[i] for i in visible_idx if i in per_gpu]
+            if visible_names:
+                return visible_names[0], len(visible_names)
+        except ValueError:
+            pass
+    sorted_keys = sorted(per_gpu.keys())
+    return per_gpu[sorted_keys[0]], len(per_gpu)
+
+
+def _sample_rss_mib_total() -> Optional[float]:
+    """Process-tree RSS in MiB (this process + all descendants).
+
+    Captures subprocess RSS too — important because the bulk of the
+    work in ``run_luna_train.py`` / ``run_scgg_train.py`` happens
+    inside the ``_luna_runner.py`` subprocess, not the parent. Falls
+    back to ``resource.getrusage`` for the parent process only when
+    ``psutil`` isn't installed (in which case we lose the subprocess
+    coverage but still get a number).
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        try:
+            import resource
+            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # macOS reports ru_maxrss in bytes; Linux in KB.
+            if sys.platform == "darwin":
+                return r / (1024.0 * 1024.0)
+            return r / 1024.0
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        proc = psutil.Process()
+        total = proc.memory_info().rss
+        for child in proc.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # Child died between enumeration and read — fine,
+                # just skip it.
+                continue
+        return total / (1024.0 * 1024.0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class _ResourceSampler:
+    """Daemon thread that polls GPU + RSS at a fixed interval and
+    tracks the running peak per phase.
+
+    Started by ``_RuntimeTracker.start`` and stopped by
+    ``_RuntimeTracker.end``; not user-facing. Interval defaults to
+    2 s but is overridable via the ``RUNTIME_SAMPLE_S`` env var so
+    long-training-step workloads can poll less aggressively.
+    """
+
+    def __init__(self, interval_s: float = 2.0):
+        self.interval_s = float(interval_s)
+        self.peak_gpu_mib: Optional[float] = None
+        self.peak_rss_mib: Optional[float] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _sample(self) -> None:
+        gpu = _sample_gpu_mib_via_nvidia_smi()
+        rss = _sample_rss_mib_total()
+        if gpu is not None:
+            self.peak_gpu_mib = (
+                gpu if self.peak_gpu_mib is None else max(self.peak_gpu_mib, gpu)
+            )
+        if rss is not None:
+            self.peak_rss_mib = (
+                rss if self.peak_rss_mib is None else max(self.peak_rss_mib, rss)
+            )
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._sample()
+            except Exception:  # noqa: BLE001
+                # Never let a sampling glitch take down the training.
+                pass
+            if self._stop.wait(self.interval_s):
+                break
+
+    def start(self) -> None:
+        # Sample once up-front so phases shorter than ``interval_s``
+        # still have a data point.
+        try:
+            self._sample()
+        except Exception:  # noqa: BLE001
+            pass
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=self.interval_s + 1.0)
+        # One more sample after stopping, in case the peak hit between
+        # the last in-thread sample and `end()` being called.
+        try:
+            self._sample()
+        except Exception:  # noqa: BLE001
+            pass
+        self._thread = None
+
+
 class _RuntimeTracker:
-    """Records phase wall-clock durations and writes them to a CSV.
+    """Records phase wall-clock durations + peak GPU memory + peak RSS,
+    writes to a CSV.
 
     Use as::
 
@@ -101,34 +320,62 @@ class _RuntimeTracker:
 
         ...etc.
 
+    During each open phase, a background ``_ResourceSampler`` thread
+    polls GPU memory (via ``nvidia-smi``) and process-tree RSS (via
+    ``psutil``) every ``RUNTIME_SAMPLE_S`` seconds (default 2.0) and
+    tracks the running peak. The peak is recorded on the phase row at
+    ``end()``. Both columns are fail-soft: missing nvidia-smi → no
+    GPU column; missing psutil → fall back to ``resource.getrusage``
+    on the parent process only (loses subprocess RSS coverage).
+
     ``end()`` flushes the running CSV after each phase, so even if a
-    later phase crashes the CSV is up to date. The CSV always includes
-    a final ``total`` row so a glance at the last line tells you how
-    long the whole run took so far.
+    later phase crashes the CSV is up to date. The CSV always
+    includes a final ``total`` row aggregating across phases
+    (duration sum, peak as max).
     """
 
     def __init__(self):
         self.phases: List[Dict[str, object]] = []
         self.overall_t0 = time.time()
-        self._open: Dict[str, float] = {}
+        self._open: Dict[str, Tuple[float, "_ResourceSampler"]] = {}
+        try:
+            self._sample_interval_s = float(
+                os.environ.get("RUNTIME_SAMPLE_S", "2.0")
+            )
+        except (ValueError, TypeError):
+            self._sample_interval_s = 2.0
 
     def start(self, name: str) -> None:
-        self._open[name] = time.time()
+        sampler = _ResourceSampler(self._sample_interval_s)
+        sampler.start()
+        self._open[name] = (time.time(), sampler)
         logger.info(f"[runtime] start phase: {name}")
 
     def end(self, name: str, flush_to: Optional[Path] = None) -> None:
-        t0 = self._open.pop(name, None)
-        if t0 is None:
+        entry = self._open.pop(name, None)
+        if entry is None:
             logger.warning(f"[runtime] end({name!r}) called without a matching start; skipping")
             return
+        t0, sampler = entry
+        sampler.stop()
         t1 = time.time()
+        peak_gpu = sampler.peak_gpu_mib
+        peak_rss = sampler.peak_rss_mib
+        # Store as numeric when available, blank-string otherwise so
+        # the CSV reads cleanly in pandas (blank → NaN).
         self.phases.append({
             "phase": name,
             "start": datetime.fromtimestamp(t0).isoformat(timespec="seconds"),
             "end": datetime.fromtimestamp(t1).isoformat(timespec="seconds"),
             "duration_s": round(t1 - t0, 3),
+            "peak_gpu_mib": round(peak_gpu, 1) if peak_gpu is not None else "",
+            "peak_rss_mib": round(peak_rss, 1) if peak_rss is not None else "",
         })
-        logger.info(f"[runtime] end   phase: {name}  ({t1 - t0:.1f}s)")
+        gpu_str = f"  peak_gpu={peak_gpu:.0f}MiB" if peak_gpu is not None else ""
+        rss_str = f"  peak_rss={peak_rss:.0f}MiB" if peak_rss is not None else ""
+        logger.info(
+            f"[runtime] end   phase: {name}  ({t1 - t0:.1f}s){gpu_str}{rss_str}"
+        )
         if flush_to is not None:
             self.write_csv(flush_to)
 
@@ -143,17 +390,109 @@ class _RuntimeTracker:
         finally:
             self.end(name, flush_to=flush_to)
 
+    def peak_summary(self) -> Dict[str, Optional[float]]:
+        """Max GPU / RSS across all completed phases. Useful for
+        stamping the aggregate_metrics.json without re-parsing the
+        CSV.
+        """
+        gpu_vals = [r["peak_gpu_mib"] for r in self.phases
+                    if isinstance(r.get("peak_gpu_mib"), (int, float))]
+        rss_vals = [r["peak_rss_mib"] for r in self.phases
+                    if isinstance(r.get("peak_rss_mib"), (int, float))]
+        return {
+            "peak_gpu_mib": round(max(gpu_vals), 1) if gpu_vals else None,
+            "peak_rss_mib": round(max(rss_vals), 1) if rss_vals else None,
+        }
+
+    def write_compute_requirements_csv(
+        self,
+        out_path: Path,
+        *,
+        method: str,
+        run_timestamp: str,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> None:
+        """Write a single-row CSV summarising the run's compute cost.
+
+        Lives alongside ``runtime.csv`` (per-phase breakdown) and
+        ``metrics.csv`` (accuracy). Together the three give a
+        complete "what did this run cost vs. what did it achieve"
+        view; the compute_requirements.csv is the headline number for
+        the paper's "method X needs Y GB GPU" tables — one row, one
+        run, the resource columns reviewers care about.
+
+        Columns:
+          * ``method`` — "LUNA" / "scgg" / "novoSpaRc"
+          * ``run_timestamp`` — same wall-clock TS used in the
+            artifacts dir name
+          * ``host`` — hostname the run executed on
+          * ``gpu_name`` — product name of the first visible GPU, or
+            empty when no GPU
+          * ``n_gpus_visible`` — count of GPUs in CUDA_VISIBLE_DEVICES
+          * ``total_duration_s`` — wall-clock from tracker init to now
+          * ``peak_gpu_mib`` — max across phases, blank when no GPU
+          * ``peak_rss_mib`` — max across phases (process tree)
+
+        Pass ``extra`` to surface method-specific knobs (e.g.
+        ``{"atlas_size": 10000}`` for novosparc, ``{"batch_size": 6}``
+        for the training methods) as additional CSV columns.
+        """
+        import socket
+        peak = self.peak_summary()
+        gpu_name, n_gpus = _get_gpu_name_and_count()
+
+        row: Dict[str, object] = {
+            "method": method,
+            "run_timestamp": run_timestamp,
+            "host": socket.gethostname(),
+            "gpu_name": gpu_name or "",
+            "n_gpus_visible": n_gpus,
+            "total_duration_s": round(time.time() - self.overall_t0, 3),
+            "peak_gpu_mib": (
+                peak["peak_gpu_mib"]
+                if peak["peak_gpu_mib"] is not None else ""
+            ),
+            "peak_rss_mib": (
+                peak["peak_rss_mib"]
+                if peak["peak_rss_mib"] is not None else ""
+            ),
+        }
+        if extra:
+            for k, v in extra.items():
+                # Don't let caller-supplied extras silently overwrite
+                # the standard fields (rare but caller bugs happen).
+                if k in row:
+                    continue
+                row[k] = v
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            w.writeheader()
+            w.writerow(row)
+
     def write_csv(self, out_path: Path) -> None:
         rows = list(self.phases)
+        gpu_vals = [r["peak_gpu_mib"] for r in rows
+                    if isinstance(r.get("peak_gpu_mib"), (int, float))]
+        rss_vals = [r["peak_rss_mib"] for r in rows
+                    if isinstance(r.get("peak_rss_mib"), (int, float))]
         rows.append({
             "phase": "total",
             "start": datetime.fromtimestamp(self.overall_t0).isoformat(timespec="seconds"),
             "end": datetime.now().isoformat(timespec="seconds"),
             "duration_s": round(time.time() - self.overall_t0, 3),
+            # Peak across all phases — useful one-glance summary at
+            # the bottom of runtime.csv.
+            "peak_gpu_mib": round(max(gpu_vals), 1) if gpu_vals else "",
+            "peak_rss_mib": round(max(rss_vals), 1) if rss_vals else "",
         })
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["phase", "start", "end", "duration_s"])
+            w = csv.DictWriter(f, fieldnames=[
+                "phase", "start", "end", "duration_s",
+                "peak_gpu_mib", "peak_rss_mib",
+            ])
             w.writeheader()
             for r in rows:
                 w.writerow(r)
@@ -1215,6 +1554,17 @@ def run_benchmark(
             agg[f"{k}_min"] = float(np.min(vals))
             agg[f"{k}_max"] = float(np.max(vals))
 
+    # Resource cost: peak GPU memory + peak process-tree RSS across
+    # all phases. Surfaced here so the comparison-friendly numbers
+    # in aggregate_metrics.json / metrics.csv include resource usage
+    # alongside accuracy — lets a paper table show "LUNA vs scgg vs
+    # novosparc on Spearman AND VRAM" in one pass.
+    peak = tracker.peak_summary()
+    if peak["peak_gpu_mib"] is not None:
+        agg["peak_gpu_mib"] = peak["peak_gpu_mib"]
+    if peak["peak_rss_mib"] is not None:
+        agg["peak_rss_mib"] = peak["peak_rss_mib"]
+
     # metrics.csv : single-row aggregate. Same data as
     # aggregate_metrics.json, just in tabular form so you can
     # `pd.concat([...])` across many runs without parsing JSON.
@@ -1247,6 +1597,23 @@ def run_benchmark(
     }
     with open(out / "config.yaml", "w") as f:
         yaml.safe_dump(cfg_snap, f, sort_keys=False)
+
+    # compute_requirements.csv — single-row, paper-shape resource
+    # summary (host, GPU model, peak VRAM, peak RSS, total wall clock).
+    # Lives next to runtime.csv (per-phase) and metrics.csv (accuracy)
+    # so all three "what did this run cost / achieve" views are
+    # consumable side-by-side. Method-specific knobs surfaced via
+    # ``extra=`` show up as additional CSV columns for the table.
+    tracker.write_compute_requirements_csv(
+        out / "compute_requirements.csv",
+        method="LUNA",
+        run_timestamp=run_ts,
+        extra={
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "n_genes": n_genes,
+        },
+    )
     tracker.end("write_artifacts", flush_to=runtime_csv)
 
     logger.info(f"Wrote LUNA training artifacts to {out}")
