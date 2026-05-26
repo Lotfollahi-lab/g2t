@@ -21,6 +21,14 @@ DataHolder in → DataHolder out, with ``pred.node_features`` of width
 ``output_features_to_pos_dims`` (default 32 under the new defaults)
 and ``pred.positions`` of width 2.
 
+Attention path
+--------------
+Each block uses ``SDPAMultiheadAttention`` (see
+``models/sdpa_attention.py``) which routes explicitly through
+``F.scaled_dot_product_attention`` — FlashAttention-2 on Ampere+
+GPUs, memory-efficient kernel on older GPUs, math fallback on CPU.
+O(N²) compute but **O(N) memory** for the attention matrix.
+
 Why on top of EDM-FM
 --------------------
 The LUNA transformer's 3-stream attention has the gene / time /
@@ -41,6 +49,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.data.dataholder import DataHolder
+from models.sdpa_attention import SDPAMultiheadAttention
 
 
 # ---------------------------------------------------------------------------
@@ -140,15 +149,17 @@ class DiTBlock(nn.Module):
                 f"hidden_dim {hidden_dim} must be divisible by n_heads {n_heads}"
             )
 
-        # We use ``MultiheadAttention(batch_first=True)`` because PyTorch
-        # ≥ 2.0 routes that through the scaled-dot-product fused kernel
-        # (Flash Attention when available). batch_first means the input
-        # shape is (B, N, D) which matches our convention.
+        # ``SDPAMultiheadAttention`` routes EXPLICITLY through
+        # ``F.scaled_dot_product_attention`` (FlashAttention-2 on
+        # Ampere+, memory-efficient kernel on older GPUs, math
+        # fallback on CPU). Same forward signature as
+        # nn.MultiheadAttention(batch_first=True) but guaranteed not
+        # to silently fall back to the O(N²)-memory native path the
+        # way stock MHA can when its fast-path conditions aren't met.
         self.norm1 = nn.LayerNorm(self.hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.attn = nn.MultiheadAttention(
+        self.attn = SDPAMultiheadAttention(
             embed_dim=self.hidden_dim,
             num_heads=self.n_heads,
-            batch_first=True,
         )
         self.norm2 = nn.LayerNorm(self.hidden_dim, elementwise_affine=False, eps=1e-6)
         ff_hidden = int(self.hidden_dim * mlp_ratio)
@@ -180,18 +191,21 @@ class DiTBlock(nn.Module):
             x: (B, N, D) per-token features.
             c: (B, D)    conditioning vector (time embedding).
             key_padding_mask: (B, N) bool, ``True`` at PAD positions
-                (PyTorch's MultiheadAttention convention). Padding
-                positions don't contribute to attention weights but
-                their token slots are kept in the output (we zero
-                them via the input mask outside the block).
+                (PyTorch's MultiheadAttention convention — preserved
+                here so call sites work unchanged after the swap to
+                ``SDPAMultiheadAttention``). Padding positions don't
+                contribute to attention weights but their token slots
+                are kept in the output (we zero them via the input
+                mask outside the block).
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
         # MSA sub-layer.
         h = _modulate(self.norm1(x), shift_msa, scale_msa)
-        # MultiheadAttention with batch_first=True takes (B, N, D).
-        # key_padding_mask is (B, N) with True at PAD.
+        # SDPAMultiheadAttention takes (B, N, D) with batch_first
+        # baked in; key_padding_mask is (B, N) bool, True at PAD
+        # (same convention as nn.MultiheadAttention).
         attn_out, _ = self.attn(
             h, h, h,
             key_padding_mask=key_padding_mask,

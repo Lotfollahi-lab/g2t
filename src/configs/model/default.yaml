@@ -50,6 +50,22 @@ framework: "flow_matching"
 #   Satorras et al. 2021 message-passing update on relative vectors.
 #   Same input/output interface as the LUNA Model so it drops in
 #   under the same training/inference pipeline.
+# - "dit"              — DiT (Peebles & Xie 2022) with adaLN-Zero
+#   time conditioning. Dense softmax self-attention via SDPA /
+#   FlashAttention-2 (O(N²) compute, O(N) memory).
+# - "perceiver"        — Perceiver-IO style anchored attention with
+#   K learnable anchor tokens. O(N·K) compute via SDPA cross-
+#   attention; preserves all-to-all reachability through the
+#   anchor bottleneck. Good for very large N when K is small.
+# - "nystromformer"    — Nyström-approximated global self-attention
+#   (Xiong et al. 2021). Sub-quadratic O(N·M) cost via segment-mean
+#   landmark pooling + Moore-Penrose pseudo-inverse. Preserves
+#   true all-to-all reachability without imposing a sparsity
+#   pattern. Strongest theoretical guarantee among the sub-
+#   quadratic options here (Nyström decomposition is a low-rank
+#   factorisation that approaches exact softmax as M → N).
+#   Hybrid switch: at M = exact_until_n the layer falls through to
+#   exact SDPA, so small slices don't pay the Nyström overhead.
 backbone: "luna_transformer"
 
 n_layers: 8 # Number of transformer/EGNN layers
@@ -1099,6 +1115,52 @@ perceiver:
     # Time embedding width — fed into the anchor stream via adaLN
     # (same primitive as the DiT backbone uses).
     time_embed_dim: 256
+
+# ---------------------------------------------------------------------------
+# Nyströmformer backbone (Xiong et al. 2021).
+#
+# Selected via ``backbone: "nystromformer"``. Sub-quadratic global
+# self-attention with O(N · M) cost via the Nyström matrix
+# approximation:
+#
+#     A ≈ F · B^+ · G            where F, G, B are softmaxed sub-
+#                                 matrices computed against M
+#                                 segment-mean landmarks.
+#
+# Key knobs:
+#   * ``n_landmarks`` (M)        — sets the speed/quality trade.
+#                                  Larger M tightens the approximation
+#                                  (M → N gives exact softmax).
+#   * ``moore_penrose_iters``    — number of Schulz iterations for B^+.
+#                                  6 is the paper's default and gives
+#                                  3-iteration cubic convergence below
+#                                  the natural noise floor.
+#   * ``exact_until_n``          — hybrid switch: if a slice has N ≤
+#                                  this threshold, each layer falls
+#                                  through to exact SDPA instead of
+#                                  running Nyström. Same weights either
+#                                  way — the layer is just smarter
+#                                  about choosing the cheaper kernel.
+#                                  0 = always Nyström. Set to 16000
+#                                  for mixed-size datasets.
+# ---------------------------------------------------------------------------
+nystromformer:
+    hidden_dim: 256
+    n_heads: 8
+    mlp_ratio: 4
+    # n_layers: null → falls back to the global cfg.model.n_layers
+    # (8 by default). Override per-backbone if needed.
+    n_layers: 8
+    time_embed_dim: 256
+    # Nyström-specific:
+    n_landmarks: 64
+    moore_penrose_iters: 6
+    # 0 = always use Nyström approximation. Set to 16000 to opt
+    # into the hybrid switch (exact SDPA for small slices, Nyström
+    # for large). Use this when training on mixed-size datasets
+    # where some slices are small enough that N² is cheaper than
+    # N·M.
+    exact_until_n: 0
 
 # ---------------------------------------------------------------------------
 # Architectural extension #5 — Latent Diffusion

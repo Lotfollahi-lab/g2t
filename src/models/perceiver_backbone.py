@@ -41,6 +41,7 @@ from models.dit_backbone import (
     TimestepEmbedder,
     _modulate,
 )
+from models.sdpa_attention import SDPAMultiheadAttention
 
 
 # ---------------------------------------------------------------------------
@@ -72,16 +73,20 @@ class _CrossAttentionBlock(nn.Module):
         super().__init__()
         self.norm_q = nn.LayerNorm(q_dim)
         self.norm_kv = nn.LayerNorm(kv_dim)
-        # If q_dim != kv_dim, PyTorch's MultiheadAttention with
-        # kdim/vdim handles the projection internally. We use that
-        # so cells and anchors can have different widths if desired
-        # (config defaults them to equal but the option is here).
-        self.attn = nn.MultiheadAttention(
+        # ``SDPAMultiheadAttention`` exposes the same ``kdim``/``vdim``
+        # surface as nn.MultiheadAttention but routes explicitly
+        # through ``F.scaled_dot_product_attention`` so we get
+        # FlashAttention-2 on Ampere+ and O(N) memory for the N×K
+        # attention matrix. The N×K matrix is the main hot spot in
+        # Perceiver — for an 83k-cell slice with K=64 it's a
+        # 83000×64 matrix; FlashAttention keeps that in O(K)
+        # peak memory and is several times faster than the
+        # naive softmax path.
+        self.attn = SDPAMultiheadAttention(
             embed_dim=q_dim,
             num_heads=n_heads,
             kdim=kv_dim,
             vdim=kv_dim,
-            batch_first=True,
         )
         self.norm_ff = nn.LayerNorm(q_dim)
         ff_hidden = int(q_dim * mlp_ratio)
@@ -142,10 +147,13 @@ class _AnchorSelfAttnBlock(nn.Module):
             )
 
         self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.attn = nn.MultiheadAttention(
+        # SDPA self-attention on the K-sized anchor stream. K is
+        # tiny (~32-128) so this is mostly for predictability rather
+        # than memory savings, but keeping the same module type
+        # across all attention sites makes the codebase uniform.
+        self.attn = SDPAMultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=n_heads,
-            batch_first=True,
         )
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         ff_hidden = int(hidden_dim * mlp_ratio)

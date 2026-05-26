@@ -36,6 +36,8 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
+from models.sdpa_attention import SDPAMultiheadAttention
+
 
 # ---------------------------------------------------------------------------
 # Small transformer block — pre-LN, self-attention, FFN with residuals.
@@ -53,8 +55,10 @@ class _VAEBlock(nn.Module):
                 f"n_heads {n_heads}"
             )
         self.norm1 = nn.LayerNorm(hidden_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=n_heads, batch_first=True,
+        # SDPA path → FlashAttention-2 on Ampere+, O(N) memory for
+        # the attention matrix. Same forward signature as MHA.
+        self.attn = SDPAMultiheadAttention(
+            embed_dim=hidden_dim, num_heads=n_heads,
         )
         self.norm2 = nn.LayerNorm(hidden_dim)
         ff_hidden = int(hidden_dim * mlp_ratio)

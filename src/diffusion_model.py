@@ -395,6 +395,22 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 output_dims=self.output_dims,
                 perceiver_cfg=getattr(cfg.model, "perceiver", None),
             )
+        elif backbone == "nystromformer":
+            # Nyström-approximated global self-attention. Sub-quadratic
+            # O(N·M) cost; preserves all-to-all reachability through M
+            # segment-mean landmarks. Architecturally a DiT lookalike
+            # but with NystromAttention in place of dense SDPA inside
+            # each block, so EDM / c2f / gene_recon wrappers compose
+            # identically.
+            from models.nystromformer_backbone import NystromformerBackbone
+            self.model = NystromformerBackbone(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                nystromformer_cfg=getattr(cfg.model, "nystromformer", None),
+            )
         elif backbone == "egnn":
             # Local import so the LUNA-baseline path (which doesn't
             # need EGNN's torch-geometric kNN code) keeps loading
