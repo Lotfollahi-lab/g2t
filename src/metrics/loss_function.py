@@ -240,6 +240,24 @@ class LossFunction(nn.Module):
                                             "shape_matching", "weight",
                                             default=0.1))
 
+        # Latent diffusion losses — automatically active iff the LDM
+        # framework wrote the relevant stashes on the pred DataHolder
+        # (pred._ldm_z_0_pred / pred._ldm_z_0_target for the FM-on-z
+        # loss; pred._ldm_mu / pred._ldm_logvar for the KL). They
+        # return a graph-attached zero on any pred that doesn't have
+        # those stashes — so toggling between frameworks just works.
+        self._ldm_fm_weight = float(_cfg_get(cfg, "model", "loss",
+                                             "latent_fm_mse", "weight",
+                                             default=1.0))
+        self._ldm_kl_weight = float(_cfg_get(cfg, "model", "loss",
+                                             "latent_kl", "weight",
+                                             default=0.001))
+        # ``always-on`` semantics: registry entry has enabled=True so
+        # the component runs whenever the pred carries the stash. For
+        # non-LDM runs the component returns 0 instantly.
+        self._ldm_fm_enabled = True
+        self._ldm_kl_enabled = True
+
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
         # ``compute_loss`` iterates this list — adding a new component
@@ -276,6 +294,13 @@ class LossFunction(nn.Module):
             # can't directly see.
             ("shape_matching", self._shape_enabled, self._shape_weight,
              self._compute_shape_matching),
+            # Latent-diffusion losses — always in the registry; both
+            # return graph-attached zero when the LDM stashes aren't
+            # on the pred (so non-LDM runs see no impact).
+            ("latent_fm_mse", self._ldm_fm_enabled, self._ldm_fm_weight,
+             self._compute_latent_fm_mse),
+            ("latent_kl",     self._ldm_kl_enabled, self._ldm_kl_weight,
+             self._compute_latent_kl),
         ]
 
         # One-time summary so the train.log shows what's active.
@@ -1273,6 +1298,55 @@ class LossFunction(nn.Module):
         if not losses:
             return masked_pred.positions[0].sum() * 0.0
         return torch.mean(torch.stack(losses))
+
+    # ------------------------------------------------------------------
+    # Latent diffusion — FM-on-z denoising loss
+    # ------------------------------------------------------------------
+    def _compute_latent_fm_mse(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """MSE between the denoiser's predicted z_0 and the encoder's
+        sampled z_0_target.
+
+        Both stashes are set by LatentDiffusionModel.apply_noise +
+        LatentDiffusionWrapper.forward. If they're missing (any non-LDM
+        framework, or inference where the encoder didn't run), we
+        return a graph-attached zero so the registry can keep this
+        component "always on" without affecting non-LDM runs.
+
+        Mask is applied so padding cells don't contribute.
+        """
+        z_0_pred = getattr(masked_pred, "_ldm_z_0_pred", None)
+        z_0_target = getattr(masked_pred, "_ldm_z_0_target", None)
+        if z_0_pred is None or z_0_target is None:
+            return masked_pred.positions[0].sum() * 0.0
+
+        mask = masked_pred.node_mask.unsqueeze(-1).to(z_0_pred.dtype)
+        sq_err = (z_0_pred - z_0_target).pow(2) * mask        # (B, N, k)
+        # Mean over real (cell, latent-dim) pairs.
+        n_real_dims = mask.sum() * float(z_0_pred.shape[-1])
+        n_real_dims = n_real_dims.clamp_min(1.0)
+        return sq_err.sum() / n_real_dims
+
+    # ------------------------------------------------------------------
+    # Latent diffusion — KL prior on the encoder's q(z | x)
+    # ------------------------------------------------------------------
+    def _compute_latent_kl(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """KL(q(z|x) || N(0, I)) computed from the encoder's mu/logvar
+        stashes. Graph-attached zero when the stashes aren't present.
+
+        See ``models.latent_vae.kl_normal_standard`` for the formula
+        — the same helper is reused so the loss term and the
+        encoder's regularisation use byte-identical math.
+        """
+        mu = getattr(masked_pred, "_ldm_mu", None)
+        logvar = getattr(masked_pred, "_ldm_logvar", None)
+        if mu is None or logvar is None:
+            return masked_pred.positions[0].sum() * 0.0
+        from models.latent_vae import kl_normal_standard
+        return kl_normal_standard(mu, logvar, masked_pred.node_mask)
 
     # ----------------------------- aggregation ----------------------------
 

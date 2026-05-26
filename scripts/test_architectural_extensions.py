@@ -534,16 +534,27 @@ def test_edm_fm_requires_edm_enabled() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_latent_diffusion_stub_raises() -> None:
+def test_latent_diffusion_is_real_now() -> None:
+    """Latent diffusion was a scaffold in earlier revisions; it's now
+    a full implementation. The previous "raises NotImplementedError"
+    test was retired — see scripts/test_latent_diffusion.py for the
+    real test suite that exercises encoder + denoiser + decoder +
+    noise model + loss components end-to-end. Here we just confirm
+    the module can be imported AND that the noise model requires a
+    cfg (the old no-args constructor that raised is gone)."""
     from utils.diffusion_model.diffusion.latent_diffusion_model import (
         LatentDiffusionModel,
     )
     try:
         LatentDiffusionModel()
-    except NotImplementedError as e:
-        assert "latent_diffusion" in str(e)
+    except TypeError:
+        # Constructor now requires a cfg — expected.
         return
-    raise AssertionError("LatentDiffusionModel did not raise NotImplementedError")
+    raise AssertionError(
+        "LatentDiffusionModel() should require a cfg argument now; "
+        "the no-args stub has been replaced with a real implementation. "
+        "If this passed silently, the constructor signature has drifted."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -581,8 +592,8 @@ def main() -> int:
          test_edm_fm_euler_step_at_s0_recovers_h0_pred),
         ("#4 EDM-FM: raises without edm.enabled",
          test_edm_fm_requires_edm_enabled),
-        ("#5 Latent diffusion stub raises NotImplementedError",
-         test_latent_diffusion_stub_raises),
+        ("#5 Latent diffusion is now a full implementation (no stub)",
+         test_latent_diffusion_is_real_now),
     ]
     n_pass = 0
     for name, fn in tests:

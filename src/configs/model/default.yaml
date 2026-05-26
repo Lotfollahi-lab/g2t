@@ -369,6 +369,29 @@ loss:
         enabled: false
         weight: 0.1
 
+    # Latent-diffusion losses. Always "enabled" in the loss registry
+    # but no-op (graph-attached zero) when the LDM stashes aren't on
+    # the pred — i.e. for non-LDM runs the components contribute
+    # nothing. The ``weight`` knobs here scale the LDM losses RELATIVE
+    # to the position-side reconstruction loss (typically
+    # pairwise_distance_mse).
+    #
+    # latent_fm_mse: denoiser objective. MSE between the denoiser's
+    # predicted clean z_0 and the encoder's sampled z_0_target. This
+    # is the FM denoising loss in latent space — directly analogous
+    # to position-space x_0 prediction in vanilla FM.
+    #
+    # latent_kl: KL(q(z|x) || N(0,I)) on the encoder's mu/logvar.
+    # Pulls the encoder's outputs toward the standard Gaussian prior
+    # so the diffusion model sees a well-conditioned distribution at
+    # all noise levels. Weight defaults to 1e-3 — KL terms in VAEs
+    # are usually small relative to the reconstruction; bump if you
+    # see "posterior collapse" (encoder ignores positions, z ≡ 0).
+    latent_fm_mse:
+        weight: 1.0
+    latent_kl:
+        weight: 0.001
+
     # k-NN graph contrastive BCE — automatically enabled by the
     # KNNGraphOutputWrapper, ignored otherwise.
     #
@@ -1042,34 +1065,50 @@ perceiver:
     time_embed_dim: 256
 
 # ---------------------------------------------------------------------------
-# Architectural extension #5 (scaffold) — Latent Diffusion
+# Architectural extension #5 — Latent Diffusion
 # (Rombach et al. 2022, "High-Resolution Image Synthesis with Latent
-# Diffusion Models" — the Stable Diffusion architecture)
+# Diffusion Models" — the Stable Diffusion architecture, adapted for
+# scgg).
 #
-# Status: CONFIG SCAFFOLD ONLY in this revision. Selecting
-# ``framework: "latent_diffusion"`` raises a clear
-# NotImplementedError. A working LDM for scgg needs:
-#   1. A tissue-level VAE that encodes (gene_expression, positions)
-#      → z ∈ R^d (one latent per slice OR one latent per cell);
-#   2. Two-phase training (train VAE first, freeze; then diffuse in
-#      latent space);
-#   3. Decoder that recovers per-cell positions from the latent.
+# Selected via ``framework: "latent_diffusion"``. Trained as a
+# single-phase joint VAE + diffusion: encoder, denoiser, and decoder
+# all update together under three losses:
+#   * pairwise_distance_mse (or any other position-space loss already
+#     enabled) — supervises the decoder's reconstruction.
+#   * latent_fm_mse — supervises the denoiser's z_0 prediction
+#     against the encoder's z_0 sample (FM denoising in latent space).
+#   * latent_kl — pulls the encoder's q(z|x) toward N(0, I).
 #
-# This is ~1-2 weeks of careful design + implementation work — the
-# VAE's compression has to preserve enough positional structure that
-# the diffusion model can reconstruct it. Scaffold + follow-up task
-# rather than trying to crash a full implementation into this pass.
+# Two-phase training (VAE pretrain, then frozen-VAE diffusion) is a
+# follow-up enhancement; the joint-training setup here is simpler
+# and stable in practice with the small KL weight.
+#
+# Mutually exclusive with EDM, kNN-graph, c2f, and hierarchical
+# wrappers — LDM owns the whole prediction pathway (encoder →
+# denoiser → decoder) and doesn't compose with output-head wrappers
+# or teacher-forcing pre-processors. Construction asserts this.
 # ---------------------------------------------------------------------------
 latent_diffusion:
-    # Latent dimensionality. 64-256 typical for image LDM; for
-    # tissue-level latent the right number depends heavily on what
-    # the VAE actually compresses (per-cell features vs whole-slice
-    # summary). Placeholder default until the VAE is built.
+    # Latent dimensionality (per cell). 64-256 typical for image LDM;
+    # for scgg per-cell latents a smaller k (32-128) is usually
+    # enough since the target is 2-D positions, not high-D images.
+    # k=128 default is a comfortable starting point.
     latent_dim: 128
-    # VAE-side knobs (placeholders).
+    # VAE encoder/decoder hidden width + depth (small transformers).
     vae_hidden_dim: 256
     vae_n_layers: 4
-    # Diffusion-side knobs (placeholders).
+    vae_n_heads: 4
+    # Denoiser (DiT-style block stack operating in latent space).
+    # Hidden width / depth / attention heads / FFN ratio / time-embed
+    # dim mirror the standalone DiT backbone's defaults. Override
+    # ``denoiser_n_layers`` to deepen the denoiser specifically;
+    # defaults to ``cfg.model.n_layers`` when omitted (so the global
+    # depth knob still works).
+    denoiser_hidden_dim: 256
+    denoiser_n_heads: 8
+    denoiser_mlp_ratio: 4
+    denoiser_time_embed_dim: 256
+    # Diffusion trajectory: standard linear-FM in latent space.
     n_diffusion_steps: 50
     epsilon_t: 1.0e-3
 

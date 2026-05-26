@@ -266,7 +266,50 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"assignment for the regression case."
             )
 
-        if backbone == "luna_transformer":
+        # ------------------------------------------------------------------
+        # Latent Diffusion short-circuit. When framework=latent_diffusion,
+        # self.model becomes the LatentDiffusionWrapper (encoder +
+        # DiT-style denoiser + decoder) and the normal backbone +
+        # EDM/kNN-wrapper logic is bypassed entirely. The wrapper has
+        # its own internal architecture; the user's choice of backbone /
+        # c2f / hier / EDM is ignored under this framework (and the
+        # checks below validate that those flags aren't mistakenly on).
+        if framework == "latent_diffusion":
+            # Mutex with the other major output-head wrappers — LDM
+            # does its own encode→denoise→decode pipeline and isn't
+            # compatible with EDM's MDS-recovery path or kNN-graph's
+            # spectral-layout path.
+            if _edm_enabled_early:
+                raise ValueError(
+                    "model.framework='latent_diffusion' is incompatible "
+                    "with model.edm.enabled=true. LDM and EDM are "
+                    "alternative paradigms — pick one. (LDM trains its "
+                    "own learned decoder; EDM uses analytical MDS.) "
+                    "Disable one of them."
+                )
+            if _knn_graph_enabled_early:
+                raise ValueError(
+                    "model.framework='latent_diffusion' is incompatible "
+                    "with model.knn_graph.enabled=true. Both replace the "
+                    "position output path; pick one."
+                )
+            if c2f_enabled or hier_enabled or combined_enabled:
+                raise ValueError(
+                    "model.framework='latent_diffusion' is incompatible "
+                    "with the c2f / hierarchical wrappers. LDM uses its "
+                    "own encoder/decoder pipeline; the wrappers expect "
+                    "the LUNA Model's position-stream interface."
+                )
+            from models.latent_diffusion_wrapper import LatentDiffusionWrapper
+            self.model = LatentDiffusionWrapper(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                ldm_cfg=getattr(cfg.model, "latent_diffusion", None),
+            )
+        elif backbone == "luna_transformer":
             if combined_enabled:
                 # Composed multi-scale: spatial-hierarchical patches +
                 # gene-coarse-to-fine clusters, both feeding ONE inner
@@ -543,14 +586,32 @@ class FullDenoisingDiffusion(pl.LightningModule):
             self.noise_model = EnergyPredictor(cfg)
         elif framework == "latent_diffusion":
             # Architectural extension #5: Stable-Diffusion-style
-            # latent diffusion model. Scaffold only — raises a clear
-            # NotImplementedError on instantiation. Real implementation
-            # needs a tissue-level VAE + two-phase training + latent-
-            # space sampling, which is multi-session work.
+            # latent diffusion. Encoder + DiT-style denoiser + decoder
+            # are all in ``self.model`` (the LatentDiffusionWrapper
+            # constructed in the backbone-dispatch block far above);
+            # the noise model here drives apply_noise / sampling in
+            # latent space and reaches into the wrapper for
+            # encode/decode operations via ``_ldm_wrapper``.
             from utils.diffusion_model.diffusion.latent_diffusion_model import (
                 LatentDiffusionModel,
             )
             self.noise_model = LatentDiffusionModel(cfg)
+            # Bind the noise model to the wrapper so apply_noise can
+            # call wrapper.encode() / wrapper.decode(). The wrapper
+            # was constructed in the LDM branch of the backbone
+            # dispatch — if this attribute is missing the user hit a
+            # config validation we should have caught upstream.
+            from models.latent_diffusion_wrapper import LatentDiffusionWrapper
+            if not isinstance(self.model, LatentDiffusionWrapper):
+                raise RuntimeError(
+                    "framework='latent_diffusion' built self.noise_model "
+                    "= LatentDiffusionModel but self.model is "
+                    f"{type(self.model).__name__}, not "
+                    "LatentDiffusionWrapper. The backbone-dispatch "
+                    "block above should have routed this — bug in "
+                    "diffusion_model.py construction order."
+                )
+            self.noise_model._ldm_wrapper = self.model
         elif framework == "diffusion":
             self.noise_model = NoiseModel(cfg)
         else:
