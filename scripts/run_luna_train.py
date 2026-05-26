@@ -1146,6 +1146,7 @@ def run_benchmark(
     load_checkpoint: Optional[str] = None,
     make_plots: bool = False,
     output_subdir: Optional[str] = None,
+    run_timestamp: Optional[str] = None,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
@@ -1176,7 +1177,20 @@ def run_benchmark(
     # Training runs use the current wall clock (one fresh timestamp
     # per run). Inference runs that can't find a YYYYMMDD_HHMMSS
     # token in the checkpoint path fall back to the wall clock.
-    if skip_training and load_checkpoint is not None:
+    # Three sources for the run TS, in order of precedence:
+    #   1. ``run_timestamp`` arg — explicit override (set by
+    #      run_luna_pipeline.py when it received --run_timestamp).
+    #   2. Regex-extracted from --load_checkpoint path (test-only mode
+    #      against a prior model; pairs inference dir with model dir).
+    #   3. Current wall clock — fresh train run with no external pin.
+    if run_timestamp is not None:
+        if not re.fullmatch(r"\d{8}_\d{6}", run_timestamp):
+            raise ValueError(
+                f"run_timestamp must match YYYYMMDD_HHMMSS; got "
+                f"{run_timestamp!r}."
+            )
+        run_ts = run_timestamp
+    elif skip_training and load_checkpoint is not None:
         m = re.search(r"(\d{8}_\d{6})", str(load_checkpoint))
         run_ts = m.group(1) if m else datetime.now().strftime("%Y%m%d_%H%M%S")
     else:
@@ -1738,6 +1752,17 @@ def main() -> int:
              "plots (svg) into <out_dir>/plots/. OFF by default during "
              "training; ON by default in inference_luna.py.",
     )
+    p.add_argument(
+        "--run_timestamp", default=None,
+        help="Optional YYYYMMDD_HHMMSS run timestamp. When set, the "
+             "script does NOT generate a fresh wall-clock timestamp; "
+             "it uses this one for the artifacts subdir AND threads it "
+             "through to ``_luna_runner.py`` so the wandb run carries "
+             "the same TS in its config/summary/tags. Forwarded by "
+             "``run_luna_pipeline.py`` so the LSF submitter can pin "
+             "one timestamp across LSF logs + training dir + inference "
+             "dir + wandb run.",
+    )
     args = p.parse_args()
 
     try:
@@ -1761,6 +1786,7 @@ def main() -> int:
             skip_training=args.skip_training,
             load_checkpoint=args.load_checkpoint,
             make_plots=args.plots,
+            run_timestamp=args.run_timestamp,
         )
     except Exception:
         logger.exception("LUNA training failed")

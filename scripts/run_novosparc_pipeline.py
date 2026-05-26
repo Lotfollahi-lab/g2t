@@ -204,6 +204,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Skip per-section ground-truth-vs-prediction plots. "
              "Plots ON by default (parity with run_luna_inference.py).",
     )
+    p.add_argument(
+        "--run_timestamp", default=None,
+        help="Optional ``YYYYMMDD_HHMMSS`` timestamp to use as the run "
+             "label. When set, the pipeline does NOT generate a fresh "
+             "wall-clock timestamp; it uses this one for the output "
+             "subdir AND the wandb config's ``run_timestamp`` field. "
+             "Used by the LSF submitter (submit_pipeline.sh) so the "
+             "LSF log dir, the artifacts dir, and the wandb run all "
+             "share the same TS. Format-checked: ``YYYYMMDD_HHMMSS``.",
+    )
 
     return p
 
@@ -454,7 +464,19 @@ def main() -> int:
         sys.exit(f"--data_dir not found: {data_dir}")
 
     # ---- Pin output directory ----
-    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # When --run_timestamp is set (e.g. by the LSF submitter), use it
+    # verbatim so LSF logs + on-disk artifacts + wandb run all share
+    # the same TS. Otherwise generate a fresh wall-clock timestamp.
+    if args.run_timestamp:
+        import re as _re
+        if not _re.fullmatch(r"\d{8}_\d{6}", args.run_timestamp):
+            sys.exit(
+                f"--run_timestamp must match YYYYMMDD_HHMMSS; got "
+                f"{args.run_timestamp!r}."
+            )
+        run_ts = args.run_timestamp
+    else:
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.output_dir:
         out = Path(args.output_dir).resolve()
     else:

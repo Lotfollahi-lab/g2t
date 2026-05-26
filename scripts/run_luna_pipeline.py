@@ -181,6 +181,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Stop after training. Use when you want to inspect "
              "intermediates before evaluating.",
     )
+    p.add_argument(
+        "--run_timestamp", default=None,
+        help="Optional ``YYYYMMDD_HHMMSS`` timestamp to use as the run "
+             "label. When set, the pipeline does NOT generate a fresh "
+             "timestamp at startup; it uses this one to construct both "
+             "the training and inference output dirs AND threads it "
+             "through to ``_luna_runner.py`` so the wandb run carries "
+             "the same TS in its config/summary/tags. Used by the LSF "
+             "submitter (submit_pipeline.sh) to align its own log dir "
+             "with the pipeline's artifacts dir. Format-checked: must "
+             "match ``YYYYMMDD_HHMMSS`` (8 digits + underscore + 6 "
+             "digits).",
+    )
 
     return p
 
@@ -197,9 +210,13 @@ def _dataset_name_from_args(args: argparse.Namespace) -> str:
 def _build_train_cmd(
     args: argparse.Namespace,
     train_output_dir: Path,
+    timestamp: str,
 ) -> list[str]:
     """Construct the run_luna_train.py argv. ``--output_dir`` is pinned
     here so the pipeline knows exactly where the checkpoint will land.
+    The ``timestamp`` is forwarded explicitly so the train script logs
+    it to wandb (config + summary + tags) — that way the wandb run
+    pairs up with its on-disk artifacts dir by TS.
     """
     cmd = [sys.executable, str(_TRAIN_SCRIPT)]
     if args.data_dir:
@@ -212,6 +229,7 @@ def _build_train_cmd(
         cmd += ["--n_genes", str(args.n_genes)]
     cmd += [
         "--output_dir", str(train_output_dir),
+        "--run_timestamp", timestamp,
         "--epochs", str(args.epochs),
         "--batch_size", str(args.batch_size),
         "--seed", str(args.seed),
@@ -309,7 +327,19 @@ def main() -> int:
     # command deterministically. run_luna_inference.py regex-parses
     # this same timestamp out of the checkpoint path, so the inference
     # artifacts land at artifacts/<dataset>/luna_inference/<TS>/.
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # When --run_timestamp is passed (e.g. by the LSF submitter), use
+    # it verbatim so the LSF log dir + on-disk artifacts dir + wandb
+    # run config all share the same TS.
+    if args.run_timestamp:
+        import re as _re
+        if not _re.fullmatch(r"\d{8}_\d{6}", args.run_timestamp):
+            sys.exit(
+                f"--run_timestamp must match YYYYMMDD_HHMMSS; got "
+                f"{args.run_timestamp!r}."
+            )
+        timestamp = args.run_timestamp
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     artifacts_root = Path(os.environ.get(
         "LUNA_ARTIFACTS_ROOT", _DEFAULT_ARTIFACTS_ROOT,
     ))
@@ -324,7 +354,7 @@ def main() -> int:
     logger.info("=" * 60)
 
     # ---- 1. Training ----
-    train_cmd = _build_train_cmd(args, train_output_dir)
+    train_cmd = _build_train_cmd(args, train_output_dir, timestamp)
     logger.info(f"[1/2] Training. Command:")
     for token in train_cmd:
         logger.info(f"    {token}")
