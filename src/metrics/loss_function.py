@@ -53,6 +53,46 @@ def _cfg_get(cfg, *keys, default=None):
 
 
 # ---------------------------------------------------------------------------
+# Differentiable Procrustes (Kabsch / Schönemann 1966) — for the
+# rotation+reflection-invariant Sinkhorn loss.
+# ---------------------------------------------------------------------------
+
+
+def _procrustes_align_2d(
+    x_src: torch.Tensor, x_ref: torch.Tensor,
+) -> torch.Tensor:
+    """Orthogonal Procrustes (rotation + reflection) alignment of
+    ``x_src`` onto ``x_ref``.
+
+    Both inputs must be 2-D point clouds of the same shape (N, 2)
+    and pre-centered (mean-subtracted). Returns ``x_src @ R`` where
+    ``R`` is the optimal orthogonal matrix minimising
+    ``||x_src @ R - x_ref||_F``.
+
+    Closed form (Schönemann 1966): ``R = U @ V^T`` where
+    ``U·diag(S)·V^T = SVD(x_src^T · x_ref)``.
+
+    Differentiability: torch.linalg.svd is differentiable; backward
+    pass is well-defined as long as the two singular values are
+    distinct (the gauge ambiguity at degenerate singular values is
+    rare for 2-D point clouds with N ≫ 2 — would require the cloud
+    to be near-perfectly isotropic with the same eigenvalues as the
+    reference, which doesn't happen in our setting).
+
+    Used by ``LossFunction._compute_sinkhorn`` to make the Sinkhorn
+    divergence rotation+reflection-invariant. Same closed-form
+    Procrustes math as ``models.edm_head._procrustes_align`` and
+    ``models.knn_graph_head._procrustes_align`` — duplicated here
+    (rather than imported) to keep the loss module free of model-
+    module imports.
+    """
+    M = x_src.T @ x_ref                                       # (2, 2)
+    U, _S, Vh = torch.linalg.svd(M, full_matrices=False)
+    R = U @ Vh                                                # (2, 2)
+    return x_src @ R                                          # (N, 2)
+
+
+# ---------------------------------------------------------------------------
 # LossFunction
 # ---------------------------------------------------------------------------
 
@@ -171,6 +211,22 @@ class LossFunction(nn.Module):
         self._sk_backend = str(_cfg_get(cfg, "model", "loss",
                                         "sinkhorn", "backend",
                                         default="tensorized"))
+        # Differentiable Procrustes alignment before Sinkhorn.
+        # Default ON because Sinkhorn-on-unaligned-clouds measures
+        # rotation noise rather than per-cell placement error in
+        # scgg's setup (EDM Procrustes-to-noise + FM rotation
+        # augmentation). See _compute_sinkhorn docstring for the
+        # full diagnosis.
+        self._sk_procrustes_align = bool(_cfg_get(
+            cfg, "model", "loss", "sinkhorn", "procrustes_align",
+            default=True,
+        ))
+        # Scale-invariant mode: divide both clouds by truth's RMS
+        # before Sinkhorn so ``blur`` is in units of "RMS extent".
+        self._sk_scale_invariant = bool(_cfg_get(
+            cfg, "model", "loss", "sinkhorn", "scale_invariant",
+            default=False,
+        ))
         # Lazy-init: only build the SamplesLoss object on first call,
         # so users who never enable the component never pay the
         # geomloss import cost.
@@ -347,7 +403,9 @@ class LossFunction(nn.Module):
                 extra = (
                     f", p={self._sk_p}, blur={self._sk_blur:.3g}, "
                     f"scaling={self._sk_scaling:.3g}, "
-                    f"backend={self._sk_backend}"
+                    f"backend={self._sk_backend}, "
+                    f"procrustes_align={self._sk_procrustes_align}, "
+                    f"scale_invariant={self._sk_scale_invariant}"
                 )
                 if self._sk_subsample:
                     extra += f", subsample={self._sk_subsample}"
@@ -879,30 +937,62 @@ class LossFunction(nn.Module):
         Computes the *debiased* Sinkhorn divergence
         ``S_ε(α, β) = L_ε(α, β) − ½(L_ε(α, α) + L_ε(β, β))``
         between the two N-cell clouds per slice, then averages across
-        slices. Debiasing makes ``S_ε`` zero when the clouds are equal
-        (the entropic-regularizer bias cancels out), so the loss
-        landscape behaves like vanilla Wasserstein near optimum.
+        slices. Debiasing makes ``S_ε`` zero when the clouds are equal,
+        so the loss landscape behaves like vanilla Wasserstein near
+        optimum.
 
-        Complementary to ``_compute_pairwise_distance_mse``:
-          * pairwise MSE matches the *distribution of pair distances*
-            but is blind to which cell is where (a permutation of the
-            cells with the same pairwise structure gets zero loss);
-          * Sinkhorn matches the *cells themselves* via an optimal
-            transport plan — penalises individual cell misplacement
-            within an otherwise-correct overall structure.
+        Why the alignment step matters
+        ------------------------------
+        Sinkhorn directly compares (x, y) tuples — it's NOT rotation
+        or reflection invariant. scgg's predictions live in an
+        arbitrary frame:
 
-        With weight ~0.1× the pairwise term it acts as a regulariser:
-        pairwise pins global structure, Sinkhorn pins placement.
+          * The EDM head does MDS + Procrustes alignment to the
+            NOISY x_t (so the frame depends on the noise sample).
+          * The FM framework applies rotation+reflection augmentation
+            at train time, perturbing the frame every step.
 
-        Implementation: lazy-imports ``geomloss.SamplesLoss``. Each
-        slice is processed independently because slices have different
-        cell counts (geomloss SamplesLoss supports batched dispatch
-        only when all clouds in the batch share an ``N``).
+        Two clouds that are identical up to a rotation have Sinkhorn
+        divergence proportional to the cloud's extent — so without an
+        alignment step, the loss is dominated by rotation noise
+        rather than per-cell placement error. The minimum the model
+        can find is scale-collapse to zero (which makes any rotation
+        the identity).
 
-        Gradient: flows through ``pred_pos`` via SamplesLoss's
-        differentiable implementation (Feydy et al. 2019). ``true_pos``
-        is treated as the target; geomloss handles it as a non-leaf
-        constant.
+        This is exactly the failure mode reported: the unaligned
+        Sinkhorn doesn't help when ON alone (collapse wins), and only
+        helps when stacked WITH pairwise_distance_mse (whose
+        rotation-invariant shape signal keeps positions from
+        collapsing — at which point the EDM head's Procrustes step
+        pulls the prediction into a stable frame and unaligned
+        Sinkhorn becomes a usable fine-tuning signal).
+
+        The fix is to make Sinkhorn rotation+reflection-invariant
+        directly: run a differentiable Kabsch / orthogonal Procrustes
+        alignment of pred onto true BEFORE Sinkhorn. With this on,
+        Sinkhorn measures the residual per-cell placement error
+        modulo the global frame — which is the signal we actually
+        want.
+
+        Implementation
+        --------------
+        Per slice, in order:
+
+          1. Mean-centre both clouds (translation invariance).
+          2. If ``procrustes_align``: rotate+reflect pred onto true
+             via SVD of (pred^T · true), with R = U·V^T (Schönemann
+             1966 / Kabsch). Fully differentiable through torch's
+             SVD backward.
+          3. If ``scale_invariant``: divide both clouds by the
+             truth's RMS distance to centroid, so ``blur`` is in
+             units of "RMS extent" rather than raw position units.
+          4. Call geomloss.SamplesLoss on the aligned (and optionally
+             scaled) clouds.
+
+        Gradient: flows through ``pred_pos`` via (a) the Procrustes
+        step's torch.linalg.svd backward and (b) SamplesLoss's
+        differentiable Sinkhorn iteration. ``true_pos`` is explicitly
+        detached so no gradient leaks into the dataloader output.
         """
         if self._sk_loss_fn is None:
             try:
@@ -933,8 +1023,8 @@ class LossFunction(nn.Module):
         for true_pos, pred_pos, mask in zip(
             masked_true.positions, masked_pred.positions, masked_true.node_mask,
         ):
-            true_real = true_pos[mask]          # (n, 2), gradient-free target
-            pred_real = pred_pos[mask]          # (n, 2), gradient-bearing
+            true_real = true_pos[mask].detach()  # never gradient-bearing
+            pred_real = pred_pos[mask]           # (n, 2), gradient-bearing
             n = true_real.shape[0]
             # Sinkhorn needs at least a couple of points to define a
             # non-degenerate transport plan; skip pathological tiny
@@ -953,10 +1043,30 @@ class LossFunction(nn.Module):
                 true_real = true_real[idx]
                 pred_real = pred_real[idx]
 
-            # SamplesLoss(x, y) with x, y of shape (N, D) returns a
-            # 0-dim tensor — the divergence between the two clouds
-            # under uniform weights. Gradient flows back through x.
-            slice_losses.append(self._sk_loss_fn(pred_real, true_real))
+            # (1) Centre both clouds. Translation invariance.
+            true_c = true_real - true_real.mean(dim=0, keepdim=True)
+            pred_c = pred_real - pred_real.mean(dim=0, keepdim=True)
+
+            # (2) Differentiable Procrustes (rotation + reflection)
+            #     of pred onto true. Same closed form as
+            #     ``models.edm_head._procrustes_align`` /
+            #     ``models.knn_graph_head._procrustes_align`` so the
+            #     alignment math is uniform across the codebase.
+            if self._sk_procrustes_align:
+                pred_c = _procrustes_align_2d(pred_c, true_c)
+
+            # (3) Optional scale invariance: rescale both clouds by
+            #     truth's RMS distance to centroid. ``blur`` is then
+            #     in units of "RMS extent" rather than raw positions.
+            if self._sk_scale_invariant:
+                with torch.no_grad():
+                    scale = true_c.pow(2).sum(dim=-1).mean().sqrt().clamp_min(1e-6)
+                true_c = true_c / scale
+                pred_c = pred_c / scale
+
+            # (4) Sinkhorn divergence on the aligned clouds. Gradient
+            #     flows through pred_c (via SVD backward + SamplesLoss).
+            slice_losses.append(self._sk_loss_fn(pred_c, true_c))
 
         if not slice_losses:
             zero = (masked_pred.positions[0].sum() * 0.0

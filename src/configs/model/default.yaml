@@ -343,6 +343,27 @@ loss:
         #                   memory + multiscale clustering; needs
         #                   KeOps. Use for N ≫ 10k.
         backend: "tensorized"
+        # Differentiable Procrustes (rotation + reflection) alignment
+        # of pred onto true BEFORE Sinkhorn. ON by default — without
+        # it, Sinkhorn measures rotation noise rather than per-cell
+        # placement error, because scgg's predictions live in an
+        # arbitrary frame (EDM head Procrustes-aligns to noisy x_t;
+        # FM rotation/reflection augmentation perturbs the frame
+        # every step). With this on, Sinkhorn becomes a true
+        # rotation+translation-invariant per-cell placement signal,
+        # complementary to pairwise_distance_mse (which is already
+        # rotation-invariant but blind to which cell is where).
+        # Closed-form Schönemann 1966 / Kabsch: R = U·V^T from
+        # SVD(pred^T · true). Fully differentiable.
+        procrustes_align: true
+        # Scale-invariant mode: divide BOTH clouds by the truth's RMS
+        # distance to centroid before Sinkhorn. Makes ``blur`` scale-
+        # independent (its effective value is then in units of "RMS
+        # extent of true cloud" rather than raw position units). OFF
+        # by default to preserve backward-compat; turn ON if your
+        # positions live at very different scales than the LUNA/MMC
+        # default and you don't want to retune ``blur``.
+        scale_invariant: false
 
     # EDM (Euclidean Distance Matrix) squared-distance MSE —
     # automatically enabled by the EDMOutputWrapper, ignored otherwise.
