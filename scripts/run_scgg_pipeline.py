@@ -2,12 +2,22 @@
 """Train + immediately evaluate: single-command scGG pipeline.
 
 Wraps ``run_scgg_train.py`` and ``run_scgg_inference.py`` into one
-invocation. A single wall-clock timestamp is generated upfront and
-pinned through both steps, so the trained model and its inference
-artifacts pair up by eye::
+invocation. A single wall-clock timestamp is generated upfront (or
+inherited from ``--run_timestamp``) and pinned through both steps,
+so the two artifact subtrees pair up by eye::
 
-    artifacts/<dataset>/scgg_model/<TS>/      ← training output
-    artifacts/<dataset>/scgg_inference/<TS>/  ← inference output
+    artifacts/<dataset>/scgg_model/<TS>/         ← training output
+    artifacts/<dataset>/scgg_inference/<TS>/     ← inference output
+
+Convention: ``<dataset>`` is the basename of ``--data_dir`` (e.g.
+``mmc_luna``), ``<method>`` is the engine name (``scgg`` / ``luna``
+/ ``novosparc``), ``<phase>`` is ``model`` (training) or
+``inference`` (test-only run on a trained checkpoint), and ``<TS>``
+is ``YYYYMMDD_HHMMSS``. LSF stdout/err for a job, when submitted
+via ``submit_pipeline.sh``, land at
+``<ARTIFACTS>/<dataset>/<method>_model/<TS>/lsf_logs/`` (the
+training dir's sub-folder) so they're co-located with the
+checkpoint they correspond to.
 
 Typical use::
 
@@ -180,6 +190,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Stop after training. Use when you want to inspect "
              "intermediates before evaluating.",
     )
+    p.add_argument(
+        "--run_timestamp", default=None,
+        help="Optional ``YYYYMMDD_HHMMSS`` timestamp to use as the run "
+             "label. When set, the pipeline does NOT generate a fresh "
+             "timestamp at startup; it uses this one to construct both "
+             "the training and inference output dirs. Used by the LSF "
+             "submitter (submit_pipeline.sh) to align its own log dir "
+             "with the pipeline's artifacts dir — set there and read "
+             "here via the runner. Format-checked: must match "
+             "``YYYYMMDD_HHMMSS`` (8 digits + underscore + 6 digits) "
+             "so downstream regex-based timestamp extraction "
+             "(``_luna_runner.py``) keeps working.",
+    )
 
     return p
 
@@ -238,11 +261,17 @@ def _build_train_cmd(
 def _build_inference_cmd(
     args: argparse.Namespace,
     checkpoint: Path,
+    infer_output_dir: Path,
 ) -> list[str]:
-    """Construct the run_scgg_inference.py argv. Inference INHERITS
-    the timestamp from the checkpoint path (regex in run_scgg_train.py),
-    so we don't pass --output_dir explicitly — the inference artifacts
-    land at artifacts/<dataset>/scgg_inference/<TS>/ automatically.
+    """Construct the run_scgg_inference.py argv.
+
+    Inference writes to the sibling subtree
+    ``<ARTIFACTS>/<dataset>/scgg_inference/<TS>/`` (matching LUNA's
+    convention). We pass ``--output_dir`` explicitly rather than
+    relying on the timestamp regex in ``_luna_runner.py`` — the
+    explicit path is robust to any future ambiguity in TS extraction
+    (e.g. when ``--run_timestamp`` was set so the TS doesn't match
+    the wall clock at the moment inference starts).
     """
     cmd = [sys.executable, str(_INFER_SCRIPT)]
     if args.data_dir:
@@ -255,6 +284,7 @@ def _build_inference_cmd(
         cmd += ["--n_genes", str(args.n_genes)]
     cmd += [
         "--checkpoint", str(checkpoint),
+        "--output_dir", str(infer_output_dir),
         "--seed", str(args.seed),
         "--wandb_mode", args.inference_wandb_mode or args.wandb_mode,
     ]
@@ -309,14 +339,36 @@ def main() -> int:
         sys.exit("--train_csv and --test_csv must be passed together.")
 
     # ---- Pin a single timestamp and on-disk location ----
-    # Generated here (not in run_scgg_train.py) so we know exactly
-    # where the checkpoint will land and can build the inference
-    # command deterministically.
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # When --run_timestamp is passed, use it verbatim (lets the LSF
+    # submit script pre-compute the TS and pin its log dir to the
+    # same path). Otherwise generate one fresh here. Either way the
+    # training and inference outputs share a single TS so they pair
+    # up by eye in the artifacts tree.
+    if args.run_timestamp:
+        # Lightweight format check — downstream code (_luna_runner.py)
+        # regex-extracts the TS from the checkpoint path looking for
+        # YYYYMMDD_HHMMSS, so we enforce the same shape here.
+        import re as _re
+        if not _re.fullmatch(r"\d{8}_\d{6}", args.run_timestamp):
+            sys.exit(
+                f"--run_timestamp must match YYYYMMDD_HHMMSS; got "
+                f"{args.run_timestamp!r}."
+            )
+        timestamp = args.run_timestamp
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     artifacts_root = Path(os.environ.get(
         "SCGG_ARTIFACTS_ROOT", _DEFAULT_ARTIFACTS_ROOT,
     ))
     dataset_name = _dataset_name_from_args(args)
+    # Standard sibling-tree layout, shared with LUNA / novosparc:
+    #   <ARTIFACTS>/<dataset>/scgg_model/<TS>/        ← training
+    #   <ARTIFACTS>/<dataset>/scgg_inference/<TS>/    ← inference
+    # The two share the same <TS> so pairs are visible at a glance.
+    # LSF logs (when submitted via submit_pipeline.sh) land under
+    # ``<TS>/lsf_logs/`` inside the training dir — co-located with
+    # the checkpoint they correspond to. Inference logs from the
+    # subprocess go to the inference dir naturally.
     train_output_dir = artifacts_root / dataset_name / "scgg_model" / timestamp
     infer_output_dir = artifacts_root / dataset_name / "scgg_inference" / timestamp
 
@@ -353,7 +405,7 @@ def main() -> int:
         return 0
 
     # ---- 2. Inference ----
-    infer_cmd = _build_inference_cmd(args, checkpoint)
+    infer_cmd = _build_inference_cmd(args, checkpoint, infer_output_dir)
     logger.info(f"[2/2] Inference. Command:")
     for token in infer_cmd:
         logger.info(f"    {token}")

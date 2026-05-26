@@ -345,6 +345,30 @@ loss:
         enabled: false
         weight: 1.0
 
+    # Anisotropic shape-matching loss. Supervises the COVARIANCE
+    # eigenvalues of the predicted point cloud against the true
+    # cloud's, per slice. Captures the "wide-x narrow-y" shape signal
+    # that pairwise-distance MSE doesn't directly enforce — pairwise
+    # MSE averages over all N² pairs and is dominated by the bulk
+    # distribution, so a model that gets the bulk right but produces
+    # an over-isotropic bounding box still scores low pairwise loss.
+    #
+    # Why eigenvalues and not the full 2×2 covariance: eigenvalues
+    # are rotation-invariant. After Procrustes alignment (in the EDM
+    # head and the FM trajectory) the prediction is in some frame
+    # determined by the noisy x_t; comparing covariance entries
+    # directly would be sensitive to that arbitrary rotation. The
+    # eigenvalues are the variances along the two principal axes
+    # regardless of which orientation the prediction settled on.
+    #
+    # Defaults OFF. When enabled, use a small weight (0.05-0.2) as
+    # an auxiliary signal on top of pairwise_distance_mse /
+    # edm_distance_mse; high weights will pull the model toward
+    # matching the moments at the expense of the per-cell structure.
+    shape_matching:
+        enabled: false
+        weight: 0.1
+
     # k-NN graph contrastive BCE — automatically enabled by the
     # KNNGraphOutputWrapper, ignored otherwise.
     #

@@ -229,6 +229,17 @@ class LossFunction(nn.Module):
                                              "knn_graph_loss", "n_negatives",
                                              default=20))
 
+        # Shape-matching loss — rotation-invariant covariance-eigenvalue
+        # MSE on the predicted vs true point cloud. Targets the "scgg
+        # predictions look too isotropic" failure mode that pairwise-
+        # distance MSE doesn't directly supervise.
+        self._shape_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                            "shape_matching", "enabled",
+                                            default=False))
+        self._shape_weight = float(_cfg_get(cfg, "model", "loss",
+                                            "shape_matching", "weight",
+                                            default=0.1))
+
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
         # ``compute_loss`` iterates this list — adding a new component
@@ -260,6 +271,11 @@ class LossFunction(nn.Module):
             # on positive/negative edges drawn from true positions.
             ("knn_graph_loss", self._knn_graph_enabled, self._knn_graph_weight,
              self._compute_knn_graph_loss),
+            # Shape-matching loss: covariance-eigenvalue MSE; targets
+            # the over-isotropic-prediction failure mode pairwise MSE
+            # can't directly see.
+            ("shape_matching", self._shape_enabled, self._shape_weight,
+             self._compute_shape_matching),
         ]
 
         # One-time summary so the train.log shows what's active.
@@ -299,6 +315,8 @@ class LossFunction(nn.Module):
                     f" (auto-wired by KNNGraphOutputWrapper, "
                     f"k={self._knn_graph_k}, n_neg={self._knn_graph_n_neg})"
                 )
+            elif name == "shape_matching":
+                extra = " (covariance-eigenvalue MSE, rotation-invariant)"
             active.append(f"{name}(w={w:.3g}{extra})")
         print(f"[LossFunction] active components: {', '.join(active) or '(none!)'}")
 
@@ -1197,6 +1215,61 @@ class LossFunction(nn.Module):
             neg_loss = neg_loss_per.sum() / n_valid_neg
 
             losses.append(0.5 * (pos_loss + neg_loss))
+        if not losses:
+            return masked_pred.positions[0].sum() * 0.0
+        return torch.mean(torch.stack(losses))
+
+    # ------------------------------------------------------------------
+    # Shape-matching loss: covariance-eigenvalue MSE per slice
+    # ------------------------------------------------------------------
+    def _compute_shape_matching(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Rotation-invariant supervision on the anisotropic spread of
+        the predicted point cloud.
+
+        Per slice, computes the 2×2 covariance matrices of the valid
+        (non-padding) cell positions on both the prediction and the
+        ground truth, takes their sorted eigenvalues, and returns the
+        mean squared difference. The eigenvalues are the variances
+        along the two principal axes of each cloud — capturing the
+        "this slice is wider in one direction than the other" signal
+        that pairwise-distance MSE smears across all pairs.
+
+        Eigenvalues are rotation-invariant, which matters because the
+        EDM head's MDS-and-Procrustes step puts the prediction in a
+        frame determined by the noisy x_t; comparing covariance
+        ENTRIES would be sensitive to that arbitrary rotation, but
+        comparing eigenvalues is not.
+
+        Per-slice loop because the valid cell count varies per slice
+        and the covariance must be computed over the valid subset.
+        """
+        losses = []
+        for b in range(masked_pred.positions.shape[0]):
+            mask = masked_true.node_mask[b]
+            valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            n = int(valid_idx.numel())
+            # Need at least 3 cells for a non-degenerate 2×2 covariance.
+            if n < 3:
+                continue
+            true_pos = masked_true.positions[b].index_select(0, valid_idx)
+            pred_pos = masked_pred.positions[b].index_select(0, valid_idx)
+            # Centre (so cov is the second central moment).
+            true_c = true_pos - true_pos.mean(dim=0, keepdim=True)
+            pred_c = pred_pos - pred_pos.mean(dim=0, keepdim=True)
+            # Per-slice 2×2 covariance via Xᵀ X / (n-1).
+            cov_true = (true_c.T @ true_c) / float(n - 1)
+            cov_pred = (pred_c.T @ pred_c) / float(n - 1)
+            # Symmetrise (numerical noise) before eigvalsh.
+            cov_true = 0.5 * (cov_true + cov_true.T)
+            cov_pred = 0.5 * (cov_pred + cov_pred.T)
+            # Eigenvalues — ascending by default.
+            evals_true = torch.linalg.eigvalsh(cov_true)
+            evals_pred = torch.linalg.eigvalsh(cov_pred)
+            # MSE on the sorted pair. Both are already ascending out of
+            # eigvalsh; no need to re-sort.
+            losses.append(((evals_pred - evals_true) ** 2).mean())
         if not losses:
             return masked_pred.positions[0].sum() * 0.0
         return torch.mean(torch.stack(losses))
