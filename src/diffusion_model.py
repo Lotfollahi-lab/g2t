@@ -655,6 +655,28 @@ class FullDenoisingDiffusion(pl.LightningModule):
         assert z_t.node_mask is not None
         model_input = z_t.copy()
 
+        # DataHolder.copy() is field-based — it only copies the
+        # explicit constructor args (positions/node_features/etc.) and
+        # silently drops any extra attributes set via direct
+        # assignment. The Latent Diffusion noise model stashes the
+        # noisy latent z_t and the encoder outputs onto the DataHolder
+        # via setattr (``out._ldm_z_t = ...`` etc.) — those would be
+        # lost by the .copy() above, so we re-attach them here. Same
+        # for the self-conditioning channel and EDM/kNN auxiliaries
+        # (the latter are read by the LightningModule itself rather
+        # than the inner model, but propagating defensively makes the
+        # behaviour uniform).
+        for attr in (
+            "_ldm_z_t",
+            "_ldm_z_0_target",
+            "_ldm_mu",
+            "_ldm_logvar",
+            "_self_cond_x0",
+        ):
+            val = getattr(z_t, attr, None)
+            if val is not None:
+                setattr(model_input, attr, val)
+
         # Self-conditioning: prepend the 2-D x_0_pred channel (from
         # the previous training-step inner pass OR previous sampling
         # step) to node_features. The inner backbone's input_dims

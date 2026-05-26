@@ -365,9 +365,45 @@ loss:
     # an auxiliary signal on top of pairwise_distance_mse /
     # edm_distance_mse; high weights will pull the model toward
     # matching the moments at the expense of the per-cell structure.
+    #
+    # ``variant`` selects which scalar(s) of the covariance the loss
+    # matches. The three variants address different failure modes
+    # that all manifest as "shape_matching loss → 0 but visuals
+    # still look isotropic":
+    #
+    #   * "eigvals"  (default, original behaviour):
+    #     MSE on the sorted eigenvalues (λ_min, λ_max) of the cov
+    #     matrix. Fails under SCALE COLLAPSE — if the model predicts
+    #     a smaller overall point cloud than the truth, both
+    #     eigenvalues shrink toward zero and the absolute MSE drops
+    #     without producing anisotropy.
+    #
+    #   * "ratio"    (scale-invariant):
+    #     MSE between λ_min/λ_max(pred) and λ_min/λ_max(true). A
+    #     pure anisotropy-ratio signal — penalises "predicted cloud
+    #     is more circular than true cloud" regardless of overall
+    #     scale. Most useful when scale collapse is suspected (which
+    #     it usually is when the pairwise_distance loss is also
+    #     active — pairwise already handles scale).
+    #
+    #   * "covariance" (full 2x2 Frobenius):
+    #     ‖cov(pred) - cov(true)‖_F². Captures both eigenvalues AND
+    #     the orientation of the principal axes (i.e. the off-
+    #     diagonal entries). Rotation-SENSITIVE: this fights the
+    #     EDM head's Procrustes alignment unless the prediction has
+    #     settled into a stable frame. Use as a follow-up after
+    #     "ratio" if you confirm the model now matches the
+    #     anisotropy magnitude but rotates it incorrectly.
+    #
+    # The per-slice (λ_min, λ_max, ratio) values for both the
+    # prediction and the truth are always logged to wandb when the
+    # loss is enabled — they appear under ``val_shape/...`` /
+    # ``train_shape/...`` keys for diagnostic purposes regardless
+    # of which ``variant`` is used.
     shape_matching:
         enabled: false
         weight: 0.1
+        variant: eigvals  # one of: eigvals | ratio | covariance
 
     # Latent-diffusion losses. Always "enabled" in the loss registry
     # but no-op (graph-attached zero) when the LDM stashes aren't on

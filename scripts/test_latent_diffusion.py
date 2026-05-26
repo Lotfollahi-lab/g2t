@@ -536,6 +536,71 @@ def test_end_to_end_joint_training_step() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression: DataHolder.copy() drops _ldm_* — LightningModule.forward
+# must re-attach them after the copy
+# ---------------------------------------------------------------------------
+
+
+def test_dataholder_copy_drops_ldm_stashes() -> None:
+    """Regression test: ``DataHolder.copy()`` is field-based and
+    silently drops attributes set via direct assignment (like the
+    ``_ldm_z_t`` the noise model stashes). Documents the upstream
+    behaviour so the FIX in diffusion_model.forward stays motivated.
+    """
+    from utils.data.dataholder import DataHolder
+    B, N, k = 1, 8, 4
+    data = _build_data(B=B, N=N, gene_dim=8)
+    data._ldm_z_t = torch.randn(B, N, k)
+    data._ldm_mu = torch.randn(B, N, k)
+    data._ldm_logvar = torch.randn(B, N, k)
+    data._ldm_z_0_target = torch.randn(B, N, k)
+    out = data.copy()
+    # ALL four must be missing from the field-based copy — that's the
+    # root cause of the runtime error this regression test guards.
+    for attr in ("_ldm_z_t", "_ldm_mu", "_ldm_logvar", "_ldm_z_0_target"):
+        assert not hasattr(out, attr), (
+            f"DataHolder.copy() unexpectedly preserves {attr!r}; the "
+            f"propagation fix in diffusion_model.forward may be "
+            f"redundant. Re-check whether the LightningModule still "
+            f"needs to re-attach LDM stashes after .copy()."
+        )
+
+
+def test_forward_propagates_ldm_stashes_through_copy() -> None:
+    """Simulates the propagation pattern from diffusion_model.forward:
+    ``model_input = z_t.copy()`` then re-attach LDM stashes onto
+    ``model_input``. After this, the LDM wrapper invoked on
+    ``model_input`` must produce a valid pred with z_0_pred.
+    """
+    B, N, gene_dim, k = 1, 12, 16, 8
+    wrap = _make_wrapper(gene_dim=gene_dim, latent_dim=k)
+    nm = _make_noise_model(latent_dim=k, n_steps=5)
+    nm._ldm_wrapper = wrap
+    data = _build_data(B=B, N=N, gene_dim=gene_dim)
+    z_t = nm.apply_noise(data)
+
+    # Mimic the LightningModule.forward path exactly.
+    model_input = z_t.copy()
+    for attr in ("_ldm_z_t", "_ldm_z_0_target", "_ldm_mu", "_ldm_logvar",
+                 "_self_cond_x0"):
+        val = getattr(z_t, attr, None)
+        if val is not None:
+            setattr(model_input, attr, val)
+
+    # Forward must succeed (NO RuntimeError) and produce z_0_pred.
+    pred = wrap(model_input)
+    assert hasattr(pred, "_ldm_z_0_pred"), (
+        "wrapper output should carry _ldm_z_0_pred after propagation"
+    )
+    assert pred._ldm_z_0_pred.shape == (B, N, k)
+    # Encoder stashes propagated through model_input → wrapper → pred.
+    for attr in ("_ldm_mu", "_ldm_logvar", "_ldm_z_0_target"):
+        assert hasattr(pred, attr), (
+            f"wrapper should re-stash {attr!r} on pred for the loss path"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -558,6 +623,10 @@ def main() -> int:
         ("latent_kl correct + gradient flows",    test_latent_kl_with_stashes_and_grad),
         ("end-to-end joint training step grads enc/dec/denoiser",
                                                   test_end_to_end_joint_training_step),
+        ("regression: DataHolder.copy() drops _ldm_* stashes",
+                                                  test_dataholder_copy_drops_ldm_stashes),
+        ("regression: forward propagates LDM stashes through .copy()",
+                                                  test_forward_propagates_ldm_stashes_through_copy),
     ]
     n_pass = 0
     for name, fn in tests:

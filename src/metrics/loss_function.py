@@ -239,6 +239,26 @@ class LossFunction(nn.Module):
         self._shape_weight = float(_cfg_get(cfg, "model", "loss",
                                             "shape_matching", "weight",
                                             default=0.1))
+        # Which scalar(s) of the covariance to match. See the long
+        # docstring in default.yaml for the rationale behind each.
+        self._shape_variant = str(_cfg_get(cfg, "model", "loss",
+                                           "shape_matching", "variant",
+                                           default="eigvals")).lower()
+        if self._shape_variant not in ("eigvals", "ratio", "covariance"):
+            raise ValueError(
+                f"model.loss.shape_matching.variant must be one of "
+                f"'eigvals', 'ratio', 'covariance'; got "
+                f"{self._shape_variant!r}."
+            )
+        # Per-batch diagnostic stash populated by
+        # ``_compute_shape_matching`` and consumed by ``forward`` /
+        # ``log_epoch_metrics`` to emit ``{train,val}_shape/...`` keys
+        # to wandb. List of per-slice dicts:
+        #   {"eig_min_true", "eig_max_true", "ratio_true",
+        #    "eig_min_pred", "eig_max_pred", "ratio_pred"}.
+        # Cleared after each log emission so we never publish stale
+        # numbers from a prior batch.
+        self._last_shape_diagnostics: List[Dict[str, float]] = []
 
         # Latent diffusion losses — automatically active iff the LDM
         # framework wrote the relevant stashes on the pred DataHolder
@@ -1250,26 +1270,40 @@ class LossFunction(nn.Module):
     def _compute_shape_matching(
         self, masked_pred: DataHolder, masked_true: DataHolder,
     ) -> torch.Tensor:
-        """Rotation-invariant supervision on the anisotropic spread of
-        the predicted point cloud.
+        """Anisotropic-shape supervision on the predicted point cloud.
 
         Per slice, computes the 2×2 covariance matrices of the valid
         (non-padding) cell positions on both the prediction and the
-        ground truth, takes their sorted eigenvalues, and returns the
-        mean squared difference. The eigenvalues are the variances
-        along the two principal axes of each cloud — capturing the
-        "this slice is wider in one direction than the other" signal
-        that pairwise-distance MSE smears across all pairs.
+        ground truth, then matches one of three scalar summaries
+        controlled by ``self._shape_variant``:
 
-        Eigenvalues are rotation-invariant, which matters because the
-        EDM head's MDS-and-Procrustes step puts the prediction in a
-        frame determined by the noisy x_t; comparing covariance
-        ENTRIES would be sensitive to that arbitrary rotation, but
-        comparing eigenvalues is not.
+          * ``"eigvals"``     — MSE on sorted (λ_min, λ_max). Default
+            (matches original behaviour). Rotation-invariant but
+            sensitive to absolute scale.
+
+          * ``"ratio"``       — MSE on λ_min/λ_max (the anisotropy
+            ratio, in [0, 1]). Scale-invariant: penalises "predicted
+            cloud is more circular" regardless of overall extent.
+
+          * ``"covariance"``  — Frobenius² norm on the full 2×2 cov
+            matrix. Captures eigenvalues AND principal-axis
+            orientation. Rotation-sensitive: only stable once the
+            prediction has settled into a consistent frame.
 
         Per-slice loop because the valid cell count varies per slice
         and the covariance must be computed over the valid subset.
+
+        Side effect: populates ``self._last_shape_diagnostics`` with
+        a list of per-slice eigenvalue numerics (true / pred / ratio)
+        that ``forward`` then publishes to wandb. This is a diagnostic
+        only — independent of which variant drives the gradient.
         """
+        # Reset diagnostic stash for this call. Stays empty (and the
+        # forward-hook publishes nothing) if the slices are all too
+        # small for a non-degenerate cov, matching the early-return
+        # path below.
+        self._last_shape_diagnostics = []
+
         losses = []
         for b in range(masked_pred.positions.shape[0]):
             mask = masked_true.node_mask[b]
@@ -1292,9 +1326,47 @@ class LossFunction(nn.Module):
             # Eigenvalues — ascending by default.
             evals_true = torch.linalg.eigvalsh(cov_true)
             evals_pred = torch.linalg.eigvalsh(cov_pred)
-            # MSE on the sorted pair. Both are already ascending out of
-            # eigvalsh; no need to re-sort.
-            losses.append(((evals_pred - evals_true) ** 2).mean())
+
+            # Diagnostic numerics for wandb (always populated, even
+            # under variants that don't touch eigenvalues directly).
+            # ``.detach().item()`` because we never want these to
+            # carry gradient — they only exist for logging.
+            eps = 1e-12
+            ratio_true_val = float(
+                (evals_true[0] / (evals_true[1] + eps)).detach().item()
+            )
+            ratio_pred_val = float(
+                (evals_pred[0] / (evals_pred[1] + eps)).detach().item()
+            )
+            self._last_shape_diagnostics.append({
+                "eig_min_true": float(evals_true[0].detach().item()),
+                "eig_max_true": float(evals_true[1].detach().item()),
+                "ratio_true":   ratio_true_val,
+                "eig_min_pred": float(evals_pred[0].detach().item()),
+                "eig_max_pred": float(evals_pred[1].detach().item()),
+                "ratio_pred":   ratio_pred_val,
+            })
+
+            # Dispatch the actual gradient-bearing loss.
+            if self._shape_variant == "eigvals":
+                # Original: MSE on the sorted pair (already ascending
+                # out of eigvalsh).
+                slice_loss = ((evals_pred - evals_true) ** 2).mean()
+            elif self._shape_variant == "ratio":
+                # Anisotropy-ratio MSE; scale-invariant. The +eps is
+                # ALSO under the gradient graph (it stabilises
+                # division by a small eigenvalue at init).
+                ratio_true = evals_true[0] / (evals_true[1] + eps)
+                ratio_pred = evals_pred[0] / (evals_pred[1] + eps)
+                slice_loss = (ratio_pred - ratio_true) ** 2
+            else:  # "covariance"
+                # Full 2×2 Frobenius². The cov matrices are 2×2 so
+                # this is just the sum of squared elementwise
+                # differences over four entries.
+                slice_loss = ((cov_pred - cov_true) ** 2).sum()
+
+            losses.append(slice_loss)
+
         if not losses:
             return masked_pred.positions[0].sum() * 0.0
         return torch.mean(torch.stack(losses))
@@ -1406,6 +1478,16 @@ class LossFunction(nn.Module):
                 to_log[f"{prefix}/position_mse"] = per_component[
                     "pairwise_distance_mse"
                 ]
+            # Per-slice shape diagnostics (eigenvalue numerics for
+            # predicted vs true covariance). Independent of which
+            # variant drove the gradient — these tell us WHY the
+            # loss is moving (or not). Reported as batch-averaged
+            # scalars under ``{train,val}_shape/...`` so they show up
+            # next to the loss components.
+            shape_prefix = (
+                "train_shape" if train_stage else "val_shape"
+            )
+            to_log.update(self._summarise_shape_diagnostics(shape_prefix))
             if wandb.run:
                 wandb.log(to_log, commit=True)
 
@@ -1448,6 +1530,62 @@ class LossFunction(nn.Module):
             to_log["train_epoch/position_mse"] = per_component[
                 "pairwise_distance_mse"
             ]
+        # Epoch-level shape diagnostics (same numerics as the per-
+        # step ``train_shape/...``, derived from the recomputation
+        # above). Empty dict if shape_matching is disabled or all
+        # slices were degenerate.
+        to_log.update(self._summarise_shape_diagnostics("train_epoch_shape"))
         if wandb.run:
             wandb.log(to_log, commit=False)
         return to_log
+
+    # ------------------------------------------------------------------
+    # Shape-diagnostic helpers
+    # ------------------------------------------------------------------
+    def _summarise_shape_diagnostics(
+        self, prefix: str,
+    ) -> Dict[str, float]:
+        """Reduce the per-slice eigenvalue stash to a flat dict of
+        wandb scalars under ``{prefix}/...``.
+
+        Reports six MEAN values across the batch:
+          * eig_min_true / eig_max_true / ratio_true
+          * eig_min_pred / eig_max_pred / ratio_pred
+
+        And three error metrics directly answering "is the prediction
+        anisotropic enough":
+          * eig_min_mae  — mean abs error on λ_min across slices
+          * eig_max_mae  — mean abs error on λ_max
+          * ratio_mae    — mean abs error on λ_min/λ_max
+
+        Returns an empty dict (and emits nothing) when there were no
+        diagnostic entries — either because shape_matching is
+        disabled or because all slices in the batch were too small
+        for a non-degenerate covariance.
+        """
+        stash = self._last_shape_diagnostics
+        if not stash:
+            return {}
+        n = float(len(stash))
+        # Aggregate.
+        sums = {
+            "eig_min_true": 0.0, "eig_max_true": 0.0, "ratio_true": 0.0,
+            "eig_min_pred": 0.0, "eig_max_pred": 0.0, "ratio_pred": 0.0,
+        }
+        mae = {"eig_min": 0.0, "eig_max": 0.0, "ratio": 0.0}
+        for entry in stash:
+            for k in sums:
+                sums[k] += entry[k]
+            mae["eig_min"] += abs(entry["eig_min_pred"] - entry["eig_min_true"])
+            mae["eig_max"] += abs(entry["eig_max_pred"] - entry["eig_max_true"])
+            mae["ratio"]   += abs(entry["ratio_pred"]   - entry["ratio_true"])
+        out = {f"{prefix}/{k}_mean": v / n for k, v in sums.items()}
+        out[f"{prefix}/eig_min_mae"] = mae["eig_min"] / n
+        out[f"{prefix}/eig_max_mae"] = mae["eig_max"] / n
+        out[f"{prefix}/ratio_mae"]   = mae["ratio"]   / n
+        # Don't clear here — the same stash is re-populated each call
+        # to ``_compute_shape_matching``, so a stale read is impossible
+        # under normal use. Clearing here would double-empty if a
+        # caller hits ``forward`` and then ``log_epoch_metrics``
+        # without an intervening compute.
+        return out

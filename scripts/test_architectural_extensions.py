@@ -558,6 +558,231 @@ def test_latent_diffusion_is_real_now() -> None:
 
 
 # ---------------------------------------------------------------------------
+# #6 — Shape-matching loss: variants + per-slice eigenvalue diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _shape_loss_cfg(variant: str = "eigvals", weight: float = 0.1) -> dict:
+    """Minimal cfg dict for LossFunction with only shape_matching on.
+    Uses nested ``dict``s — LossFunction._cfg_get falls back to .get()
+    for dicts so we don't need OmegaConf to test."""
+    return {
+        "model": {
+            "loss": {
+                "pairwise_distance_mse": {"enabled": False, "weight": 0.0},
+                "shape_matching": {
+                    "enabled": True,
+                    "weight": weight,
+                    "variant": variant,
+                },
+            },
+        },
+    }
+
+
+def _shape_two_clouds(
+    aniso_true: float = 4.0, aniso_pred: float = 1.0, n: int = 64,
+):
+    """Build a single-batch DataHolder pair where the true positions
+    are a stretched ellipse (aspect ratio = aniso_true) and the
+    predictions are stretched by aniso_pred. Both clouds share x,y
+    layout, just scaled along x.
+    """
+    from utils.data.dataholder import DataHolder
+    torch.manual_seed(123)
+    # Base: 2-D gaussian.
+    base = torch.randn(1, n, 2)
+    # Stretch x by the requested factor.
+    true_pos = base.clone()
+    true_pos[..., 0] *= aniso_true
+    pred_pos = base.clone()
+    pred_pos[..., 0] *= aniso_pred
+    mask = torch.ones(1, n, dtype=torch.bool)
+    masked_true = DataHolder(
+        node_features=torch.zeros(1, n, 4),
+        positions=true_pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, n, 1, dtype=torch.long),
+        cell_ID=torch.arange(n).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1),
+        node_mask=mask,
+    )
+    # Predictions need gradient so we can assert backward works.
+    pred_pos.requires_grad_(True)
+    masked_pred = DataHolder(
+        node_features=torch.zeros(1, n, 4),
+        positions=pred_pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, n, 1, dtype=torch.long),
+        cell_ID=torch.arange(n).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1),
+        node_mask=mask,
+    )
+    return masked_pred, masked_true
+
+
+def test_shape_eigvals_default_behaviour() -> None:
+    """The ``eigvals`` variant is the original behaviour: MSE on
+    sorted eigenvalues. Must (a) return a finite scalar tensor,
+    (b) be > 0 when predictions are isotropic and truth is anisotropic,
+    (c) backprop to the prediction tensor.
+    """
+    from metrics.loss_function import LossFunction
+    loss_fn = LossFunction(_shape_loss_cfg(variant="eigvals"))
+    pred, true = _shape_two_clouds(aniso_true=4.0, aniso_pred=1.0)
+    val = loss_fn._compute_shape_matching(pred, true)
+    assert val.ndim == 0, f"expected scalar, got shape {val.shape}"
+    assert torch.isfinite(val).item(), f"eigvals loss not finite: {val}"
+    assert val.item() > 0.0, (
+        f"eigvals loss should be > 0 for aniso pred vs iso truth; got {val}"
+    )
+    val.backward()
+    assert pred.positions.grad is not None, (
+        "eigvals variant didn't reach pred.positions"
+    )
+
+
+def test_shape_ratio_is_scale_invariant() -> None:
+    """The ``ratio`` variant must NOT depend on overall scale: doubling
+    both pred and true should leave the loss unchanged (up to fp noise).
+    This is the whole point of the variant — distinguishes shape
+    anisotropy from absolute size.
+    """
+    from metrics.loss_function import LossFunction
+    loss_fn = LossFunction(_shape_loss_cfg(variant="ratio"))
+    # Reference: aniso=4 truth, aniso=1 pred (isotropic).
+    pred1, true1 = _shape_two_clouds(aniso_true=4.0, aniso_pred=1.0)
+    val1 = loss_fn._compute_shape_matching(pred1, true1).item()
+    # Scale both by 100×. Eigenvalues scale by 100² = 10000, but the
+    # RATIO λ_min/λ_max is invariant.
+    pred2, true2 = _shape_two_clouds(aniso_true=4.0, aniso_pred=1.0)
+    pred2.positions.data.mul_(100.0)
+    true2.positions.data.mul_(100.0)
+    val2 = loss_fn._compute_shape_matching(pred2, true2).item()
+    rel_err = abs(val1 - val2) / (abs(val1) + 1e-12)
+    assert rel_err < 1e-3, (
+        f"ratio variant not scale-invariant: val1={val1:.6f} vs "
+        f"val2={val2:.6f} (rel err {rel_err:.3e}). The ratio loss "
+        f"should depend only on shape, not size."
+    )
+
+
+def test_shape_ratio_separates_anisotropies() -> None:
+    """Sanity: an isotropic prediction against a strongly anisotropic
+    truth should produce a LARGER ratio-loss than a mildly anisotropic
+    prediction against the same truth.
+    """
+    from metrics.loss_function import LossFunction
+    loss_fn = LossFunction(_shape_loss_cfg(variant="ratio"))
+    pred_iso, true_aniso = _shape_two_clouds(aniso_true=4.0, aniso_pred=1.0)
+    pred_mild, _        = _shape_two_clouds(aniso_true=4.0, aniso_pred=3.0)
+    val_iso  = loss_fn._compute_shape_matching(pred_iso,  true_aniso).item()
+    val_mild = loss_fn._compute_shape_matching(pred_mild, true_aniso).item()
+    assert val_iso > val_mild, (
+        f"ratio variant should penalise isotropic prediction more than "
+        f"mildly-anisotropic; got iso={val_iso:.4f} vs mild={val_mild:.4f}"
+    )
+
+
+def test_shape_covariance_variant_finite_and_backprops() -> None:
+    """Covariance Frobenius variant: finite scalar, > 0 on mismatched
+    clouds, and gradient reaches the prediction tensor.
+    """
+    from metrics.loss_function import LossFunction
+    loss_fn = LossFunction(_shape_loss_cfg(variant="covariance"))
+    pred, true = _shape_two_clouds(aniso_true=4.0, aniso_pred=1.0)
+    val = loss_fn._compute_shape_matching(pred, true)
+    assert torch.isfinite(val).item(), f"covariance loss not finite: {val}"
+    assert val.item() > 0.0, (
+        f"covariance loss should be > 0 on mismatched clouds; got {val}"
+    )
+    val.backward()
+    assert pred.positions.grad is not None, (
+        "covariance variant didn't reach pred.positions"
+    )
+
+
+def test_shape_diagnostics_populated_and_summarised() -> None:
+    """After a compute, ``_last_shape_diagnostics`` carries one entry
+    per non-degenerate slice with the documented keys, and
+    ``_summarise_shape_diagnostics`` flattens to the expected wandb
+    scalar names.
+    """
+    from metrics.loss_function import LossFunction
+    loss_fn = LossFunction(_shape_loss_cfg(variant="eigvals"))
+    pred, true = _shape_two_clouds(aniso_true=4.0, aniso_pred=1.0)
+    _ = loss_fn._compute_shape_matching(pred, true)
+    assert len(loss_fn._last_shape_diagnostics) == 1, (
+        f"expected one diagnostic entry for the single batch slice; "
+        f"got {len(loss_fn._last_shape_diagnostics)}"
+    )
+    entry = loss_fn._last_shape_diagnostics[0]
+    for k in ("eig_min_true", "eig_max_true", "ratio_true",
+              "eig_min_pred", "eig_max_pred", "ratio_pred"):
+        assert k in entry, f"diagnostic stash missing key {k!r}: {entry}"
+    # The truth was stretched 4× along x → λ_max_true should be much
+    # bigger than λ_min_true; pred was isotropic → ratio_pred ≈ 1.
+    assert entry["eig_max_true"] > 4 * entry["eig_min_true"], (
+        f"truth eigvals look wrong: {entry}"
+    )
+    assert entry["ratio_pred"] > 0.5, (
+        f"pred is isotropic, ratio should be near 1.0; got {entry}"
+    )
+    assert entry["ratio_true"] < 0.2, (
+        f"truth is 4×-stretched, ratio should be small; got {entry}"
+    )
+    # Now check the wandb-flattening helper.
+    out = loss_fn._summarise_shape_diagnostics("val_shape")
+    expected_keys = {
+        "val_shape/eig_min_true_mean", "val_shape/eig_max_true_mean",
+        "val_shape/ratio_true_mean",   "val_shape/eig_min_pred_mean",
+        "val_shape/eig_max_pred_mean", "val_shape/ratio_pred_mean",
+        "val_shape/eig_min_mae",       "val_shape/eig_max_mae",
+        "val_shape/ratio_mae",
+    }
+    missing = expected_keys - set(out.keys())
+    assert not missing, f"summary missing keys: {missing}"
+    # ratio_mae must equal |ratio_pred - ratio_true| (single slice).
+    expected_ratio_mae = abs(entry["ratio_pred"] - entry["ratio_true"])
+    assert abs(out["val_shape/ratio_mae"] - expected_ratio_mae) < 1e-6, (
+        f"ratio_mae mismatch: got {out['val_shape/ratio_mae']:.6f}, "
+        f"expected {expected_ratio_mae:.6f}"
+    )
+
+
+def test_shape_diagnostics_empty_when_disabled() -> None:
+    """When shape_matching is OFF, ``_summarise_shape_diagnostics``
+    must return ``{}`` (no stale entries from a prior call leak into
+    wandb). Equivalent for the disabled case: never populated.
+    """
+    from metrics.loss_function import LossFunction
+    # Empty cfg → shape_matching defaults to disabled.
+    loss_fn = LossFunction({})
+    # Stash starts empty.
+    out = loss_fn._summarise_shape_diagnostics("val_shape")
+    assert out == {}, f"expected empty dict when disabled; got {out}"
+
+
+def test_shape_invalid_variant_raises() -> None:
+    """Misconfigured ``variant`` must fail loud at construction time —
+    we want the strict-mode behaviour the rest of the loss module
+    already follows."""
+    from metrics.loss_function import LossFunction
+    try:
+        LossFunction(_shape_loss_cfg(variant="trace"))
+    except ValueError as e:
+        assert "shape_matching.variant" in str(e), (
+            f"error message should name the offending field; got {e}"
+        )
+        return
+    raise AssertionError(
+        "invalid variant should raise ValueError at __init__"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -594,6 +819,20 @@ def main() -> int:
          test_edm_fm_requires_edm_enabled),
         ("#5 Latent diffusion is now a full implementation (no stub)",
          test_latent_diffusion_is_real_now),
+        ("#6 Shape loss: eigvals variant (default) finite + backprops",
+         test_shape_eigvals_default_behaviour),
+        ("#6 Shape loss: ratio variant is scale-invariant",
+         test_shape_ratio_is_scale_invariant),
+        ("#6 Shape loss: ratio variant separates aniso magnitudes",
+         test_shape_ratio_separates_anisotropies),
+        ("#6 Shape loss: covariance variant finite + backprops",
+         test_shape_covariance_variant_finite_and_backprops),
+        ("#6 Shape loss: per-slice diagnostics + wandb summary",
+         test_shape_diagnostics_populated_and_summarised),
+        ("#6 Shape loss: diagnostics empty when disabled",
+         test_shape_diagnostics_empty_when_disabled),
+        ("#6 Shape loss: invalid variant raises at __init__",
+         test_shape_invalid_variant_raises),
     ]
     n_pass = 0
     for name, fn in tests:
