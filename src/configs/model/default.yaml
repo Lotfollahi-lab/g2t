@@ -1028,6 +1028,40 @@ edm:
     # turn on for any run that combines EDM with a non-EDM
     # auxiliary loss.
     mds_align_gradient: false
+    # ---- MDS Tikhonov regularization strength ----
+    # Per-eigenvalue diagonal perturbation in ``_classical_mds_2d``.
+    # The Tikhonov diagonal is ``arange(n) * mds_tikhonov_eps * scale``
+    # where scale = max(|B_ii|), so the MINIMUM spacing between
+    # adjacent eigenvalues after the bump is ``mds_tikhonov_eps · scale``.
+    # eigh's backward formula contains ``1/(λ_i − λ_j)`` for ALL n²
+    # eigenpair indices (autograd's chain-rule traversal touches the
+    # full Jacobian even though we only read out the top-2
+    # eigenvectors), so the upper bound on these gradient
+    # magnifiers is ``1 / (mds_tikhonov_eps · scale)``.
+    #
+    # When to bump (the 2026-05-27 diagnosis)
+    # ---------------------------------------
+    # With ``mds_align_gradient=false`` (legacy default): MDS-backward
+    # is never exercised, so 1e-6 (minimal precision impact) is
+    # correct.
+    #
+    # With ``mds_align_gradient=true`` AND any position-based loss
+    # active (sinkhorn / chamfer / shape_matching): MDS-backward is
+    # exercised. At cortex's n≈7000 the default 1e-6 gives gradient
+    # magnitudes O(1e6), which overflows fp32 in chain rule. Symptom:
+    # finite forward losses (bounded ~0.01-0.1) but on_after_backward
+    # raises RuntimeError on NaN/Inf in some param.grad. Bump to:
+    #   - 1e-4 for n in [3000, 10000]  — most spatial datasets
+    #   - 1e-3 for n > 10000           — very large slices
+    #
+    # Precision cost: each eigenvalue receives a unique tag of size
+    # `i * mds_tikhonov_eps * scale`. For the top-2 eigenvalues
+    # (i = n-1, n-2) the tag is O(mds_tikhonov_eps · scale · n).
+    # At 1e-4 and n=7000, that's ~0.7 · scale — a substantial
+    # perturbation. But the top-2 eigenvalues themselves are O(scale·n)
+    # for a well-separated layout, so the *relative* perturbation
+    # is still ~mds_tikhonov_eps, i.e. ~1e-4. Acceptable.
+    mds_tikhonov_eps: 1.0e-6
     # ---- Architectural extension #1 — bilinear / anisotropic gating ----
     # When true, the EDM head computes a learned Mahalanobis-style
     # distance D_ij = (h_i − h_j)^T M (h_i − h_j) with M = W^T W

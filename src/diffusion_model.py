@@ -528,6 +528,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 mds_align_gradient=bool(
                     getattr(edm_cfg, "mds_align_gradient", False)
                 ),
+                mds_tikhonov_eps=float(
+                    getattr(edm_cfg, "mds_tikhonov_eps", 1e-6)
+                ),
             )
 
         if knn_graph_enabled:

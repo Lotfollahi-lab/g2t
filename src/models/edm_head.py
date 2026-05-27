@@ -55,15 +55,43 @@ from utils.data.dataholder import DataHolder
 # ---------------------------------------------------------------------------
 
 
-def _classical_mds_2d(D_sq: torch.Tensor) -> torch.Tensor:
+def _classical_mds_2d(
+    D_sq: torch.Tensor, tikhonov_eps: float = 1e-6,
+) -> torch.Tensor:
     """Differentiable classical MDS to 2D from a squared-distance matrix.
 
     Args:
         D_sq: (n, n) symmetric, nonneg squared-distance matrix.
+        tikhonov_eps: Per-eigenvalue spacing target for the
+            Tikhonov regularization, expressed as a fraction of
+            ``max(|B|)``. The diagonal of B gets a strictly-
+            increasing perturbation ``arange(n) * tikhonov_eps * scale``
+            (NO `/n` divisor) so adjacent eigenvalues are separated
+            by at least ``tikhonov_eps * scale`` after the bump.
+            Default 1e-6 = "MDS precision priority". Bump to 1e-4
+            or 1e-3 when running with ``mds_align_gradient=true``
+            on large clouds (n ≥ 5000) — eigh's backward formula
+            contains ``1/(λ_i − λ_j)`` terms that diverge to ±Inf
+            at degenerate eigenvalues, and the 1e-6 default gives
+            spacing too tight (~1e-6 · scale) for fp32 chain-rule
+            traversal to stay finite when a position-based loss
+            (sinkhorn / chamfer / shape) puts a gradient sink on
+            the MDS output.
 
     Returns:
         (n, 2) MDS coordinates. Frame is the eigenframe of the
         double-centred Gram matrix — defined up to reflection/rotation.
+
+    Note (2026-05-27): the prior implementation divided the
+    perturbation by ``n``, which at cortex's n≈7000 gave
+    per-eigenvalue spacing of ~1.4e-10. autograd's eigvec-Jacobian
+    then contained 1/(λ_i − λ_j) terms ≈ 7×10⁹ — high enough that
+    chain-rule traversal overflowed fp32 when ANY loss put a
+    gradient sink on the MDS output. The new version drops the
+    `/n` divisor; precision impact stays bounded because the
+    top-2 eigenvectors are the most-separated pair so their
+    perturbation is dominated by the data signal, not by the
+    Tikhonov tag.
     """
     n = D_sq.shape[0]
     device = D_sq.device
@@ -77,16 +105,12 @@ def _classical_mds_2d(D_sq: torch.Tensor) -> torch.Tensor:
     B = 0.5 * (B + B.T)
 
     # Tikhonov regularization to break eigenvalue degeneracy.
-    # Light touch (1e-6 scaled by B's magnitude) — heavier
-    # perturbation degrades MDS precision unnecessarily. The
-    # heavy lifting against eigh backward instabilities is done
-    # at the OUTER level via the strict Procrustes degeneracy
-    # check (which skips the SVD entirely when M is poorly
-    # conditioned) and the train.gradient_clip_val=1.0 default
-    # in setup.py (clips residual large-but-finite gradients
-    # before they overflow fp32).
-    eps_reg = 1e-6 * B.diag().abs().max().clamp_min(1.0)
-    reg = torch.arange(n, device=device, dtype=dtype) * eps_reg / float(n)
+    # Per-eigenvalue spacing is ``tikhonov_eps * scale`` where
+    # scale = max(|B|). No `/n` divisor — that's the fix for the
+    # 2026-05-27 NaN bug.
+    scale = B.diag().abs().max().clamp_min(1.0)
+    eps_reg = float(tikhonov_eps) * scale
+    reg = torch.arange(n, device=device, dtype=dtype) * eps_reg
     B = B + torch.diag(reg)
 
     # Eigendecomposition (ascending). Top 2 = last 2.
@@ -189,12 +213,27 @@ class EDMOutputWrapper(nn.Module):
         mds_align: bool = True,
         anisotropic_gating: bool = False,
         mds_align_gradient: bool = False,
+        mds_tikhonov_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
         self.embed_dim = int(embed_dim)
         self.mds_align = bool(mds_align)
         self.anisotropic_gating = bool(anisotropic_gating)
+        # Per-eigenvalue Tikhonov perturbation in classical MDS.
+        # Forwarded to ``_classical_mds_2d`` so the strength is set
+        # per-run rather than hardcoded. See the docstring in that
+        # function for the math; in short, this controls the minimum
+        # spacing between adjacent eigenvalues of B before eigh, and
+        # 1/(λ_i − λ_j) terms in eigh's backward are bounded by
+        # 1/(tikhonov_eps · scale). At cortex's n≈7000, default
+        # 1e-6 gives backward magnitudes ~1e6/scale that can
+        # overflow fp32 in chain rule; bump to 1e-4 or 1e-3 when
+        # using ``mds_align_gradient=true`` with a position-based
+        # loss. Default kept at 1e-6 for backward-compat with
+        # mds_align_gradient=false runs (where MDS-backward isn't
+        # exercised anyway, so precision wins).
+        self.mds_tikhonov_eps = float(mds_tikhonov_eps)
         # When False (the legacy default), the MDS-aligned positions
         # are produced under ``torch.no_grad()`` and overwrite
         # ``pred.positions`` with a gradient-FREE tensor. That's
@@ -390,7 +429,9 @@ class EDMOutputWrapper(nn.Module):
                 continue
             D_v = D_sq[b].index_select(0, valid_idx).index_select(1, valid_idx)
             try:
-                x_mds = _classical_mds_2d(D_v)            # (n_valid, 2)
+                x_mds = _classical_mds_2d(             # (n_valid, 2)
+                    D_v, tikhonov_eps=self.mds_tikhonov_eps,
+                )
             except Exception:
                 aligned_list.append(x_ref[b])
                 continue
