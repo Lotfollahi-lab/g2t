@@ -36,6 +36,26 @@ class FullDenoisingDiffusion(pl.LightningModule):
 
         self.cfg = cfg
         self.name = cfg.general.name
+
+        # Optional autograd anomaly detection — set
+        # ``train.detect_anomaly=true`` to enable. PyTorch then saves
+        # the forward stack of every op, and on backward raises an
+        # error pinpointing the EXACT op that produced any NaN/Inf
+        # gradient (file + line). ~5-10x slower training, so for
+        # debugging only. See configs/train/default.yaml for the
+        # full usage note. Gated by a global flag (not a context
+        # manager) because PL constructs the LightningModule then
+        # runs many forwards inside its own training loop — the
+        # global flag is the only way to keep anomaly mode active
+        # for the whole run.
+        if bool(getattr(cfg.train, "detect_anomaly", False)):
+            torch.autograd.set_detect_anomaly(True, check_nan=True)
+            print(
+                "[FullDenoisingDiffusion] WARNING: autograd anomaly "
+                "detection is ON (cfg.train.detect_anomaly=true). "
+                "Training will be ~5-10x slower. Use only for "
+                "debugging NaN/Inf gradient sources."
+            )
         # ``max_diffusion_steps`` is the outer step count for the
         # sampling loop in utils/diffusion_model/sample/sample.py:47:
         #     for s_int in reversed(range(0, self.max_diffusion_steps, ...))

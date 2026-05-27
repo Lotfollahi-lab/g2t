@@ -6,6 +6,26 @@ fast_dev_run: False # If True, runs 1 batch of train, test and val to find any b
 weight_decay: 1.0e-12
 
 # ---------------------------------------------------------------------------
+# Autograd anomaly detection.
+# ---------------------------------------------------------------------------
+# When true, calls torch.autograd.set_detect_anomaly(True, check_nan=True)
+# before training starts. This makes PyTorch:
+#   1. Save the forward-pass stack trace of every op.
+#   2. On backward, if any op produces NaN/Inf gradient, raise an
+#      error AND print the saved forward trace pointing at the
+#      EXACT op (file + line) that produced it.
+# Cost: ~5-10x slower training because of the saved-stack overhead.
+# Use ONLY for debugging — flip back to false for real runs.
+#
+# Typical workflow when a NaN gradient kills a run:
+#   --override train.detect_anomaly=true
+# Re-run for a few steps until the NaN fires. Read the printed
+# forward stack to find the unstable op. Stabilise it at the source
+# (see models/edm_head.py::_classical_mds_2d for the Tikhonov
+# pattern), then flip detect_anomaly back off for production runs.
+detect_anomaly: false
+
+# ---------------------------------------------------------------------------
 # Train-time rotation+reflection augmentation.
 #
 # Each training step applies an INDEPENDENT random element of O(2)

@@ -103,8 +103,18 @@ def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
     contained (knn_graph and edm shouldn't depend on each other).
 
     R = U @ Vh from SVD(x_src.T @ x_ref) — Schönemann 1966.
+
+    Degenerate-M handling: same as ``edm_head._procrustes_align`` —
+    when M is near-zero, the SVD backward formula's
+    ``1/(σ_i − σ_j)`` terms blow up to NaN/Inf, so we return x_src
+    unchanged (R = I is one valid choice when M = 0).
     """
     M = x_src.T @ x_ref
+    with torch.no_grad():
+        M_max = M.abs().max()
+        degenerate = (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6
+    if degenerate:
+        return x_src
     U, _S, Vh = torch.linalg.svd(M)
     R = U @ Vh
     return x_src @ R

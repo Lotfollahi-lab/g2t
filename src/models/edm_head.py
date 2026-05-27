@@ -117,8 +117,23 @@ def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
     ``R = U @ Vh``. (Earlier revision had ``R = Vh.T @ U.T = V Uᵀ``,
     which is R-transposed — applied the INVERSE rotation and broke
     the smoke test.)
+
+    Degenerate-M handling: when M is near-zero (training init, where
+    pred ≈ 0 → M ≈ 0), the SVD's singular values are both near zero
+    and the backward formula's ``1/(σ_i − σ_j)`` / ``1/(σ_i + σ_j)``
+    terms blow up to NaN/Inf. Mathematically the optimal R is
+    undefined when M = 0 — any orthogonal matrix minimises the
+    objective equally. We pick R = I in that regime and return
+    x_src unchanged. This is mathematically valid (not a silent
+    silencing of the alignment) and removes the only NaN-prone
+    backward in this op.
     """
     M = x_src.T @ x_ref                            # (2, 2)
+    with torch.no_grad():
+        M_max = M.abs().max()
+        degenerate = (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6
+    if degenerate:
+        return x_src
     U, _S, Vh = torch.linalg.svd(M)
     R = U @ Vh                                      # (2, 2)
     return x_src @ R
