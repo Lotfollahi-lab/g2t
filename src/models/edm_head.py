@@ -428,10 +428,33 @@ class EDMOutputWrapper(nn.Module):
                 aligned_list.append(x_ref[b])
                 continue
             D_v = D_sq[b].index_select(0, valid_idx).index_select(1, valid_idx)
+            # Cast to float64 for the MDS computation. eigh's backward
+            # formula contains ``1/(λ_i − λ_j)`` terms; with the bulk
+            # of eigenvalues clustered near zero (a near-rank-2 matrix
+            # for a 2D point cloud), fp32 precision is insufficient to
+            # keep these terms finite. The 2026-05-27 per-module
+            # grad-finder pinpointed eigh-backward at n≈2000 as a
+            # direct-NaN producer in fp32: the C++ kernel emits NaN
+            # for the divergent Jacobian entries because fp32 can't
+            # express small-enough numbers. fp64 has ~10⁹× finer
+            # representable spacing around 0 (smallest normalized
+            # 1e-308 vs 1e-38), enough to keep the chain rule finite.
+            #
+            # ``tensor.to(dtype)`` is differentiable — the gradient
+            # casts back automatically at the boundary. Cost: ~2x
+            # slower MDS step (irrelevant in the training-step budget
+            # — MDS is O(n³) but n≤7k and dominated by the projector
+            # / transformer forward).
+            D_v_64 = D_v.to(torch.float64)
             try:
-                x_mds = _classical_mds_2d(             # (n_valid, 2)
-                    D_v, tikhonov_eps=self.mds_tikhonov_eps,
+                x_mds_64 = _classical_mds_2d(          # (n_valid, 2) fp64
+                    D_v_64, tikhonov_eps=self.mds_tikhonov_eps,
                 )
+                # Cast back to fp32 (or whatever the surrounding
+                # graph dtype is); gradient flows back through
+                # `.to()` and gets implicitly promoted to fp64
+                # inside _classical_mds_2d's backward.
+                x_mds = x_mds_64.to(D_v.dtype)
             except Exception:
                 aligned_list.append(x_ref[b])
                 continue
