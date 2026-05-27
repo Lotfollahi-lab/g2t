@@ -69,6 +69,23 @@ import torch
 from utils.data.dataholder import DataHolder
 
 
+def _remove_mean_with_mask(x: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
+    """Inlined copy of ``utils.data.load.remove_mean_with_mask`` to
+    avoid pulling scanpy through ``utils.data.load``'s module-level
+    import — keeps this file importable from a venv that doesn't
+    have scanpy (the lite test suite imports it that way).
+
+    Subtracts the per-batch-element mean over the REAL cells from
+    ``x`` (shape ``(B, N, D)``). The PAD-row safety assertions in
+    the canonical helper are dropped here — apply_noise already
+    masks ``x`` to zero on padding before calling this.
+    """
+    m = node_mask.unsqueeze(-1)                        # (B, N, 1)
+    n = m.sum(dim=1, keepdim=True).clamp_min(1)        # (B, 1, 1)
+    mean = (x * m).sum(dim=1, keepdim=True) / n        # (B, 1, D)
+    return (x - mean) * m                              # zero at PAD
+
+
 class EDMFlowMatchingModel:
     """Drop-in replacement for ``FlowMatchingModel`` that operates in
     the k-D embedding space whose pairwise distances are the EDM.
@@ -181,6 +198,16 @@ class EDMFlowMatchingModel:
                             device=device, dtype=dtype)
         mask = data.node_mask.unsqueeze(-1).to(dtype)
         noise = noise * mask
+        # Mean-remove the noise per slice over the REAL cells, so the
+        # FM trajectory's centroid stays at zero — matches the
+        # FlowMatchingModel convention (which removes x_1's mean,
+        # i.e. the noise endpoint). Without this the EDM-FM
+        # trajectory's centroid drifts O(1/sqrt(N)) per slice and
+        # the backbone has to learn to recover a random shift the
+        # standard FM model never saw. Apply to all k channels so
+        # the higher dims of h_t (used by the EDM head) are also
+        # centroid-free.
+        noise = _remove_mean_with_mask(noise, data.node_mask)
 
         # h_t = (1-t)·h_0 + t·noise.
         t_b = t.unsqueeze(-1)                                          # (B, 1, 1)
@@ -235,6 +262,10 @@ class EDMFlowMatchingModel:
         h_T = torch.randn(B, N, self.embed_dim, device=device, dtype=dtype)
         mask = node_mask.unsqueeze(-1).to(dtype)
         h_T = h_T * mask
+        # Mean-remove so the reverse trajectory starts on the same
+        # centroid manifold the apply_noise endpoint lives on. Same
+        # rationale as in apply_noise above.
+        h_T = _remove_mean_with_mask(h_T, node_mask)
         x_T = h_T[..., :2]                                             # (B, N, 2)
 
         # t=1 at the start of the reverse trajectory.

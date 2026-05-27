@@ -431,7 +431,15 @@ ENGINE_OUTPUT_SUBDIR = "scgg_model"  # <artifacts_root>/<dataset>/<this>/<TS>/
 # the vendored LUNA copy under scgg/src/.
 _ENGINE_REPO_DEFAULT = Path(__file__).resolve().parent.parent / "src"
 
-_ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
+# Artifacts root: honour SCGG_ARTIFACTS_ROOT (the same env var the LSF
+# submitter exports). Without this lookup, setting the env var only
+# redirects the LSF log dir while the python script kept writing to
+# the hardcoded NFS path — splitting a single run across two
+# filesystems silently.
+_ARTIFACTS_ROOT = Path(os.environ.get(
+    "SCGG_ARTIFACTS_ROOT",
+    "/nfs/team361/sb75/scgg-reproducibility/artifacts",
+))
 
 _EPOCH_RE = re.compile(r"epoch=(\d+)")
 
@@ -1094,6 +1102,7 @@ def run_benchmark(
     output_subdir: Optional[str] = None,
     embedding_field: Optional[str] = None,
     n_inference_samples: int = 1,
+    run_timestamp: Optional[str] = None,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
@@ -1116,16 +1125,31 @@ def run_benchmark(
     if (train_csv is None) != (test_csv is None):
         raise ValueError("--train_csv and --test_csv must be passed together.")
 
-    # Inference inherits the model's timestamp from the checkpoint
-    # path so artifacts pair up by eye: a checkpoint at
-    #   .../<engine>_model/20260521_225545/luna_run/checkpoints/epoch=N.ckpt
-    # produces an inference dir at
-    #   .../<engine>_inference/20260521_225545/...
-    # Training runs use the current wall clock (one fresh timestamp
-    # per run). Inference runs that can't find a YYYYMMDD_HHMMSS
-    # token in the checkpoint path fall back to the wall clock.
-    if skip_training and load_checkpoint is not None:
-        m = re.search(r"(\d{8}_\d{6})", str(load_checkpoint))
+    # Three sources for the run TS, in order of precedence:
+    #   1. ``run_timestamp`` arg — explicit override (set by
+    #      run_scgg_pipeline.py when it received --run_timestamp).
+    #   2. Regex-extracted from --load_checkpoint path (test-only mode
+    #      against a prior model; pairs inference dir with model dir).
+    #   3. Current wall clock — fresh train run with no external pin.
+    # Without source (1) the wandb-side timestamp (which goes into
+    # config / summary / tags via _luna_runner) silently disagreed
+    # with the on-disk artifacts dir TS when the pipeline pinned a
+    # different one. Mirror the LUNA-train fix from task #72.
+    if run_timestamp is not None:
+        # Accept YYYYMMDD_HHMMSS optionally followed by a
+        # _xxx uniquifier suffix (added by submit_pipeline.sh to
+        # prevent sub-second collisions when a for-loop fires many
+        # jobs in the same wall-clock second). The suffix is part of
+        # the directory name and must be preserved end-to-end.
+        if not re.fullmatch(r"\d{8}_\d{6}(?:_[A-Za-z0-9]+)?", run_timestamp):
+            raise ValueError(
+                f"run_timestamp must match YYYYMMDD_HHMMSS or "
+                f"YYYYMMDD_HHMMSS_<suffix>; got {run_timestamp!r}."
+            )
+        run_ts = run_timestamp
+    elif skip_training and load_checkpoint is not None:
+        # Same shape as above for the checkpoint-path extraction.
+        m = re.search(r"(\d{8}_\d{6}(?:_[A-Za-z0-9]+)?)", str(load_checkpoint))
         run_ts = m.group(1) if m else datetime.now().strftime("%Y%m%d_%H%M%S")
     else:
         run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1714,6 +1738,16 @@ def main() -> int:
              "ensembling). Typical values: 5-10. Linearly scales "
              "inference wall-clock.",
     )
+    p.add_argument(
+        "--run_timestamp", default=None,
+        help="Optional YYYYMMDD_HHMMSS run timestamp. When set, the "
+             "script does NOT generate a fresh wall-clock TS; it uses "
+             "this one for the artifacts subdir AND threads it through "
+             "to _luna_runner so wandb config/summary/tags carry the "
+             "same TS. Forwarded by run_scgg_pipeline.py so the LSF "
+             "submitter can pin one timestamp across LSF logs + "
+             "training dir + inference dir + wandb run.",
+    )
     args = p.parse_args()
 
     try:
@@ -1739,9 +1773,10 @@ def main() -> int:
             make_plots=args.plots,
             embedding_field=args.embedding_field,
             n_inference_samples=args.n_inference_samples,
+            run_timestamp=args.run_timestamp,
         )
     except Exception:
-        logger.exception("LUNA training failed")
+        logger.exception("scgg training failed")
         return 1
     return 0
 

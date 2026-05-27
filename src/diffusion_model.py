@@ -56,6 +56,19 @@ class FullDenoisingDiffusion(pl.LightningModule):
             # mirror it on the Lightning module so sample.py's outer
             # ``reversed(range(0, max_diffusion_steps))`` iterates once.
             self.max_diffusion_steps = 1
+        elif framework == "latent_diffusion":
+            # LDM has its own n_diffusion_steps knob under
+            # cfg.model.latent_diffusion.n_diffusion_steps (default 50,
+            # same as FM's default — but the two CAN diverge if the
+            # user overrides one). Previously this branch fell through
+            # to cfg.model.diffusion_steps (1000, the DDPM default),
+            # putting the outer sampling loop on a different grid than
+            # the LDM noise model's internal s_val computation
+            # (which divides by ldm_cfg.n_diffusion_steps). Mismatch
+            # silently distorted the FM-on-z trajectory.
+            ldm_cfg = getattr(cfg.model, "latent_diffusion", None)
+            n_steps = int(getattr(ldm_cfg, "n_diffusion_steps", 50)) if ldm_cfg is not None else 50
+            self.max_diffusion_steps = n_steps
         else:
             self.max_diffusion_steps = cfg.model.diffusion_steps
         self.log_every_steps = True
@@ -492,6 +505,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 anisotropic_gating=bool(
                     getattr(edm_cfg, "anisotropic_gating", False)
                 ),
+                mds_align_gradient=bool(
+                    getattr(edm_cfg, "mds_align_gradient", False)
+                ),
             )
 
         if knn_graph_enabled:
@@ -511,6 +527,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 spectral_layout=bool(getattr(knn_graph_cfg, "spectral_layout", True)),
                 k_for_layout=int(getattr(knn_graph_cfg, "k", 10)),
                 temperature=float(getattr(knn_graph_cfg, "temperature", 0.1)),
+                spectral_layout_gradient=bool(
+                    getattr(knn_graph_cfg, "spectral_layout_gradient", False)
+                ),
             )
 
         # Auxiliary gene-reconstruction head. Active iff
@@ -525,6 +544,29 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self._gene_recon_enabled = bool(
             getattr(recon_cfg, "enabled", False)
         ) if recon_cfg is not None else False
+        if self._gene_recon_enabled and framework == "latent_diffusion":
+            # Mutex: gene reconstruction masks gene features in the
+            # forward pass and asks the model to recover the masked
+            # values. Under framework=latent_diffusion, the VAE
+            # encoder runs inside apply_noise on the SAME (masked)
+            # gene features, so the encoder learns
+            # "masked-gene → latent" at training, but sees UNMASKED
+            # genes at inference (no gene-recon at sample time).
+            # The resulting distribution shift on the encoder's
+            # input degrades z_T → x_0 quality silently. If you
+            # want to combine them, the gene_recon path needs to
+            # be redesigned to feed UNmasked features to the
+            # encoder and only mask for the recon head. Until that
+            # exists, refuse the combination.
+            raise ValueError(
+                "model.gene_reconstruction.enabled=true is "
+                "incompatible with model.framework='latent_diffusion'. "
+                "Gene-recon masks gene features into the backbone, "
+                "but the LDM encoder runs on those same features in "
+                "apply_noise — train sees masked, inference sees "
+                "unmasked, and the encoder's input distribution "
+                "silently drifts. Disable one of the two."
+            )
         if self._gene_recon_enabled:
             self._gene_recon_mask_ratio = float(getattr(recon_cfg, "mask_ratio", 0.15))
             self._gene_recon_weight = float(getattr(recon_cfg, "weight", 0.05))
@@ -688,6 +730,15 @@ class FullDenoisingDiffusion(pl.LightningModule):
             "_ldm_mu",
             "_ldm_logvar",
             "_self_cond_x0",
+            # EDM-FM h-space state. Currently consumed only by the
+            # noise model's sampler (which reads it off the ORIGINAL
+            # z_t, not model_input), so omitting it would not break
+            # anything today — but propagating it defensively keeps
+            # the stash contract uniform with the LDM stashes and
+            # protects against future refactors that route the noise-
+            # model call through model_input instead of z_t.
+            "_edm_h_t",
+            "_edm_h_0",
         ):
             val = getattr(z_t, attr, None)
             if val is not None:

@@ -469,10 +469,10 @@ def main() -> int:
     # the same TS. Otherwise generate a fresh wall-clock timestamp.
     if args.run_timestamp:
         import re as _re
-        if not _re.fullmatch(r"\d{8}_\d{6}", args.run_timestamp):
+        if not _re.fullmatch(r"\d{8}_\d{6}(?:_[A-Za-z0-9]+)?", args.run_timestamp):
             sys.exit(
-                f"--run_timestamp must match YYYYMMDD_HHMMSS; got "
-                f"{args.run_timestamp!r}."
+                f"--run_timestamp must match YYYYMMDD_HHMMSS or "
+                f"YYYYMMDD_HHMMSS_<suffix>; got {args.run_timestamp!r}."
             )
         run_ts = args.run_timestamp
     else:

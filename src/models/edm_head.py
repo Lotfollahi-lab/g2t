@@ -132,12 +132,36 @@ class EDMOutputWrapper(nn.Module):
         embed_dim: int = 8,
         mds_align: bool = True,
         anisotropic_gating: bool = False,
+        mds_align_gradient: bool = False,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
         self.embed_dim = int(embed_dim)
         self.mds_align = bool(mds_align)
         self.anisotropic_gating = bool(anisotropic_gating)
+        # When False (the legacy default), the MDS-aligned positions
+        # are produced under ``torch.no_grad()`` and overwrite
+        # ``pred.positions`` with a gradient-FREE tensor. That's
+        # conservative for backward stability (eigh's backward has
+        # 1/(λ_i - λ_j) terms that NaN at near-degenerate eigenvalues),
+        # but it SILENTLY silences any loss component computed on
+        # ``pred.positions`` (sinkhorn, shape_matching, etc.) —
+        # the loss value still moves because the underlying D_sq
+        # improves under edm_distance_mse, but the gradient w.r.t.
+        # the model weights is zero through this path. Result: all
+        # runs comparing different position-space auxiliary losses
+        # produce IDENTICAL final weights (only edm_distance_mse
+        # drives training).
+        #
+        # When True, MDS runs WITH gradient and a NaN-guard hook is
+        # registered on the output. The hook intercepts NaN/Inf
+        # gradients (from eigh backward's pathological cases) and
+        # replaces them with zeros — so a single slice with
+        # near-degenerate eigvals at most loses its auxiliary-loss
+        # gradient contribution rather than poisoning the whole
+        # backward graph. The common case (well-separated eigvals)
+        # gets clean gradient flow.
+        self.mds_align_gradient = bool(mds_align_gradient)
 
         # Projector: per-cell (inner-features + position) → embedding.
         # We concat positions to inner features so the head sees the
@@ -223,26 +247,65 @@ class EDMOutputWrapper(nn.Module):
         pred.edm_h = h
 
         if self.mds_align:
-            # DETACH the MDS path from autograd. The MDS step uses
-            # ``torch.linalg.eigh``, whose backward formula has
-            # ``1/(λ_i − λ_j)`` terms that diverge to ±inf when
-            # eigenvalues are close. Even paths that produce a
-            # gradient of 0 at the OUTPUT (e.g. the cluster_balance
-            # fallback ``pred.positions.sum() * 0.0``) then compute
-            # ``0 × inf = NaN`` in autograd's chain-rule traversal,
-            # which poisons the entire backward. We don't need
-            # gradient through MDS anyway: the EDM loss reads
-            # ``pred.edm_D`` directly (no MDS in that path), and
-            # FM/DDPM Euler steps consume ``pred.positions`` only
-            # at inference (no backward). Setting requires_grad=False
-            # on the MDS output makes the gradient graph through this
-            # path explicitly empty, sidestepping the eigh-backward
-            # numerical issue.
-            with torch.no_grad():
+            if self.mds_align_gradient:
+                # GRADIENT-CARRYING MDS path. The MDS-aligned positions
+                # have a live autograd connection back to ``D_sq``, so
+                # any loss computed on ``pred.positions`` (sinkhorn,
+                # shape_matching, pairwise_distance_mse-on-positions)
+                # actually trains the model. Without this flag, those
+                # losses are silently no-ops — their values move
+                # because ``D_sq`` improves under edm_distance_mse,
+                # but their gradient w.r.t. the weights is zero, so
+                # they contribute nothing to training. Enabling this
+                # flag is the difference between "loss curves on
+                # wandb look reasonable" and "the auxiliary loss
+                # actually drives the model toward what it measures".
+                #
+                # Why it was off by default: eigh's backward formula
+                # has ``1/(λ_i − λ_j)`` terms that diverge at near-
+                # degenerate eigenvalues. We install a NaN-guard hook
+                # on the MDS output below that replaces any NaN/Inf
+                # gradient component with zero — so a single
+                # degenerate slice at most loses its own auxiliary-
+                # loss gradient contribution rather than poisoning the
+                # whole backward graph. The common case (well-
+                # separated eigvals on real point clouds) flows
+                # through cleanly.
                 new_pos = self._mds_align_positions(
-                    D_sq.detach(), pred.positions.detach(), data.node_mask,
+                    D_sq, pred.positions, data.node_mask,
                 )
-            new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
+                new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
+                # Hook MUST be registered on a tensor that
+                # requires_grad. Skip in eval / under no_grad context
+                # (e.g. inference), where the tensor won't have grad.
+                if new_pos.requires_grad:
+                    def _nan_to_zero(grad):
+                        # Replace NaN / ±Inf with 0. nan_to_num is
+                        # out-of-place and autograd-compatible.
+                        return torch.nan_to_num(
+                            grad, nan=0.0, posinf=0.0, neginf=0.0,
+                        )
+                    new_pos.register_hook(_nan_to_zero)
+            else:
+                # Legacy detached path. The MDS step uses
+                # ``torch.linalg.eigh``, whose backward formula has
+                # ``1/(λ_i − λ_j)`` terms that diverge to ±inf when
+                # eigenvalues are close. Even paths that produce a
+                # gradient of 0 at the OUTPUT (e.g. the cluster_balance
+                # fallback ``pred.positions.sum() * 0.0``) then compute
+                # ``0 × inf = NaN`` in autograd's chain-rule traversal,
+                # which poisons the entire backward. Detaching makes
+                # this slice gradient-free.
+                # NOTE: under this path, auxiliary position-space
+                # losses (sinkhorn, shape_matching, etc.) do NOT
+                # train the model — their gradient through pred.positions
+                # is identically zero. Set mds_align_gradient=True to
+                # restore that gradient signal.
+                with torch.no_grad():
+                    new_pos = self._mds_align_positions(
+                        D_sq.detach(), pred.positions.detach(), data.node_mask,
+                    )
+                new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
             pred.positions = new_pos
 
         return pred

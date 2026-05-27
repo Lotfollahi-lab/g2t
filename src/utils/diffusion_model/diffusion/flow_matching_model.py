@@ -284,6 +284,14 @@ class FlowMatchingModel:
             node_features=z_t.node_features,
             positions=positions,
             node_mask=node_mask,
+            # Preserve cell-class / cell-ID across the sampling chain.
+            # Backbones can condition on cell_class; without these
+            # passed through, every step after the first one passes
+            # None and the conditioning silently disappears.
+            # EDM-FM and LDM step functions already forward these;
+            # the FM path was inconsistent and missed them.
+            cell_class=getattr(z_t, "cell_class", None),
+            cell_ID=getattr(z_t, "cell_ID", None),
             t_int=s_int if s_int.dim() == 2 else s_int.view(1, 1).expand_as(new_t),
             t=new_t,
             diffusion_time=new_t,

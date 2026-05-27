@@ -59,27 +59,26 @@ def iterate_sampling(self, z_t: torch.Tensor, batch: DataHolder) -> torch.Tensor
         z_t._self_cond_x0 = torch.zeros_like(z_t.positions)
 
     # Iteratively sample z_s from z_t for each diffusion step.
-    # The forward inside ``sample_zs_from_zt`` returns ``pred``
-    # whose ``.positions`` IS the x_0 estimate at this step.
-    # We capture that and stash on z_s for the next iteration.
+    # ``sample_zs_from_zt`` returns ``(z_s, pred)`` — z_s is the next
+    # noised state (the ODE-blended intermediate ``(s/t)·z_t +
+    # ((t-s)/t)·x_0_pred`` for FM-x0-prediction), pred is the model's
+    # raw x_0 prediction at this step. The two are DIFFERENT when
+    # s > 0: pred.positions ≈ x_0_pred, while z_s.positions is a
+    # blend toward x_0_pred. For self-conditioning we want the model's
+    # raw x_0 prediction (mirrors the training-time recipe in
+    # training_step_func, which stashes ``first_pred.positions``,
+    # not the noised state). Using z_s.positions instead introduces a
+    # train/inference distribution mismatch that quietly degrades
+    # self-cond sampling quality.
     for s_int in reversed(range(0, self.max_diffusion_steps, sample_interval)):
         s_array = torch.full(
             (1, 1), s_int, dtype=torch.long, device=batch.node_features.device
         )
-        # Save the current self-cond before we overwrite z_t.
-        prev_self_cond = getattr(z_t, "_self_cond_x0", None) if self_cond_on else None
-        z_s = sample_zs_from_zt(self, z_t, s_array)
+        z_s, pred = sample_zs_from_zt(self, z_t, s_array)
         if self_cond_on:
-            # The next forward will see z_s._self_cond_x0. The pred
-            # we just made is the best x_0 estimate so far; cache it
-            # so the LightningModule's next forward uses it.
-            # ``sample_zs_from_zt_and_pred`` returns z_s with the
-            # noise-model-decided positions (the next intermediate);
-            # the x_0 ESTIMATE comes from the network's prediction
-            # which we don't have direct access to here. We approximate
-            # by using z_s.positions, which for FM IS close to the
-            # current x_0 estimate after the Euler step.
-            z_s._self_cond_x0 = z_s.positions.detach()
+            # Canonical x_0 prediction — matches the training-time
+            # self-cond contract.
+            z_s._self_cond_x0 = pred.positions.detach()
         z_t = z_s
 
     return z_t
@@ -112,7 +111,7 @@ def sample_from_single_graph(
     return sampled_graph.positions
 
 
-def sample_zs_from_zt(self, z_t: torch.Tensor, s_int: torch.Tensor) -> torch.Tensor:
+def sample_zs_from_zt(self, z_t: torch.Tensor, s_int: torch.Tensor):
     """
     Samples zs ~ p(zs | zt) for the denoising process.
 
@@ -121,7 +120,15 @@ def sample_zs_from_zt(self, z_t: torch.Tensor, s_int: torch.Tensor) -> torch.Ten
         s_int (torch.Tensor): The tensor representing the integer time step s.
 
     Returns:
-        torch.Tensor: The sampled zs tensor.
+        Tuple[DataHolder, DataHolder]: ``(z_s, pred)``.
+            * ``z_s`` is the next noised state from the noise model.
+            * ``pred`` is the model's raw forward output (i.e. the
+              x_0 prediction for x_0-prediction parameterisations).
+              Returned so callers (``iterate_sampling``) can stash
+              ``pred.positions.detach()`` as the self-conditioning
+              input for the next step — that's the value the
+              training-step self-cond contract uses, NOT z_s.positions
+              which is the ODE-blended intermediate.
 
     Notes:
         Default path is single-forward (Euler / DDPM reverse step).
@@ -130,6 +137,11 @@ def sample_zs_from_zt(self, z_t: torch.Tensor, s_int: torch.Tensor) -> torch.Ten
         Euler-predicted endpoint and ask the noise model to apply
         the Heun (trapezoidal) correction. DDPM's NoiseModel never
         sets ``sampler``, so its path is untouched.
+
+        For Heun-corrected sampling we return the FIRST forward's
+        pred (the one evaluated at z_t). This matches the training-
+        time self-cond protocol, which conditions on a prediction
+        evaluated at z_t — not at z_s_euler.
     """
     pred = self.forward(z_t)
     z_s = self.noise_model.sample_zs_from_zt_and_pred(z_t=z_t, pred=pred, s_int=s_int)
@@ -143,7 +155,7 @@ def sample_zs_from_zt(self, z_t: torch.Tensor, s_int: torch.Tensor) -> torch.Ten
         z_s = self.noise_model.heun_correction(
             z_t=z_t, pred1=pred, z_s_euler=z_s, pred2=pred2, s_int=s_int,
         )
-    return z_s
+    return z_s, pred
 
 
 @torch.no_grad()

@@ -1195,6 +1195,15 @@ class HierarchicalCoarseToFineWrapper(nn.Module):
             kmeans_n_iters=self.kmeans_n_iters,
             cluster_mode=self.cluster_mode,
             gumbel_tau=self.gumbel_tau,
+            # Without these two, GeneClusterModule's defaults
+            # (anneal_steps=0) silently disabled the annealing
+            # schedule for HierarchicalCoarseToFineWrapper runs
+            # — the cfg knobs were read into self.* (above) but
+            # never reached the cluster module. The CoarseToFine
+            # wrapper at line 735 already passes these correctly;
+            # mirror it here.
+            gumbel_anneal_steps=self.gumbel_anneal_steps,
+            gumbel_tau_final=self.gumbel_tau_final,
         )
         self.coarse_regressor = CoarseRegressor(
             cluster_feature_dim=gene_proj_dim,

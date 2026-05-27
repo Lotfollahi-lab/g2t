@@ -522,7 +522,18 @@ _ENGINE_REPO_DEFAULT = Path(
     "/nfs/team361/sb75/scgg-reproducibility/analysis/benchmarking/luna"
 )
 
-_ARTIFACTS_ROOT = Path("/nfs/team361/sb75/scgg-reproducibility/artifacts")
+# Artifacts root: honour LUNA_ARTIFACTS_ROOT (the LSF submitter
+# exports SCGG_ARTIFACTS_ROOT; both names accepted for parity with
+# the per-engine convention used elsewhere in the codebase).
+# Without this lookup, the env var only redirects the LSF log dir
+# while the python script kept writing to the hardcoded NFS path.
+_ARTIFACTS_ROOT = Path(os.environ.get(
+    "LUNA_ARTIFACTS_ROOT",
+    os.environ.get(
+        "SCGG_ARTIFACTS_ROOT",
+        "/nfs/team361/sb75/scgg-reproducibility/artifacts",
+    ),
+))
 
 _EPOCH_RE = re.compile(r"epoch=(\d+)")
 
@@ -1184,14 +1195,16 @@ def run_benchmark(
     #      against a prior model; pairs inference dir with model dir).
     #   3. Current wall clock — fresh train run with no external pin.
     if run_timestamp is not None:
-        if not re.fullmatch(r"\d{8}_\d{6}", run_timestamp):
+        # Accept the optional ``_xxx`` uniquifier appended by
+        # submit_pipeline.sh to prevent sub-second collisions.
+        if not re.fullmatch(r"\d{8}_\d{6}(?:_[A-Za-z0-9]+)?", run_timestamp):
             raise ValueError(
-                f"run_timestamp must match YYYYMMDD_HHMMSS; got "
-                f"{run_timestamp!r}."
+                f"run_timestamp must match YYYYMMDD_HHMMSS or "
+                f"YYYYMMDD_HHMMSS_<suffix>; got {run_timestamp!r}."
             )
         run_ts = run_timestamp
     elif skip_training and load_checkpoint is not None:
-        m = re.search(r"(\d{8}_\d{6})", str(load_checkpoint))
+        m = re.search(r"(\d{8}_\d{6}(?:_[A-Za-z0-9]+)?)", str(load_checkpoint))
         run_ts = m.group(1) if m else datetime.now().strftime("%Y%m%d_%H%M%S")
     else:
         run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")

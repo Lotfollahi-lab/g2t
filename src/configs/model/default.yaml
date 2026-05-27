@@ -869,6 +869,28 @@ edm:
     # acts as a pure auxiliary loss). Default true: the canonical
     # frame is the whole point.
     mds_align: true
+    # When ``mds_align: true``, the MDS-aligned ``pred.positions``
+    # are by default produced under ``torch.no_grad()`` (so the
+    # backward graph can't poison itself through ``torch.linalg.eigh``'s
+    # 1/(λ_i - λ_j) backward singularity at near-degenerate
+    # eigenvalues). The defensive detach has a SILENT cost:
+    # auxiliary losses computed on ``pred.positions`` (sinkhorn,
+    # shape_matching, pairwise_distance_mse-on-positions) have
+    # zero gradient w.r.t. the model weights through this path —
+    # their loss values move because ``D_sq`` improves under
+    # edm_distance_mse, but they contribute nothing to training.
+    # Set ``mds_align_gradient: true`` to RESTORE gradient flow.
+    # A NaN-guard backward hook is installed on the MDS output so
+    # any near-degenerate slice at most loses its own gradient
+    # contribution rather than poisoning the entire backward graph.
+    # This is the difference between "wandb shows the auxiliary
+    # loss going down" (the legacy false path: it goes down but
+    # doesn't train) and "the auxiliary loss actually trains the
+    # model toward what it measures" (true). Default false
+    # preserves the legacy behaviour for existing checkpoints;
+    # turn on for any run that combines EDM with a non-EDM
+    # auxiliary loss.
+    mds_align_gradient: false
     # ---- Architectural extension #1 — bilinear / anisotropic gating ----
     # When true, the EDM head computes a learned Mahalanobis-style
     # distance D_ij = (h_i − h_j)^T M (h_i − h_j) with M = W^T W
@@ -988,6 +1010,18 @@ knn_graph:
     # backbone's raw output (useful for ablation: does the graph
     # supervision alone help the backbone's positional prediction?).
     spectral_layout: true
+    # When ``spectral_layout: true``, the spectral-layout
+    # ``pred.positions`` is by default produced under
+    # ``torch.no_grad()`` (defends against the same eigh-degenerate
+    # backward issue as edm.mds_align). Same silent-silencing
+    # caveat: any auxiliary loss that operates on pred.positions
+    # (shape_matching, sinkhorn, knn_rank, persistent_homology,
+    # pairwise_distance_mse-on-positions) gets ZERO gradient through
+    # this path. The ``LossFunction.__init__`` guard raises at
+    # config-load time if this combination is detected, so it can't
+    # silently happen. Set to ``true`` to restore gradient flow with
+    # a NaN-guard backward hook (mirrors edm.mds_align_gradient).
+    spectral_layout_gradient: false
 
 # ---------------------------------------------------------------------------
 # scGG fundamental method #3 (scaffold): SE(2)-equivariant vector-neuron

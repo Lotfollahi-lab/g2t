@@ -423,6 +423,112 @@ class LossFunction(nn.Module):
             active.append(f"{name}(w={w:.3g}{extra})")
         print(f"[LossFunction] active components: {', '.join(active) or '(none!)'}")
 
+        # -------- Fail-loud check: silently-silenced auxiliary losses --------
+        # These components compute their loss VALUE on
+        # ``pred.positions``. Under EDM with ``mds_align=true`` AND
+        # ``mds_align_gradient=false`` (legacy default), the EDM head
+        # overwrites pred.positions under torch.no_grad() with
+        # detached MDS coordinates — making the gradient path through
+        # pred.positions IDENTICALLY ZERO. The loss values still
+        # move (because edm_distance_mse improves D_sq, which
+        # improves the post-MDS positions), but the model never
+        # learns from these auxiliary signals. This caused a real
+        # silent bug where 5 ablation runs varying ONLY in their
+        # auxiliary loss config produced bit-identical Spearman to
+        # 16 decimal places.
+        #
+        # Refuse to start training when this combination is
+        # configured. The user must either (a) enable
+        # mds_align_gradient=True, (b) disable the listed
+        # components, or (c) disable EDM.
+        edm_on = bool(_cfg_get(cfg, "model", "edm", "enabled", default=False))
+        edm_mds = bool(_cfg_get(cfg, "model", "edm", "mds_align", default=True))
+        edm_grad = bool(_cfg_get(cfg, "model", "edm", "mds_align_gradient",
+                                 default=False))
+        edm_silenced = edm_on and edm_mds and not edm_grad
+
+        # SAME structural bug class for the kNN-graph head: when
+        # ``knn_graph.spectral_layout=true`` AND
+        # ``knn_graph.spectral_layout_gradient=false``, pred.positions
+        # is detached after the Laplacian eigenmaps step. Audit-found
+        # by the 2026-05-27 silent-silencing review.
+        knn_graph_on = bool(_cfg_get(cfg, "model", "knn_graph", "enabled",
+                                     default=False))
+        knn_spectral = bool(_cfg_get(cfg, "model", "knn_graph",
+                                     "spectral_layout", default=True))
+        knn_grad = bool(_cfg_get(cfg, "model", "knn_graph",
+                                 "spectral_layout_gradient", default=False))
+        knn_silenced = knn_graph_on and knn_spectral and not knn_grad
+
+        if edm_silenced or knn_silenced:
+            silenced: List[str] = []
+            if self._shape_enabled:
+                silenced.append("shape_matching")
+            if self._sk_enabled:
+                silenced.append("sinkhorn")
+            if self._knn_enabled:
+                silenced.append("knn_rank")
+            if self._ph_enabled:
+                silenced.append("persistent_homology")
+            # pairwise_distance_mse-on-positions also operates on
+            # pred.positions. It's normally AUTO-disabled when EDM or
+            # kNN are on (via ``replace_position_loss=true``) — but
+            # we should still flag it if the user explicitly
+            # re-enabled it under a silenced path.
+            if self._pwd_enabled:
+                silenced.append("pairwise_distance_mse")
+            if silenced:
+                # Build the specific reason chain.
+                reasons = []
+                if edm_silenced:
+                    reasons.append(
+                        "model.edm.enabled=true AND "
+                        "model.edm.mds_align=true AND "
+                        "model.edm.mds_align_gradient=false"
+                    )
+                if knn_silenced:
+                    reasons.append(
+                        "model.knn_graph.enabled=true AND "
+                        "model.knn_graph.spectral_layout=true AND "
+                        "model.knn_graph.spectral_layout_gradient=false"
+                    )
+                # Tailor the fix suggestion to which head is silencing.
+                gradient_flag_hint = []
+                if edm_silenced:
+                    gradient_flag_hint.append(
+                        "model.edm.mds_align_gradient=true"
+                    )
+                if knn_silenced:
+                    gradient_flag_hint.append(
+                        "model.knn_graph.spectral_layout_gradient=true"
+                    )
+                raise ValueError(
+                    "Silent-silencing combination detected. The "
+                    f"following loss components are enabled: {silenced}. "
+                    "All of them compute their loss on "
+                    "``pred.positions`` — but the following config "
+                    f"silences the gradient through that path: "
+                    f"{' AND '.join(reasons)}. Result: the loss "
+                    "values still move on the wandb chart (because "
+                    "the underlying head's gradient-bearing output — "
+                    "edm_D or knn_logits — keeps improving), but the "
+                    "model is NOT actually trained by these auxiliary "
+                    "losses. To proceed, do exactly one of:\n"
+                    "  1) Enable the gradient-restoring flag(s): "
+                    f"{', '.join(gradient_flag_hint)}. The MDS / "
+                    "     spectral-layout path then carries gradient "
+                    "     AND a NaN-guard backward hook contains any "
+                    "     eigh-degenerate slice.\n"
+                    "  2) Disable the listed loss components and "
+                    "     rely on the head-native loss alone "
+                    "     (edm_distance_mse / knn_graph_loss).\n"
+                    "  3) Disable the head (model.edm.enabled=false "
+                    "     OR model.knn_graph.enabled=false) — falls "
+                    "     back to the inner backbone's direct "
+                    "     pred.positions output, gradient flows "
+                    "     unconditionally."
+                )
+
     # ----------------------------- component implementations --------------
 
     @staticmethod
@@ -919,9 +1025,65 @@ class LossFunction(nn.Module):
             true_sorted = true_padded[true_order]
             pred_sorted = pred_padded[pred_order]
 
-            # Sum of squared coord differences — approximation to W2²
-            # under the sorted-lifetime matching.
-            slice_loss = ((true_sorted - pred_sorted) ** 2).sum(dim=-1).mean()
+            # W2² with diagonal-slack matching.
+            #
+            # Three cases per matched pair (true_sorted[i], pred_sorted[i]):
+            #
+            #   (a) Both real (lifetime > 0):
+            #         cost = (b_t - b_p)² + (d_t - d_p)²       — standard L2² pair cost
+            #
+            #   (b) One side is a diagonal pad (b = d = 0 — written by
+            #       _pad_pd_with_diagonal), other side is real:
+            #         cost = (b - d)² / 2                       — distance² from the
+            #         real point to its nearest diagonal projection ((b+d)/2,(b+d)/2).
+            #         This is the canonical W₂² diagonal-slack convention.
+            #
+            #   (c) Both diagonal pads:
+            #         cost = 0.
+            #
+            # The original code used the case-(a) formula EVERYWHERE,
+            # penalising case (b) by (b² + d²) instead of (b−d)²/2.
+            # For matched pairs where (b, d) lie close to the diagonal
+            # this over-penalises by up to 2×, which biased the model
+            # toward suppressing all 1-features whenever the predicted
+            # PD had higher cardinality than the truth.
+            true_lifetimes_s = (true_sorted[:, 1] - true_sorted[:, 0]).detach()
+            pred_lifetimes_s = (pred_sorted[:, 1] - pred_sorted[:, 0]).detach()
+            # Threshold guards against fp rounding noise — real features
+            # have strictly positive lifetimes (gudhi only emits PD
+            # points with death > birth), pads have exactly zero.
+            eps_pad = 1e-10
+            is_pad_true = true_lifetimes_s < eps_pad
+            is_pad_pred = pred_lifetimes_s < eps_pad
+            both_real = (~is_pad_true) & (~is_pad_pred)
+            pad_t_only = is_pad_true & (~is_pad_pred)
+            pad_p_only = is_pad_pred & (~is_pad_true)
+
+            # Case (a) — paired real features.
+            real_cost = ((true_sorted - pred_sorted) ** 2).sum(dim=-1)
+            # Case (b1) — pred real, true pad: penalise pred by its
+            # diagonal-projection distance².
+            pred_diag_cost = (
+                (pred_sorted[:, 0] - pred_sorted[:, 1]) ** 2 * 0.5
+            )
+            # Case (b2) — true real, pred pad: penalise by true's
+            # diagonal-projection distance². This term has no gradient
+            # (the true PD is gradient-free anyway) but contributes
+            # to the slice loss magnitude, so we include it for
+            # numerical comparability with the all-paired case.
+            true_diag_cost = (
+                (true_sorted[:, 0] - true_sorted[:, 1]) ** 2 * 0.5
+            )
+            zero_cost = torch.zeros_like(real_cost)
+
+            per_pair = torch.where(
+                both_real, real_cost,
+                torch.where(
+                    pad_t_only, pred_diag_cost,
+                    torch.where(pad_p_only, true_diag_cost, zero_cost),
+                ),
+            )
+            slice_loss = per_pair.mean()
             slice_losses.append(slice_loss)
 
         if not slice_losses:
@@ -1570,13 +1732,31 @@ class LossFunction(nn.Module):
         train_stage: bool = True,
         log: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
-        # Remember the last batch so log_epoch_metrics can re-derive
-        # without forcing a second forward (matches LUNA's pattern).
+        # Remember the last batch so log_epoch_metrics can publish the
+        # most recent step's metrics WITHOUT calling compute_loss
+        # again. Previously log_epoch_metrics re-ran compute_loss,
+        # which advanced stateful counters in the components (PH
+        # _ph_step_counter, RNG state in Sinkhorn's negative
+        # sampling, etc.) and silently shifted their schedules by
+        # one extra increment per epoch.
         self.true_positions = masked_true.positions
         self.pred_positions = masked_pred.positions
         self.node_mask = masked_true.node_mask
 
         loss, per_component = self.compute_loss(masked_pred, masked_true)
+
+        # Stash for log_epoch_metrics. Use a snapshot of the FLOAT
+        # values (already detached inside compute_loss via .item()
+        # on each component) so callers can't accidentally hold on
+        # to gradient-bearing tensors.
+        self._last_per_component = dict(per_component)
+        # Also snapshot the shape-diagnostic stash for the epoch
+        # summary — _last_shape_diagnostics is repopulated each
+        # _compute_shape_matching call and would be wiped by any
+        # future call to compute_loss, so we capture it now.
+        self._last_shape_diagnostics_snapshot = list(
+            self._last_shape_diagnostics
+        )
 
         to_log: Optional[Dict[str, float]] = None
         if log:
@@ -1608,29 +1788,22 @@ class LossFunction(nn.Module):
         pass
 
     def log_epoch_metrics(self) -> Dict[str, float]:
-        """Recompute the loss from the most recent forward's tensors and
-        log it as `train_epoch/*`. Used by LUNA's training-step wrapper.
+        """Publish the most recent forward's per-component metrics as
+        ``train_epoch/*``. Used by LUNA's training-step wrapper.
+
+        Reads ``self._last_per_component`` (snapshot stashed in
+        ``forward()``) rather than re-running ``compute_loss`` on the
+        cached tensors. Re-running used to (a) double the wall-clock
+        cost of every component once per epoch, (b) advance PH's
+        step counter an extra time per epoch, shifting the
+        ``frequency`` schedule, and (c) draw fresh random
+        subsamples in components like Sinkhorn — meaning the
+        published epoch number wasn't the same loss the training
+        step used.
         """
-        if (
-            self.true_positions is None
-            or self.pred_positions is None
-            or self.node_mask is None
-        ):
+        per_component = getattr(self, "_last_per_component", None)
+        if not per_component:
             return {}
-
-        # Wrap the remembered tensors back into the DataHolder-shaped
-        # objects compute_loss expects. Only the three attributes we
-        # actually look at need to be present.
-        class _Bag:
-            pass
-        masked_pred = _Bag()
-        masked_pred.positions = self.pred_positions
-        masked_pred.node_mask = self.node_mask
-        masked_true = _Bag()
-        masked_true.positions = self.true_positions
-        masked_true.node_mask = self.node_mask
-
-        _, per_component = self.compute_loss(masked_pred, masked_true)
 
         to_log = {
             f"train_epoch/{k}": v for k, v in per_component.items()
@@ -1640,11 +1813,21 @@ class LossFunction(nn.Module):
             to_log["train_epoch/position_mse"] = per_component[
                 "pairwise_distance_mse"
             ]
-        # Epoch-level shape diagnostics (same numerics as the per-
-        # step ``train_shape/...``, derived from the recomputation
-        # above). Empty dict if shape_matching is disabled or all
-        # slices were degenerate.
-        to_log.update(self._summarise_shape_diagnostics("train_epoch_shape"))
+        # Epoch-level shape diagnostics. Restore the snapshot
+        # captured at forward() time so the values match the step's
+        # numbers; _summarise_shape_diagnostics reads
+        # _last_shape_diagnostics. Empty dict if shape_matching is
+        # disabled or all slices were degenerate at the last step.
+        prev_stash = self._last_shape_diagnostics
+        self._last_shape_diagnostics = getattr(
+            self, "_last_shape_diagnostics_snapshot", []
+        )
+        try:
+            to_log.update(
+                self._summarise_shape_diagnostics("train_epoch_shape")
+            )
+        finally:
+            self._last_shape_diagnostics = prev_stash
         if wandb.run:
             wandb.log(to_log, commit=False)
         return to_log

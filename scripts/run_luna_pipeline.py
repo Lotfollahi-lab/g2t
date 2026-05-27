@@ -92,10 +92,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
 
     # ---------------- Train-side knobs ----------------
-    p.add_argument("--epochs", type=int, default=1000,
-                   help="train.n_epochs override (LUNA paper default: 1000).")
-    p.add_argument("--batch_size", type=int, default=6,
-                   help="train.batch_size override (LUNA paper default: 6).")
+    p.add_argument("--epochs", type=int, default=None,
+                   help="train.n_epochs override. When omitted, the "
+                        "underlying run_luna_train.py default (1000, "
+                        "the LUNA paper value) applies — so a Hydra "
+                        "override 'train.n_epochs=X' in --override "
+                        "wins. Pass this flag only when you want to "
+                        "set epochs explicitly via the wrapper.")
+    p.add_argument("--batch_size", type=int, default=None,
+                   help="train.batch_size override. When omitted, the "
+                        "underlying run_luna_train.py default (6, the "
+                        "LUNA paper value) applies — so a Hydra "
+                        "override 'train.batch_size=X' in --override "
+                        "wins. Pass this flag only when you want to "
+                        "set batch_size explicitly via the wrapper.")
     p.add_argument("--lr", type=float, default=None,
                    help="Optional train.lr override. LUNA's published "
                         "default for the cortex experiment is 5e-4.")
@@ -230,11 +240,18 @@ def _build_train_cmd(
     cmd += [
         "--output_dir", str(train_output_dir),
         "--run_timestamp", timestamp,
-        "--epochs", str(args.epochs),
-        "--batch_size", str(args.batch_size),
         "--seed", str(args.seed),
         "--wandb_mode", args.wandb_mode,
     ]
+    # Only forward --epochs / --batch_size when the user explicitly
+    # passed them — so a Hydra override of train.n_epochs /
+    # train.batch_size in --override actually wins, instead of being
+    # silently clobbered by the wrapper's default value being placed
+    # BEFORE the override list on the cmdline.
+    if args.epochs is not None:
+        cmd += ["--epochs", str(args.epochs)]
+    if args.batch_size is not None:
+        cmd += ["--batch_size", str(args.batch_size)]
     if args.lr is not None:
         cmd += ["--lr", str(args.lr)]
     if args.log2_normalize:
@@ -255,11 +272,17 @@ def _build_train_cmd(
 def _build_inference_cmd(
     args: argparse.Namespace,
     checkpoint: Path,
+    infer_output_dir: Path,
 ) -> list[str]:
-    """Construct the run_luna_inference.py argv. Inference INHERITS
-    the timestamp from the checkpoint path (regex in run_luna_train.py),
-    so we don't pass --output_dir explicitly — the inference artifacts
-    land at artifacts/<dataset>/luna_inference/<TS>/ automatically.
+    """Construct the run_luna_inference.py argv. ``--output_dir`` is
+    pinned here explicitly (mirrors the scgg pipeline) so the
+    inference subprocess writes to the SAME filesystem the pipeline
+    has chosen — previously inference relied on regex-extraction of
+    the timestamp from the checkpoint path + the hardcoded
+    ``_ARTIFACTS_ROOT`` inside run_luna_train, which silently split
+    a run across two filesystems whenever ``LUNA_ARTIFACTS_ROOT``
+    was set to redirect outputs (the env-var lookup added in
+    run_luna_train.py:525 is honoured, but only by THAT process).
     """
     cmd = [sys.executable, str(_INFER_SCRIPT)]
     if args.data_dir:
@@ -272,6 +295,7 @@ def _build_inference_cmd(
         cmd += ["--n_genes", str(args.n_genes)]
     cmd += [
         "--checkpoint", str(checkpoint),
+        "--output_dir", str(infer_output_dir),
         "--seed", str(args.seed),
         "--wandb_mode", args.inference_wandb_mode or args.wandb_mode,
     ]
@@ -332,10 +356,10 @@ def main() -> int:
     # run config all share the same TS.
     if args.run_timestamp:
         import re as _re
-        if not _re.fullmatch(r"\d{8}_\d{6}", args.run_timestamp):
+        if not _re.fullmatch(r"\d{8}_\d{6}(?:_[A-Za-z0-9]+)?", args.run_timestamp):
             sys.exit(
-                f"--run_timestamp must match YYYYMMDD_HHMMSS; got "
-                f"{args.run_timestamp!r}."
+                f"--run_timestamp must match YYYYMMDD_HHMMSS or "
+                f"YYYYMMDD_HHMMSS_<suffix>; got {args.run_timestamp!r}."
             )
         timestamp = args.run_timestamp
     else:
@@ -380,7 +404,7 @@ def main() -> int:
         return 0
 
     # ---- 2. Inference ----
-    infer_cmd = _build_inference_cmd(args, checkpoint)
+    infer_cmd = _build_inference_cmd(args, checkpoint, infer_output_dir)
     logger.info(f"[2/2] Inference. Command:")
     for token in infer_cmd:
         logger.info(f"    {token}")

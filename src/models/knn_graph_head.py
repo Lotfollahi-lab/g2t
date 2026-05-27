@@ -132,6 +132,7 @@ class KNNGraphOutputWrapper(nn.Module):
         spectral_layout: bool = True,
         k_for_layout: int = 10,
         temperature: float = 0.1,
+        spectral_layout_gradient: bool = False,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
@@ -148,6 +149,17 @@ class KNNGraphOutputWrapper(nn.Module):
             raise ValueError(
                 f"knn_graph.temperature must be > 0; got {temperature}"
             )
+        # Mirror of ``model.edm.mds_align_gradient`` — same trade-off,
+        # same fix. When False (legacy default), the spectral-layout
+        # ``pred.positions`` is detached and any position-space
+        # auxiliary loss (shape_matching, sinkhorn, knn_rank,
+        # persistent_homology, pairwise_distance_mse-on-positions)
+        # has ZERO gradient through this path. When True, gradient
+        # flows AND a torch.nan_to_num backward hook contains the
+        # eigh-degenerate NaN risk to the affected slice. See
+        # configs/model/default.yaml::knn_graph.spectral_layout_gradient
+        # for the user-facing explanation.
+        self.spectral_layout_gradient = bool(spectral_layout_gradient)
 
         in_dim = int(inner_out_dim) + 2
         hidden = max(32, 2 * self.embed_dim)
@@ -202,21 +214,46 @@ class KNNGraphOutputWrapper(nn.Module):
         pred.knn_logits = logits
 
         if self.spectral_layout:
-            # DETACH the spectral-layout path from autograd for the
-            # same reason as EDM's MDS detach (see edm_head.py): the
-            # Laplacian eigenmaps eigh has the same near-degenerate-
-            # eigenvalue backward issue (1/(λ_i − λ_j) → inf), and
-            # the cluster_balance loss-component fallback path
-            # ``pred.positions.sum() * 0.0`` would then propagate
-            # ``0 × inf = NaN`` to every parameter. The k-NN loss
-            # reads ``pred.knn_logits`` directly (not pred.positions),
-            # so we don't need gradient through this path; inference
-            # doesn't backward at all.
-            with torch.no_grad():
+            if self.spectral_layout_gradient:
+                # GRADIENT-CARRYING spectral-layout path. Same trade-off
+                # as edm_head.py::mds_align_gradient: the Laplacian
+                # eigenmaps eigh has 1/(λ_i − λ_j) backward terms
+                # that diverge at near-degenerate eigenvalues. We
+                # install a torch.nan_to_num backward hook on the
+                # spectral-layout output below, so a degenerate slice
+                # at most loses its own auxiliary-loss gradient
+                # contribution rather than poisoning the entire
+                # backward graph. The common case (well-separated
+                # eigvals) flows through cleanly. Enable this when
+                # combining knn_graph with shape_matching / sinkhorn
+                # / knn_rank / persistent_homology / pairwise_distance_mse;
+                # otherwise those losses contribute zero gradient.
                 new_pos = self._spectral_layout(
-                    logits.detach(), pred.positions.detach(), data.node_mask,
+                    logits, pred.positions, data.node_mask,
                 )
-            new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
+                new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
+                if new_pos.requires_grad:
+                    def _nan_to_zero(grad):
+                        return torch.nan_to_num(
+                            grad, nan=0.0, posinf=0.0, neginf=0.0,
+                        )
+                    new_pos.register_hook(_nan_to_zero)
+            else:
+                # Legacy detached path. The k-NN loss reads
+                # ``pred.knn_logits`` directly (not pred.positions),
+                # so this path is fine in isolation. But under any
+                # auxiliary loss that reads pred.positions, the
+                # gradient through this path is IDENTICALLY ZERO —
+                # those losses still show non-zero values on wandb
+                # (positions improve as logits improve), but the
+                # model is not trained by them. The fail-loud guard
+                # in ``LossFunction.__init__`` catches this combo
+                # at config-load time so it can't silently happen.
+                with torch.no_grad():
+                    new_pos = self._spectral_layout(
+                        logits.detach(), pred.positions.detach(), data.node_mask,
+                    )
+                new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
             pred.positions = new_pos
 
         return pred

@@ -328,12 +328,21 @@ class NoiseModel:
         Raises:
             AssertionError: If the shape of node_mask is inconsistent.
         """
-        # Randomly sample positions from a normal distribution
+        # Randomly sample positions from a normal distribution.
+        # NOTE: there used to be a ``torch.manual_seed(0)`` call right
+        # after this draw. It was removed (2026-05-27) because it (a)
+        # reseeded the GLOBAL CPU RNG mid-sampler, destroying any
+        # subsequent CPU randomness in the run (including any other
+        # sampler calls within the same epoch), and (b) made
+        # multi-sample inference ensembling useless on the DDPM path:
+        # every call returned a noise tensor sharing the same downstream
+        # CPU-RNG trajectory, so n_inference_samples > 1 produced
+        # near-identical samples that averaged to a single sample
+        # (zero useful variance). Seeding belongs at run start
+        # (general.seed), not per-sampler-call.
         positions = torch.randn(
             node_mask.shape[0], node_mask.shape[1], 2, device=node_mask.device
         )
-
-        torch.manual_seed(0)
 
         # Apply node mask to the sampled positions
         positions = positions * node_mask.unsqueeze(-1)
