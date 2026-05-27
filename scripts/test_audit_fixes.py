@@ -1036,6 +1036,82 @@ def test_warmup_counter_doesnt_advance_on_val_stage() -> None:
     )
 
 
+def test_graph_zero_bypasses_mds_path() -> None:
+    """Regression test for the 0×Inf NaN trap.
+
+    Setup: build a tiny EDM scenario where MDS's eigh backward is
+    artificially set to produce Inf for any nonzero incoming
+    gradient (we don't actually call MDS — we just verify the
+    helper returns a zero whose autograd connection bypasses
+    ``pred.positions``).
+
+    Specifically: when ``masked_pred.edm_D`` exists, ``_graph_zero``
+    must return a zero whose ``grad_fn`` traces through edm_D,
+    NOT through positions. We check this by verifying that the
+    returned tensor's autograd graph has edm_D in its inputs.
+    """
+    from utils.data.dataholder import DataHolder
+    from metrics.loss_function import _graph_zero
+
+    # Build a DataHolder where positions and edm_D are SEPARATE
+    # gradient-bearing tensors. _graph_zero should pick edm_D.
+    pos = torch.randn(1, 8, 2, requires_grad=True)
+    edm_D = torch.randn(1, 8, 8, requires_grad=True)
+    data = DataHolder(
+        node_features=torch.zeros(1, 8, 4), positions=pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+        cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1), node_mask=torch.ones(1, 8, dtype=torch.bool),
+    )
+    data.edm_D = edm_D  # stash, as EDM head does
+
+    zero = _graph_zero(data)
+    assert zero.item() == 0.0
+    # Backward: gradient should land on edm_D, NOT on positions.
+    # (Both have requires_grad=True; the helper should route
+    # through whichever it prefers.)
+    pos.grad = None
+    edm_D.grad = None
+    zero.backward()
+    assert pos.grad is None or pos.grad.abs().sum().item() == 0.0, (
+        "_graph_zero should not propagate gradient through "
+        "pred.positions when edm_D is available — that's the 0×Inf "
+        "NaN trap we're avoiding."
+    )
+    assert edm_D.grad is not None, (
+        "_graph_zero should route gradient through edm_D"
+    )
+
+
+def test_graph_zero_falls_back_to_positions_without_edm_D() -> None:
+    """When neither edm_D nor knn_logits is present (e.g.,
+    pure-regression framework, no EDM head), the helper falls back
+    to pred.positions. That's safe because in those configs
+    pred.positions IS the inner backbone's direct output (no MDS
+    overwrite), so no spectral op is in the backward."""
+    from utils.data.dataholder import DataHolder
+    from metrics.loss_function import _graph_zero
+
+    pos = torch.randn(1, 8, 2, requires_grad=True)
+    data = DataHolder(
+        node_features=torch.zeros(1, 8, 4), positions=pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+        cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1), node_mask=torch.ones(1, 8, dtype=torch.bool),
+    )
+    # No edm_D, no knn_logits stashed.
+    zero = _graph_zero(data)
+    zero.backward()
+    assert pos.grad is not None, (
+        "fallback should route gradient through pred.positions when "
+        "no head-native stash is available"
+    )
+
+
 def test_b3_14_gene_recon_ldm_mutex() -> None:
     """The LightningModule's __init__ must raise when gene_recon AND
     latent_diffusion are both enabled. Text-inspection because
@@ -1110,6 +1186,10 @@ def main() -> int:
          test_warmup_unlocks_after_n_steps),
         ("Warmup: val-stage forwards don't advance the counter",
          test_warmup_counter_doesnt_advance_on_val_stage),
+        ("_graph_zero routes through edm_D, not positions (MDS bypass)",
+         test_graph_zero_bypasses_mds_path),
+        ("_graph_zero falls back to positions when no head stash",
+         test_graph_zero_falls_back_to_positions_without_edm_D),
         ("B3.14 — gene_recon × LDM mutex raises",
          test_b3_14_gene_recon_ldm_mutex),
     ]

@@ -52,6 +52,47 @@ def _cfg_get(cfg, *keys, default=None):
     return default if cur is None else cur
 
 
+def _graph_zero(masked_pred) -> torch.Tensor:
+    """Return a scalar tensor of value 0 that's safely attachable to
+    the loss-sum autograd graph.
+
+    History (task #48 / #103): the obvious choice
+    ``masked_pred.positions[0].sum() * 0.0`` looked safe because the
+    value is zero, but with ``model.edm.mds_align_gradient=true``
+    ``pred.positions`` is the output of MDS, whose ``eigh`` backward
+    formula contains ``1/(λ_i − λ_j)`` terms that go to ±Inf at
+    near-degenerate eigenvalues. Autograd's chain rule then
+    computes ``0 × Inf = NaN`` even though the leaf gradient is
+    nominally zero, poisoning the entire backward graph.
+
+    The fix: source the graph-attached zero from a tensor whose
+    backward path does NOT include any spectral op. In order of
+    preference:
+      1. ``masked_pred.edm_D`` — the EDM head's predicted squared-
+         distance matrix. Always gradient-bearing under EDM
+         (through projector → backbone), never goes through MDS.
+      2. ``masked_pred.knn_logits`` — same role under the kNN-graph
+         head.
+      3. ``masked_pred.positions[0].sum() * 0.0`` — fallback only
+         when no head-native gradient-bearing stash exists (e.g.,
+         direct regression framework with no EDM/kNN head). In that
+         configuration ``pred.positions`` IS the inner backbone's
+         direct output (no MDS overwrite), so the zero is safe.
+      4. A constant ``torch.tensor(0.0)`` if even ``positions``
+         isn't available (defensive; shouldn't happen in practice).
+    """
+    edm_D = getattr(masked_pred, "edm_D", None)
+    if edm_D is not None:
+        return edm_D.sum() * 0.0
+    knn_logits = getattr(masked_pred, "knn_logits", None)
+    if knn_logits is not None:
+        return knn_logits.sum() * 0.0
+    positions = getattr(masked_pred, "positions", None)
+    if positions is not None and len(positions) > 0:
+        return positions[0].sum() * 0.0
+    return torch.tensor(0.0)
+
+
 # ---------------------------------------------------------------------------
 # Differentiable Procrustes (Kabsch / Schönemann 1966) — for the
 # rotation+reflection-invariant Sinkhorn loss.
@@ -717,12 +758,10 @@ class LossFunction(nn.Module):
             slice_losses.append(1.0 - corr.mean())
 
         if not slice_losses:
-            # No slice had enough cells. Return a zero tensor that
-            # tracks the model's parameters so backward doesn't crash.
-            zero = (masked_pred.positions[0].sum() * 0.0
-                    if len(masked_pred.positions) > 0
-                    else torch.tensor(0.0))
-            return zero
+            # No slice had enough cells. Return a gradient-zero
+            # that's safely attachable to the loss-sum graph WITHOUT
+            # traversing MDS (see _graph_zero docstring).
+            return _graph_zero(masked_pred)
 
         return torch.mean(torch.stack(slice_losses))
 
@@ -788,7 +827,7 @@ class LossFunction(nn.Module):
         # this term is summed into the total loss.
         def _zero():
             if len(masked_pred.positions) > 0:
-                return masked_pred.positions[0].sum() * 0.0
+                return _graph_zero(masked_pred)
             return torch.tensor(0.0)
 
         # `frequency` skip — early return BEFORE we do any cdist /
@@ -1002,7 +1041,7 @@ class LossFunction(nn.Module):
 
         def _zero():
             if len(masked_pred.positions) > 0:
-                return masked_pred.positions[0].sum() * 0.0
+                return _graph_zero(masked_pred)
             return torch.tensor(0.0)
 
         # Same frequency-skip semantics as dim=0.
@@ -1302,10 +1341,7 @@ class LossFunction(nn.Module):
             slice_losses.append(self._sk_loss_fn(pred_c, true_c))
 
         if not slice_losses:
-            zero = (masked_pred.positions[0].sum() * 0.0
-                    if len(masked_pred.positions) > 0
-                    else torch.tensor(0.0))
-            return zero
+            return _graph_zero(masked_pred)
         return torch.mean(torch.stack(slice_losses))
 
     def _compute_coarse_centroid_mse(
@@ -1337,7 +1373,7 @@ class LossFunction(nn.Module):
         cluster_ids = getattr(masked_pred, "_cluster_ids", None)
         K = getattr(masked_pred, "_n_clusters", None)
         if pred_centroids is None or cluster_ids is None or K is None:
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
 
         B, N = cluster_ids.shape
         device = pred_centroids.device
@@ -1445,7 +1481,7 @@ class LossFunction(nn.Module):
         bal = getattr(masked_pred, "_cluster_balance_loss", None)
         weight = float(getattr(masked_pred, "_cluster_balance_weight", 0.0))
         if bal is None or weight <= 0.0:
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
         return weight * bal
 
     # ------------------------------------------------------------------
@@ -1483,7 +1519,7 @@ class LossFunction(nn.Module):
         if D_pred is None:
             # Wrapper not wired in. Return graph-attached zero so the
             # backward pass still works through the rest of the loss.
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
 
         losses = []
         # Numerical eps for the sqrt (avoid 0-derivative singularity at
@@ -1510,7 +1546,7 @@ class LossFunction(nn.Module):
                 self.mse(d_pred_v[triu_mask], d_true_v[triu_mask])
             )
         if not losses:
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))
 
     # ------------------------------------------------------------------
@@ -1536,7 +1572,7 @@ class LossFunction(nn.Module):
         """
         logits = getattr(masked_pred, "knn_logits", None)
         if logits is None:
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
 
         k = max(1, self._knn_graph_k)
         n_neg = max(1, self._knn_graph_n_neg)
@@ -1604,7 +1640,7 @@ class LossFunction(nn.Module):
 
             losses.append(0.5 * (pos_loss + neg_loss))
         if not losses:
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))
 
     # ------------------------------------------------------------------
@@ -1735,7 +1771,7 @@ class LossFunction(nn.Module):
             losses.append(slice_loss)
 
         if not losses:
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))
 
     # ------------------------------------------------------------------
@@ -1758,7 +1794,7 @@ class LossFunction(nn.Module):
         z_0_pred = getattr(masked_pred, "_ldm_z_0_pred", None)
         z_0_target = getattr(masked_pred, "_ldm_z_0_target", None)
         if z_0_pred is None or z_0_target is None:
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
 
         mask = masked_pred.node_mask.unsqueeze(-1).to(z_0_pred.dtype)
         sq_err = (z_0_pred - z_0_target).pow(2) * mask        # (B, N, k)
@@ -1783,7 +1819,7 @@ class LossFunction(nn.Module):
         mu = getattr(masked_pred, "_ldm_mu", None)
         logvar = getattr(masked_pred, "_ldm_logvar", None)
         if mu is None or logvar is None:
-            return masked_pred.positions[0].sum() * 0.0
+            return _graph_zero(masked_pred)
         from models.latent_vae import kl_normal_standard
         return kl_normal_standard(mu, logvar, masked_pred.node_mask)
 
@@ -1848,7 +1884,7 @@ class LossFunction(nn.Module):
             # backward is still well-defined. Print a one-shot warning
             # so the user isn't surprised by zero-gradient training
             # during a long warmup.
-            total = masked_pred.positions[0].sum() * 0.0
+            total = _graph_zero(masked_pred)
             if not getattr(self, "_warned_empty_total", False):
                 print(
                     "[LossFunction] WARNING: total loss has no "
