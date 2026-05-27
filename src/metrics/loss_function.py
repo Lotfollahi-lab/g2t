@@ -1507,19 +1507,50 @@ class LossFunction(nn.Module):
                 true_c = true_c / scale
                 pred_c = pred_c / scale
 
-            # (4) Chamfer: forward + backward NN distances on the
-            #     aligned clouds. cdist returns ‖·‖ (L²); squaring
-            #     happens after the min so we don't backprop through
-            #     a sqrt at d=0 (gradient singularity).
-            d = torch.cdist(pred_c, true_c, p=2)        # (N, N)
+            # (4) Chamfer: forward + backward NN squared-distances on
+            #     the aligned clouds.
+            #
+            # CRITICAL — must compute SQUARED distance DIRECTLY here,
+            # NOT via ``torch.cdist(..., p=2)`` and then squaring the
+            # output. The reason: cdist returns ``sqrt(sum_k diff²)``,
+            # and even though we square the min afterwards
+            # (``forward_min ** 2``), autograd's chain rule still
+            # traverses the sqrt FIRST:
+            #     d(min²)/d(p) = 2·min · d(cdist)/d(p)
+            #                  = 2·min · (p−t)/cdist
+            # When pred[i] ≈ true[j*] exactly (a routine occurrence
+            # once the model converges a bit — and especially at
+            # init when MDS output is tiny so all pred cells cluster
+            # near origin), cdist[i, j*] → 0 and (p−t)/0 → NaN.
+            # The outer ``2·min = 2·0`` doesn't rescue it because
+            # 0·NaN = NaN. This produces the SAME finite-forward /
+            # NaN-backward signature as the prior SVD-backward bugs.
+            #
+            # Computing squared distances directly via
+            #     (p_i - t_j) ⊙ (p_i - t_j) summed over coords
+            # has chain rule gradient = 2·(p − t), which is bounded
+            # (zero!) at coincident points. No singularity.
+            diff = pred_c.unsqueeze(1) - true_c.unsqueeze(0)  # (Np, Nt, 2)
+            d_sq = (diff * diff).sum(dim=-1)                  # (Np, Nt)
             # Min along dim=1 → for each pred row, the closest true
             # column. Differentiable through the min entry (subgrad).
-            forward_min  = d.min(dim=1).values          # (N,)
-            backward_min = d.min(dim=0).values          # (N,)
+            forward_min_sq  = d_sq.min(dim=1).values          # (Np,)
+            backward_min_sq = d_sq.min(dim=0).values          # (Nt,)
             if self._ch_squared:
-                forward_min  = forward_min  ** 2
-                backward_min = backward_min ** 2
-            slice_losses.append(forward_min.mean() + backward_min.mean())
+                slice_losses.append(
+                    forward_min_sq.mean() + backward_min_sq.mean()
+                )
+            else:
+                # L² Chamfer: sqrt of squared NN distances, with eps
+                # so the sqrt's derivative ``1/(2·sqrt(x))`` is
+                # bounded at x=0. Cheaper than detecting d=0 cases
+                # and the eps shifts the loss by O(sqrt(eps))≈1e-6
+                # which is negligible vs typical NN distances.
+                eps_sqrt = 1.0e-12
+                slice_losses.append(
+                    (forward_min_sq  + eps_sqrt).sqrt().mean()
+                    + (backward_min_sq + eps_sqrt).sqrt().mean()
+                )
 
         if not slice_losses:
             return _graph_zero(masked_pred)

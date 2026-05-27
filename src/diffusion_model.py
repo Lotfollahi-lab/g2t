@@ -56,6 +56,24 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 "Training will be ~5-10x slower. Use only for "
                 "debugging NaN/Inf gradient sources."
             )
+        # The per-module backward-hook diagnostic. This complements
+        # ``torch.autograd.set_detect_anomaly`` in TWO important
+        # ways: (a) anomaly_mode only catches NaN — if the gradient
+        # is Inf (e.g. from an eigh / SVD backward at near-degenerate
+        # spectrum) anomaly_mode misses it because Inf only becomes
+        # NaN later (via 0×Inf in chain rule); (b) anomaly_mode's
+        # error message points at the op that PRODUCED the NaN but
+        # via the FORWARD stack — which is helpful but doesn't
+        # directly tell you which nn.Module's backward is responsible.
+        # The per-module hook reports both (which module + whether
+        # its grad_output was already bad on arrival or its grad_input
+        # is what corrupted things). Gated by the same
+        # ``train.detect_anomaly`` flag — pure diagnostic, off by
+        # default. Hooks installed AFTER self.model is built, see
+        # ``_install_per_module_grad_finder`` further down in __init__.
+        self._per_module_grad_finder_on = bool(
+            getattr(cfg.train, "detect_anomaly", False)
+        )
         # ``max_diffusion_steps`` is the outer step count for the
         # sampling loop in utils/diffusion_model/sample/sample.py:47:
         #     for s_int in reversed(range(0, self.max_diffusion_steps, ...))
@@ -702,6 +720,147 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"or 'latent_diffusion'."
             )
 
+    def _install_per_module_grad_finder(self) -> None:
+        """Install register_full_backward_hook on every nn.Module so we
+        can pinpoint WHICH module's backward first produces a
+        non-finite gradient. Complements
+        ``torch.autograd.set_detect_anomaly`` in two important ways:
+
+          1. anomaly_mode only catches NaN. If the gradient is Inf
+             (the canonical signature of an eigh/SVD backward at
+             near-degenerate spectrum), Inf only becomes NaN later
+             via 0×Inf in chain rule — by which point anomaly_mode
+             has missed it. We check for BOTH NaN and Inf.
+
+          2. anomaly_mode tells you the FORWARD op that produced the
+             bad gradient (via saved stack), which is useful but
+             abstract. The per-module hook reports the nn.Module by
+             name, which is what you actually grep for in source.
+
+        The hook fires AFTER each module's backward computes
+        ``grad_input``. By comparing:
+          - ``grad_output`` (gradient flowing INTO this module's
+            backward; the gradient produced by later modules)
+          - ``grad_input`` (gradient produced BY this module's
+            backward; flows to earlier modules)
+        we classify:
+          - grad_output non-finite → bug is later in forward (we
+            received a bad gradient already corrupted)
+          - grad_output finite but grad_input non-finite → THIS
+            module's backward is the producer
+        The FIRST module (in backward order) to report this is the
+        culprit. We raise immediately so the user gets a stack trace
+        at the moment of detection rather than running through the
+        rest of the backward.
+
+        Only installed when ``cfg.train.detect_anomaly=true`` to
+        keep the hot path free of overhead in production runs.
+        """
+        if not self._per_module_grad_finder_on:
+            return
+        # Track the first reporter so we don't spam — once any
+        # module reports a bad gradient, we raise.
+        self._first_bad_grad_reported = False
+
+        def make_hook(name: str):
+            def hook(module, grad_input, grad_output):
+                if self._first_bad_grad_reported:
+                    return
+                # Helpers: tuple-of-tensors-or-None safe checks.
+                def _any_nonfinite(t_tuple):
+                    if t_tuple is None:
+                        return False
+                    for t in t_tuple:
+                        if t is None:
+                            continue
+                        if not torch.isfinite(t).all():
+                            return True
+                    return False
+                def _stats(t_tuple):
+                    if t_tuple is None:
+                        return "(no tensors)"
+                    parts = []
+                    for i, t in enumerate(t_tuple):
+                        if t is None:
+                            parts.append(f"[{i}]=None")
+                            continue
+                        n_nan = torch.isnan(t).sum().item()
+                        n_inf = torch.isinf(t).sum().item()
+                        finite_mask = torch.isfinite(t)
+                        if finite_mask.any():
+                            finite_vals = t[finite_mask]
+                            mx = finite_vals.abs().max().item()
+                        else:
+                            mx = float("nan")
+                        parts.append(
+                            f"[{i}] shape={tuple(t.shape)} "
+                            f"nan={n_nan} inf={n_inf} max|finite|={mx:.3e}"
+                        )
+                    return "; ".join(parts)
+
+                bad_out = _any_nonfinite(grad_output)
+                bad_in  = _any_nonfinite(grad_input)
+                if not (bad_in or bad_out):
+                    return
+                self._first_bad_grad_reported = True
+                if bad_out and not bad_in:
+                    verdict = "received-bad-from-later"
+                elif bad_in and not bad_out:
+                    verdict = "PRODUCED-BAD-IN-THIS-MODULE"
+                else:
+                    verdict = "both-bad (this module amplified an "
+                    verdict += "already-corrupted gradient)"
+                msg = (
+                    f"\n[per-module grad finder] non-finite gradient "
+                    f"detected during backward.\n"
+                    f"  module:       {name} ({type(module).__name__})\n"
+                    f"  verdict:      {verdict}\n"
+                    f"  grad_output:  {_stats(grad_output)}\n"
+                    f"  grad_input:   {_stats(grad_input)}\n"
+                    f"To dig deeper:\n"
+                    f"  - 'PRODUCED-BAD-IN-THIS-MODULE' verdict → the "
+                    f"backward of THIS module's forward op is\n"
+                    f"    where the bug lives. Examples: eigh/SVD on "
+                    f"degenerate spectrum; sqrt at d=0; clamp_min\n"
+                    f"    with too-small floor; log at 0; cdist(p=2) "
+                    f"at coincident points.\n"
+                    f"  - 'received-bad-from-later' → walk BACK up "
+                    f"the call chain; the bug is in a module that\n"
+                    f"    runs AFTER this one in forward (earlier "
+                    f"in backward).\n"
+                )
+                # Print first so the message is visible even if the
+                # subsequent raise gets caught somewhere.
+                print(msg, flush=True)
+                raise RuntimeError(msg)
+            return hook
+
+        for name, mod in self.named_modules():
+            # Skip the LightningModule root (named_modules includes
+            # self with name='').
+            if name == "":
+                continue
+            mod.register_full_backward_hook(make_hook(name))
+        print(
+            "[FullDenoisingDiffusion] per-module grad-finder armed "
+            "on all nn.Module children. Will raise on the first "
+            "non-finite gradient during backward."
+        )
+
+    def on_fit_start(self) -> None:
+        # Install per-module hooks lazily here — the model has been
+        # fully constructed by now (DDP rank-aware), so named_modules
+        # walks the right tree. Calling from __init__ would miss
+        # any module added later by Lightning (rare but possible).
+        if getattr(self, "_per_module_grad_finder_on", False):
+            if not hasattr(self, "_per_module_hooks_installed"):
+                self._install_per_module_grad_finder()
+                self._per_module_hooks_installed = True
+        # Original on_fit_start continues below.
+        self.train_iterations = 100
+        if self.local_rank == 0:
+            setup_wandb(self.cfg)
+
     def on_train_epoch_start(self) -> None:
         on_train_epoch_start_func(self)
 
@@ -887,10 +1046,10 @@ class FullDenoisingDiffusion(pl.LightningModule):
             pred = pred.mask()
         return pred
 
-    def on_fit_start(self) -> None:
-        self.train_iterations = 100
-        if self.local_rank == 0:
-            setup_wandb(self.cfg)
+    # NOTE: on_fit_start is defined ABOVE (near the per-module grad
+    # finder hook). The original here was a duplicate — Python would
+    # call the LATER definition (this one) and the grad-finder
+    # installation would never run. Removed.
 
     @property
     def BS(self) -> int:
