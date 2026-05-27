@@ -1939,8 +1939,25 @@ class LossFunction(nn.Module):
             cov_pred = cov_pred + reg
             cov_true = cov_true + reg
             # Eigenvalues — ascending by default.
-            evals_true = torch.linalg.eigvalsh(cov_true)
-            evals_pred = torch.linalg.eigvalsh(cov_pred)
+            #
+            # Cast to fp64 for eigvalsh. eigvalsh's backward formula
+            # contains ``1/(λ_i − λ_j)`` terms; at training init
+            # cov_pred ≈ 0 + Tikhonov, so λ_1 ≈ 0 and λ_2 ≈ eps_reg
+            # = 1e-6. The fp32 representable spacing around values
+            # near zero is ~1.19e-7 (eps_fp32), so 1/(λ_2 − λ_1) at
+            # 1e-6 ÷ 0 evaluates to a value right at the fp32
+            # precision boundary — the kernel emits NaN directly
+            # (same root cause as the 2026-05-27 MDS eigh fp64
+            # cast). fp64's eps is 2.22e-16, ~10⁹× finer, so the
+            # divergent Jacobian term evaluates to a large-but-
+            # finite number that gradient_clip_val=1.0 then bounds.
+            # Cast cov to fp64, run eigvalsh in fp64, cast results
+            # back. ``.to()`` is differentiable so gradient flows
+            # through the cast cleanly.
+            cov_pred_64 = cov_pred.to(torch.float64)
+            cov_true_64 = cov_true.to(torch.float64)
+            evals_true = torch.linalg.eigvalsh(cov_true_64).to(cov_pred.dtype)
+            evals_pred = torch.linalg.eigvalsh(cov_pred_64).to(cov_pred.dtype)
 
             # Diagnostic numerics for wandb (always populated, even
             # under variants that don't touch eigenvalues directly).
