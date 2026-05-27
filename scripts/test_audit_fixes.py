@@ -822,6 +822,86 @@ def test_shape_matching_eigvalsh_no_nan_grad_at_init() -> None:
     )
 
 
+def test_edm_head_procrustes_detaches_R_at_steady_state() -> None:
+    """Regression test for the 2026-05-27 NaN bug:
+
+    The EDM head's own _procrustes_align (different file from the
+    loss-side helper) used to let gradient flow through SVD. At the
+    steady-state regime where MDS layout ≈ reference frame, the SVD
+    backward NaN's even though the forward is finite. Both Sinkhorn
+    AND Chamfer triggered this via mds_align_gradient=true.
+
+    The fix detaches R inside the head's Procrustes. This test
+    constructs the exact pathological regime (x_src ≈ x_ref + tiny
+    noise) and asserts finite gradient.
+    """
+    from models.edm_head import _procrustes_align
+
+    torch.manual_seed(42)
+    # Near-converged regime: x_src ≈ x_ref. M = x_src.T @ x_ref is
+    # approximately ‖x_ref‖² · I → σ_max ≈ σ_min → SVD backward
+    # divergent without the detach.
+    N = 64
+    x_ref = torch.randn(N, 2)
+    x_ref = x_ref - x_ref.mean(0)
+    x_src = (x_ref + 1e-4 * torch.randn(N, 2)).clone().requires_grad_(True)
+    aligned = _procrustes_align(x_src, x_ref)
+    # Sinkhorn-like target so gradient pattern matches production.
+    loss = ((aligned - x_ref) ** 2).sum()
+    loss.backward()
+    assert x_src.grad is not None
+    assert torch.isfinite(x_src.grad).all(), (
+        f"edm_head._procrustes_align produced non-finite gradient at "
+        f"the near-degenerate steady-state regime. The R-detach fix "
+        f"should prevent this. Got {x_src.grad}"
+    )
+
+
+def test_knn_graph_head_procrustes_detaches_R_at_steady_state() -> None:
+    """Mirror of the EDM-head regression test for the kNN-graph
+    head's analogous _procrustes_align. Same bug, same fix."""
+    from models.knn_graph_head import _procrustes_align
+
+    torch.manual_seed(43)
+    N = 64
+    x_ref = torch.randn(N, 2)
+    x_ref = x_ref - x_ref.mean(0)
+    x_src = (x_ref + 1e-4 * torch.randn(N, 2)).clone().requires_grad_(True)
+    aligned = _procrustes_align(x_src, x_ref)
+    loss = ((aligned - x_ref) ** 2).sum()
+    loss.backward()
+    assert x_src.grad is not None
+    assert torch.isfinite(x_src.grad).all(), (
+        f"knn_graph_head._procrustes_align produced non-finite "
+        f"gradient at steady-state regime. The R-detach fix should "
+        f"prevent this. Got {x_src.grad}"
+    )
+
+
+def test_edm_head_procrustes_recovers_rotation() -> None:
+    """Sanity check that detaching R didn't break the FORWARD: a
+    rotated cloud should still be aligned back to the reference."""
+    import math
+    from models.edm_head import _procrustes_align
+
+    torch.manual_seed(0)
+    x = torch.randn(64, 2)
+    x = x - x.mean(0)
+    for theta in (0.3, math.pi / 4, math.pi / 2):
+        R = torch.tensor(
+            [[math.cos(theta), -math.sin(theta)],
+             [math.sin(theta),  math.cos(theta)]],
+            dtype=x.dtype,
+        )
+        x_rot = x @ R
+        aligned = _procrustes_align(x_rot, x)
+        err = (aligned - x).abs().max().item()
+        assert err < 1e-4, (
+            f"head Procrustes failed to align after R-detach: "
+            f"θ={theta:.3f}, max err {err:.3e}"
+        )
+
+
 def test_mds_eigh_no_nan_grad_with_tikhonov() -> None:
     """Classical MDS's eigh backward at degenerate eigenvalues was
     the NaN source for the EDM path under mds_align_gradient=True.
@@ -1351,6 +1431,12 @@ def main() -> int:
          test_procrustes_skip_when_degenerate),
         ("Procrustes normal path still aligns + has gradient",
          test_procrustes_normal_path_for_nondegenerate),
+        ("EDM head Procrustes: finite grad at steady-state σ ≈ σ",
+         test_edm_head_procrustes_detaches_R_at_steady_state),
+        ("kNN-graph head Procrustes: finite grad at steady-state σ ≈ σ",
+         test_knn_graph_head_procrustes_detaches_R_at_steady_state),
+        ("EDM head Procrustes: still recovers rotation in forward",
+         test_edm_head_procrustes_recovers_rotation),
         ("shape_matching: finite gradient at init (Tikhonov on cov)",
          test_shape_matching_eigvalsh_no_nan_grad_at_init),
         ("MDS eigh: finite gradient on near-zero D_sq (Tikhonov on B)",

@@ -93,38 +93,32 @@ def _laplacian_eigenmaps_2d(A: torch.Tensor) -> torch.Tensor:
 
 
 def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
-    """Orthogonal Procrustes (rotation+reflection). See edm_head.py for
-    the same routine — duplicated here to keep this module self-
-    contained (knn_graph and edm shouldn't depend on each other).
+    """Orthogonal Procrustes (rotation+reflection) with DETACHED R.
 
-    R = U @ Vh from SVD(x_src.T @ x_ref) — Schönemann 1966.
+    R = U @ Vh from SVD(x_src.T @ x_ref) — Schönemann 1966 / Kabsch.
+    Computed under ``torch.no_grad()`` and detached before the final
+    ``x_src @ R`` multiply, so gradient flows through x_src as if R
+    were a constant rotation. See ``edm_head._procrustes_align`` and
+    ``metrics.loss_function._procrustes_align_2d`` for the identical
+    pattern — duplicated here to keep this module self-contained
+    (knn_graph and edm shouldn't depend on each other).
 
-    Degenerate-M handling: mirrors ``edm_head._procrustes_align``.
-    Skip alignment when M is near-zero OR near-singular OR has
-    near-degenerate singular values — all three regimes make the
-    SVD backward produce extreme gradients that accumulate to Inf
-    through the transformer chain.
+    Detaching R is the 2026-05-27 fix for the steady-state NaN bug
+    where Chamfer / Sinkhorn (with mds_align_gradient or spectral_
+    layout_gradient = true) would NaN even though forward losses
+    were bounded. SVD's backward has ``1/(σ_i² − σ_j²)`` terms that
+    diverge when the model converges enough that spectral-layout ≈
+    reference (M near-diagonal, σ_max ≈ σ_min). Detaching sidesteps
+    the SVD backward entirely. See ``edm_head._procrustes_align``
+    docstring for the full diagnosis.
     """
-    M = x_src.T @ x_ref
     with torch.no_grad():
-        M_detached = M.detach()
+        M_detached = (x_src.detach().T @ x_ref.detach())
         M_max = M_detached.abs().max()
         if (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6:
-            degenerate = True
-        else:
-            sigma = torch.linalg.svdvals(M_detached)
-            s_max = sigma[0].item()
-            s_min = sigma[-1].item()
-            if s_max < 1e-30:
-                degenerate = True
-            else:
-                cond_singular  = (s_min / s_max) < 1e-3
-                cond_degenerate = ((s_max - s_min) / s_max) < 1e-3
-                degenerate = cond_singular or cond_degenerate
-    if degenerate:
-        return x_src
-    U, _S, Vh = torch.linalg.svd(M)
-    R = U @ Vh
+            return x_src
+        U, _S, Vh = torch.linalg.svd(M_detached)
+        R = (U @ Vh).detach()
     return x_src @ R
 
 

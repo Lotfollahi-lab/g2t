@@ -99,7 +99,7 @@ def _classical_mds_2d(D_sq: torch.Tensor) -> torch.Tensor:
 
 def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
     """Orthogonal Procrustes: find the rotation+reflection R that minimises
-    ‖x_src @ R − x_ref‖_F. Returns x_src @ R.
+    ‖x_src @ R − x_ref‖_F. Returns x_src @ R with R DETACHED.
 
     Both inputs assumed to be mean-centred. Reflection is allowed
     (full O(2) alignment, not just SO(2)) — biologically symmetric
@@ -108,49 +108,56 @@ def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
     Derivation: with M = x_src^T @ x_ref and SVD M = U Σ Vᵀ, the
     closed-form solution is R = U Vᵀ (Schönemann 1966). PyTorch's
     ``linalg.svd`` returns ``Vh = Vᵀ`` directly, so the formula is
-    ``R = U @ Vh``. (Earlier revision had ``R = Vh.T @ U.T = V Uᵀ``,
-    which is R-transposed — applied the INVERSE rotation and broke
-    the smoke test.)
+    ``R = U @ Vh``.
 
-    Degenerate-M handling: SVD's backward formula has
-    ``1/(σ_i² − σ_j²)`` terms that blow up to large-but-finite
-    values whenever the two singular values are close (not just
-    zero). Three regimes we skip alignment in:
-      1. M near-zero (max |M_ij| < 1e-6): no information to align.
-      2. M near-singular (σ_min/σ_max < 1e-3): one σ is much
-         smaller than the other, but σ_min² is still in the
-         denominator of the backward formula, giving extreme
-         gradient magnitudes.
-      3. M with degenerate σ (σ_max−σ_min)/σ_max < 1e-3: σ_diff
-         in the denominator is tiny, gradient explodes.
-    The check is run under no_grad so it doesn't itself contribute
-    to the autograd graph. In all three regimes we return x_src
-    unchanged (R = I is a valid choice mathematically when M is
-    degenerate). For non-degenerate M the standard SVD path runs.
+    Gradient pattern: R is computed UNDER ``torch.no_grad()`` and
+    detached before ``x_src @ R``. Gradient w.r.t. ``x_src`` flows
+    as if R were a constant rotation:
+        d L / d x_src = (d L / d (x_src @ R)) @ R^T
+    "Fixed-structure differentiable alignment" — R is recomputed
+    fresh every forward from the CURRENT x_src and x_ref, so the
+    alignment stays current; we just don't let gradient
+    back-propagate through the SVD that produced R.
+
+    Why we detach R (2026-05-27 finding)
+    ------------------------------------
+    SVD's backward formula has ``1/(σ_i² − σ_j²)`` terms that
+    diverge at degenerate or near-degenerate singular values. The
+    earlier snapshot-threshold check (M_max, σ_min/σ_max,
+    (σ_max−σ_min)/σ_max < 1e-3) was NECESSARY-but-not-sufficient:
+    it caught only obvious degenerate cases. The much more common
+    failure was the STEADY-STATE regime once the model converges
+    enough that MDS layout ≈ reference layout — M is then nearly a
+    scaled identity, σ_max ≈ σ_min, and the SVD backward is
+    intrinsically ill-conditioned. Observed wandb signature: bound
+    loss values (sinkhorn ~0.015, chamfer same), NaN gradient
+    raised by ``on_after_backward``.
+
+    Detaching R sidesteps the SVD-backward entirely. Geometric
+    meaning preserved: we still rotate MDS output to align with the
+    reference frame; we just don't propagate gradient through that
+    rotation choice. The MDS layout is intrinsically
+    rotation-ambiguous anyway (every rotation of the eigvecs gives
+    the same D), so there's no learnable signal in the rotation —
+    detaching it doesn't lose information. Same fix already applied
+    to ``metrics.loss_function._procrustes_align_2d`` (bug #105)
+    and ``models.knn_graph_head._procrustes_align``.
     """
-    M = x_src.T @ x_ref                            # (2, 2)
+    # Compute the entire alignment under no_grad. Forward arithmetic
+    # is identical; only the autograd graph changes. The M-near-zero
+    # short-circuit is kept for defense-in-depth: when M is exactly
+    # zero the SVD's forward itself can return NaN in U/V on some
+    # builds (not just its backward), so we skip the SVD call.
     with torch.no_grad():
-        M_detached = M.detach()
+        M_detached = (x_src.detach().T @ x_ref.detach())     # (2, 2)
         M_max = M_detached.abs().max()
         if (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6:
-            degenerate = True
-        else:
-            # Cheap 2x2 SVD on the detached matrix to inspect σ.
-            # svdvals returns singular values in DESCENDING order.
-            sigma = torch.linalg.svdvals(M_detached)
-            s_max = sigma[0].item()
-            s_min = sigma[-1].item()
-            if s_max < 1e-30:
-                degenerate = True
-            else:
-                # Two conditions, both bad for backward stability:
-                cond_singular  = (s_min / s_max) < 1e-3   # one σ near zero
-                cond_degenerate = ((s_max - s_min) / s_max) < 1e-3  # σ ≈ σ
-                degenerate = cond_singular or cond_degenerate
-    if degenerate:
-        return x_src
-    U, _S, Vh = torch.linalg.svd(M)
-    R = U @ Vh                                      # (2, 2)
+            return x_src
+        # SVD's own forward is well-defined for non-zero M even at
+        # σ_max ≈ σ_min — only its BACKWARD has the divergence,
+        # which we sidestep by being under no_grad here.
+        U, _S, Vh = torch.linalg.svd(M_detached)
+        R = (U @ Vh).detach()                                 # (2, 2)
     return x_src @ R
 
 
