@@ -188,7 +188,13 @@ def test_procrustes_recovers_reflection() -> None:
 
 
 def test_procrustes_gradient_flows() -> None:
-    """Gradient must flow through the SVD."""
+    """Gradient must flow through ``x_src @ R`` as a linear map.
+
+    Note: R is computed under ``no_grad`` and detached, so gradient
+    does NOT flow through SVD's backward (that's the WHOLE POINT of
+    the detach — SVD's backward at near-degenerate σ produces NaN).
+    Gradient still flows through ``x_src`` itself via the constant-R
+    linear transform. dL/dx_src = (dL/d(x_src @ R)) @ R^T."""
     torch.manual_seed(3)
     x_src = torch.randn(32, 2, requires_grad=True)
     x_ref = torch.randn(32, 2)
@@ -197,7 +203,44 @@ def test_procrustes_gradient_flows() -> None:
     aligned.pow(2).sum().backward()
     assert x_src.grad is not None, "no grad on x_src"
     assert x_src.grad.abs().sum().item() > 0, (
-        "zero grad on x_src — SVD backward didn't propagate"
+        "zero grad on x_src — constant-R linear transform didn't "
+        "propagate gradient"
+    )
+    # And the gradient must be finite (the WHOLE POINT of detaching R).
+    assert torch.isfinite(x_src.grad).all(), (
+        f"NaN/Inf in x_src.grad: {x_src.grad}"
+    )
+
+
+def test_procrustes_backward_finite_at_near_degenerate_sigma() -> None:
+    """Steady-state regime check: at convergence ``pred ≈ true`` up
+    to small noise, so M = pred^T·true is approximately a scaled
+    identity. SVD's σ_max ≈ σ_min and SVD's backward formula has
+    ``1/(σ_max² − σ_min²)`` terms that diverge here — would produce
+    NaN/Inf gradient WITHOUT the R-detach.
+
+    With the R-detach, the gradient must be finite regardless of
+    how close the σ's get.
+    """
+    torch.manual_seed(7)
+    N = 64
+    x_true = torch.randn(N, 2)
+    x_true = x_true - x_true.mean(0)
+    # Make x_src ≈ x_true with tiny noise — this forces M ≈ identity
+    # and triggers the near-degenerate σ failure mode that broke the
+    # 2026-05-27 sinkhorn runs (forward sinkhorn=0.015 but backward
+    # NaN).
+    x_src = (x_true + 1e-4 * torch.randn(N, 2)).requires_grad_(True)
+    aligned = _procrustes_align_2d(x_src - x_src.mean(0), x_true)
+    # Use a Sinkhorn-like target so the gradient pattern matches
+    # what _compute_sinkhorn produces.
+    loss = ((aligned - x_true) ** 2).sum()
+    loss.backward()
+    assert x_src.grad is not None
+    assert torch.isfinite(x_src.grad).all(), (
+        f"Near-degenerate Procrustes produced non-finite gradient: "
+        f"{x_src.grad}. The R-detach inside _procrustes_align_2d is "
+        f"supposed to prevent this."
     )
 
 

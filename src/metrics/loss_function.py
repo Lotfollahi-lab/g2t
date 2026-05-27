@@ -113,58 +113,68 @@ def _procrustes_align_2d(
     Closed form (Schönemann 1966): ``R = U @ V^T`` where
     ``U·diag(S)·V^T = SVD(x_src^T · x_ref)``.
 
-    Degenerate-M handling: at training init, x_src ≈ 0 (the position
-    head's output is small under default Kaiming init), so M ≈ 0
-    and SVD's singular values are both near zero. The SVD backward
-    formula has ``1/(σ_i − σ_j)`` and ``1/(σ_i + σ_j)`` terms that
-    blow up to NaN/Inf at degenerate singular values. The
-    gradient then NaN-poisons the position head's weights on the
-    optimizer step, and every subsequent forward produces NaN
-    positions.
+    Gradient pattern: R is computed UNDER ``torch.no_grad()`` and
+    detached before the final ``x_src @ R`` multiply. The gradient
+    therefore flows through ``x_src`` as if R were a CONSTANT
+    rotation:
+        d L / d x_src = (d L / d (x_src @ R)) @ R^T
+    This is the "fixed-structure differentiable alignment" pattern
+    — same idea as differentiable persistent homology (Hofer 2019),
+    where the simplex structure is fixed per step but the values
+    flow gradient. The alignment is recomputed FROM SCRATCH every
+    step using the current x_src, so it stays fresh; we just don't
+    let gradient back-propagate through the SVD that produced R.
 
-    Mathematically, the optimal R is UNDEFINED when M = 0 — every
-    orthogonal R minimises ``||0·R − x_ref||`` equally. We choose
-    R = I in that regime, giving ``x_src @ I = x_src``. This is NOT
-    silencing the loss: the downstream Sinkhorn still fires on
-    (x_src, x_ref), with full gradient through x_src. We just skip
-    a rotation step that has no well-defined target. Once x_src
-    grows above the threshold (a few training steps in), the SVD
-    path engages normally.
+    Why we detach R
+    ---------------
+    SVD's backward formula contains ``1/(σ_i² − σ_j²)`` terms that
+    diverge at degenerate (or near-degenerate) singular values. A
+    detached-snapshot threshold check (M_max, σ_min/σ_max,
+    (σ_max−σ_min)/σ_max) is a NECESSARY-but-not-sufficient guard —
+    it catches obvious-init-time degeneracy, but once the model
+    has trained to a state where pred ≈ true (up to rotation), the
+    Gram matrix M = pred_c^T · true_c becomes approximately a
+    scaled identity, σ_max ≈ σ_min, and the SVD backward is
+    intrinsically ill-conditioned. The 2026-05-27 observation:
+    ``train_loss/sinkhorn`` bounded ~0.015 (FORWARD is fine) but
+    backward still NaN's; SVD backward of nearly-degenerate M is
+    the structural cause.
+
+    Detaching R sidesteps the SVD-backward path entirely. The
+    geometric meaning is preserved: we still pull each cell toward
+    its truth-position in the best-aligned frame; we just don't
+    learn to choose poses that are "easier to align" — which is a
+    rotation-invariant target anyway, so no information is lost.
 
     Used by ``LossFunction._compute_sinkhorn`` to make the Sinkhorn
     divergence rotation+reflection-invariant. Same closed-form
     Procrustes math as ``models.edm_head._procrustes_align`` and
-    ``models.knn_graph_head._procrustes_align`` — duplicated here
-    (rather than imported) to keep the loss module free of model-
-    module imports.
+    ``models.knn_graph_head._procrustes_align`` — but those modules
+    let gradient flow through R (controlled by the
+    ``mds_align_gradient`` / ``spectral_layout_gradient`` flags),
+    because the position head's output IS the post-alignment cloud
+    in those paths and gradient must propagate through the
+    alignment for the head to train. Here in the loss, the model's
+    pred has already been produced; alignment is an internal step
+    of THIS LOSS COMPONENT only, so detaching R is structurally
+    safe.
     """
-    M = x_src.T @ x_ref                                       # (2, 2)
-    # Skip alignment when SVD backward would produce extreme
-    # gradients. Three regimes — see the matching block in
-    # ``models.edm_head._procrustes_align`` for the full
-    # justification (same math, same fix, duplicated rather than
-    # imported so the loss module stays free of model-module
-    # imports).
+    # Compute R entirely outside autograd. The detached-snapshot
+    # degeneracy check stays for defense-in-depth — if M is truly
+    # zero (very first step before any training), the SVD itself
+    # can return NaN in U/V (not just in its backward). The
+    # threshold catches that case and returns x_src unchanged.
     with torch.no_grad():
-        M_detached = M.detach()
+        M_detached = (x_src.detach().T @ x_ref.detach())          # (2, 2)
         M_max = M_detached.abs().max()
         if (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6:
-            degenerate = True
-        else:
-            sigma = torch.linalg.svdvals(M_detached)
-            s_max = sigma[0].item()
-            s_min = sigma[-1].item()
-            if s_max < 1e-30:
-                degenerate = True
-            else:
-                cond_singular  = (s_min / s_max) < 1e-3
-                cond_degenerate = ((s_max - s_min) / s_max) < 1e-3
-                degenerate = cond_singular or cond_degenerate
-    if degenerate:
-        return x_src
-    U, _S, Vh = torch.linalg.svd(M, full_matrices=False)
-    R = U @ Vh                                                # (2, 2)
-    return x_src @ R                                          # (N, 2)
+            return x_src
+        # SVD's own forward is well-defined for non-zero M even when
+        # σ's are close — only the BACKWARD has the degeneracy.
+        # Since we're under no_grad, we can compute R freely.
+        U, _S, Vh = torch.linalg.svd(M_detached, full_matrices=False)
+        R = (U @ Vh).detach()                                     # (2, 2)
+    return x_src @ R                                              # (N, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -1263,18 +1273,25 @@ class LossFunction(nn.Module):
           1. Mean-centre both clouds (translation invariance).
           2. If ``procrustes_align``: rotate+reflect pred onto true
              via SVD of (pred^T · true), with R = U·V^T (Schönemann
-             1966 / Kabsch). Fully differentiable through torch's
-             SVD backward.
+             1966 / Kabsch). R is computed UNDER no_grad and detached
+             — gradient flows through pred_c as if R were a constant
+             rotation. See ``_procrustes_align_2d`` docstring for
+             why we detach R rather than flowing gradient through
+             SVD's backward.
           3. If ``scale_invariant``: divide both clouds by the
              truth's RMS distance to centroid, so ``blur`` is in
              units of "RMS extent" rather than raw position units.
           4. Call geomloss.SamplesLoss on the aligned (and optionally
              scaled) clouds.
 
-        Gradient: flows through ``pred_pos`` via (a) the Procrustes
-        step's torch.linalg.svd backward and (b) SamplesLoss's
+        Gradient: flows through ``pred_pos`` via (a) the (constant-R)
+        rotation applied to pred_c, and (b) SamplesLoss's
         differentiable Sinkhorn iteration. ``true_pos`` is explicitly
         detached so no gradient leaks into the dataloader output.
+        R itself is non-differentiable by design — sidesteps the
+        SVD-backward NaN trap at near-degenerate σ (which is the
+        common steady-state regime after the model has learned to
+        match true positions up to rotation).
         """
         if self._sk_loss_fn is None:
             try:
