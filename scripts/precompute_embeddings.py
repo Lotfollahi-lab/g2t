@@ -81,7 +81,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -231,62 +230,64 @@ _ALL_ENCODERS = sorted(set(_PER_SLICE_ENCODERS.keys()) | _GLOBAL_ENCODERS)
 
 def _import_nicheformer_helper(helper_dir: Optional[Path]):
     """Import ``compute_nicheformer_embedding`` (+ companion helpers)
-    from the squint-reproducibility tree, which already vendors a
-    fully-functional wrapper around the official tokenization
-    notebook. We don't duplicate the logic here — the helper is
-    several hundred lines of mouse→human ortholog mapping, technology-
-    specific token vocab, and tokenization with the model's
-    ``technology_mean`` baseline.
+    from the VENDORED ``_nicheformer_embedding.py`` that lives next
+    to this script in ``scgg/scripts/``. Originally copied from the
+    squint-reproducibility tree; vendored here so scgg has no
+    cross-repo path dependency.
 
-    helper_dir search order:
-      1. Explicit ``--nicheformer-helper-dir`` arg, if given.
-      2. Sibling-project default:
-         ``../../squint_claude_project/squint-reproducibility/
-            analysis/benchmarking/cell_type_identification/``
-         relative to this scripts/ directory.
-      3. Env var ``SQUINT_NICHEFORMER_HELPER_DIR``.
-
-    Raises SystemExit with a clear pointer if not found.
+    The ``helper_dir`` argument is kept for back-compat — if set,
+    we import from that directory instead. This lets the user point
+    at a maintained-elsewhere copy of the helper without re-vendoring
+    each time the upstream changes.
     """
-    candidates: List[Path] = []
-    if helper_dir is not None:
-        candidates.append(Path(helper_dir))
-    # Heuristic relative to this script's location.
-    this = Path(__file__).resolve()
-    # scgg/scripts/ -> ../../.. -> workspace, then into squint tree.
-    candidates.append(
-        this.parent.parent.parent
-        / "squint_claude_project"
-        / "squint-reproducibility"
-        / "analysis" / "benchmarking" / "cell_type_identification"
-    )
-    env_dir = os.environ.get("SQUINT_NICHEFORMER_HELPER_DIR")
-    if env_dir:
-        candidates.append(Path(env_dir))
-
-    for c in candidates:
-        if (c / "_nicheformer_embedding.py").is_file():
-            if str(c) not in sys.path:
-                sys.path.insert(0, str(c))
+    # Default: sibling import (the vendored copy).
+    if helper_dir is None:
+        this_dir = Path(__file__).resolve().parent
+        if str(this_dir) not in sys.path:
+            sys.path.insert(0, str(this_dir))
+        try:
             from _nicheformer_embedding import (              # noqa: E402
                 NICHEFORMER_CONTEXT_LENGTH,
                 add_human_ortholog_ensembl_ids,
                 compute_nicheformer_embedding,
             )
             logger.info(
-                f"Nicheformer helper imported from {c}"
+                f"Nicheformer helper imported from vendored copy: "
+                f"{this_dir / '_nicheformer_embedding.py'}"
             )
             return (
                 compute_nicheformer_embedding,
                 add_human_ortholog_ensembl_ids,
                 NICHEFORMER_CONTEXT_LENGTH,
             )
-    searched = "\n  ".join(str(c) for c in candidates)
-    raise SystemExit(
-        "Could not locate `_nicheformer_embedding.py` (squint helper).\n"
-        f"Searched:\n  {searched}\n"
-        "Pass --nicheformer_helper_dir=<path> or set the env var "
-        "SQUINT_NICHEFORMER_HELPER_DIR."
+        except ImportError as e:
+            raise SystemExit(
+                "Failed to import the vendored Nicheformer helper at "
+                f"{this_dir / '_nicheformer_embedding.py'}.\n"
+                f"Underlying ImportError: {e}\n"
+                "Check that the file exists and that its dependencies "
+                "(nicheformer, torch, anndata, scipy, sklearn, mygene, "
+                "pandas) are installed."
+            )
+
+    # Override path: explicit --nicheformer_helper_dir provided.
+    if not (Path(helper_dir) / "_nicheformer_embedding.py").is_file():
+        raise SystemExit(
+            f"--nicheformer_helper_dir={helper_dir} does not contain "
+            f"_nicheformer_embedding.py."
+        )
+    if str(helper_dir) not in sys.path:
+        sys.path.insert(0, str(helper_dir))
+    from _nicheformer_embedding import (                      # noqa: E402
+        NICHEFORMER_CONTEXT_LENGTH,
+        add_human_ortholog_ensembl_ids,
+        compute_nicheformer_embedding,
+    )
+    logger.info(f"Nicheformer helper imported from override: {helper_dir}")
+    return (
+        compute_nicheformer_embedding,
+        add_human_ortholog_ensembl_ids,
+        NICHEFORMER_CONTEXT_LENGTH,
     )
 
 
@@ -827,9 +828,11 @@ def main() -> int:
     # ---- Nicheformer flags ------------------------------------------------
     p.add_argument(
         "--nicheformer_helper_dir", type=Path, default=None,
-        help="Directory containing _nicheformer_embedding.py from "
-             "squint-reproducibility. Defaults to the sibling-project "
-             "path; can also be set via env var SQUINT_NICHEFORMER_HELPER_DIR.",
+        help="(Override) Directory containing _nicheformer_embedding.py. "
+             "By default, scgg uses the vendored copy at "
+             "scgg/scripts/_nicheformer_embedding.py. Set this only if "
+             "you want to point at a different copy (e.g. an in-place "
+             "edited version in squint-reproducibility).",
     )
     p.add_argument(
         "--nicheformer_model_dir", type=Path, default=Path(
