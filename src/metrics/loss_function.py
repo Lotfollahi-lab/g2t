@@ -326,6 +326,29 @@ class LossFunction(nn.Module):
         # geomloss import cost.
         self._sk_loss_fn = None
 
+        # ---- Chamfer distance loss component ----
+        # Sinkhorn-free OT-flavoured fallback. No log-sum-exp, no
+        # Sinkhorn iteration; just cdist + min. Both ops have bounded
+        # backward, so gradient is stable regardless of model state.
+        self._ch_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                         "chamfer", "enabled",
+                                         default=False))
+        self._ch_weight = float(_cfg_get(cfg, "model", "loss",
+                                         "chamfer", "weight", default=1.0))
+        self._ch_squared = bool(_cfg_get(cfg, "model", "loss",
+                                         "chamfer", "squared", default=True))
+        self._ch_procrustes_align = bool(_cfg_get(
+            cfg, "model", "loss", "chamfer", "procrustes_align",
+            default=True,
+        ))
+        self._ch_scale_invariant = bool(_cfg_get(
+            cfg, "model", "loss", "chamfer", "scale_invariant",
+            default=False,
+        ))
+        ch_sub = _cfg_get(cfg, "model", "loss", "chamfer", "subsample",
+                          default=None)
+        self._ch_subsample = int(ch_sub) if ch_sub else None
+
         # Coarse-cluster centroid MSE. Auto-enabled by the
         # CoarseToFineWrapper; needs the wrapper to stash
         # ``_predicted_cluster_centroids`` and ``_cluster_ids`` on
@@ -456,8 +479,9 @@ class LossFunction(nn.Module):
             name: int(_cfg_get(cfg, "model", "loss", name,
                                "warmup_steps", default=0))
             for name in (
-                "sinkhorn", "shape_matching", "persistent_homology",
-                "knn_rank", "pairwise_distance_mse", "edm_distance_mse",
+                "sinkhorn", "chamfer", "shape_matching",
+                "persistent_homology", "knn_rank",
+                "pairwise_distance_mse", "edm_distance_mse",
                 "knn_graph_loss", "coarse_centroid_mse",
                 "latent_fm_mse", "latent_kl",
             )
@@ -478,6 +502,11 @@ class LossFunction(nn.Module):
              self._compute_persistent_homology),
             ("sinkhorn", self._sk_enabled, self._sk_weight,
              self._compute_sinkhorn),
+            # Chamfer: Sinkhorn-free OT-flavoured fallback. cdist+min
+            # only — bounded backward, no log-sum-exp / SVD failure
+            # modes. See _compute_chamfer docstring.
+            ("chamfer", self._ch_enabled, self._ch_weight,
+             self._compute_chamfer),
             ("coarse_centroid_mse", self._cc_enabled, self._cc_weight,
              self._compute_coarse_centroid_mse),
             # cluster_balance is always "enabled" in the registry; the
@@ -541,6 +570,14 @@ class LossFunction(nn.Module):
                 )
                 if self._sk_subsample:
                     extra += f", subsample={self._sk_subsample}"
+            elif name == "chamfer":
+                extra = (
+                    f", squared={self._ch_squared}, "
+                    f"procrustes_align={self._ch_procrustes_align}, "
+                    f"scale_invariant={self._ch_scale_invariant}"
+                )
+                if self._ch_subsample:
+                    extra += f", subsample={self._ch_subsample}"
             elif name == "coarse_centroid_mse":
                 extra = " (auto-wired by CoarseToFineWrapper)"
             elif name == "edm_distance_mse":
@@ -598,6 +635,8 @@ class LossFunction(nn.Module):
                 silenced.append("shape_matching")
             if self._sk_enabled:
                 silenced.append("sinkhorn")
+            if self._ch_enabled:
+                silenced.append("chamfer")
             if self._knn_enabled:
                 silenced.append("knn_rank")
             if self._ph_enabled:
@@ -1371,8 +1410,116 @@ class LossFunction(nn.Module):
                 pred_c = pred_c / scale
 
             # (4) Sinkhorn divergence on the aligned clouds. Gradient
-            #     flows through pred_c (via SVD backward + SamplesLoss).
+            #     flows through pred_c (via constant-R linear map +
+            #     SamplesLoss). R itself is detached — see
+            #     _procrustes_align_2d docstring for why.
             slice_losses.append(self._sk_loss_fn(pred_c, true_c))
+
+        if not slice_losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(slice_losses))
+
+    # ------------------------------------------------------------------
+    # Chamfer distance — Sinkhorn-free OT-flavoured fallback
+    # ------------------------------------------------------------------
+    def _compute_chamfer(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Bidirectional nearest-neighbour distance between predicted
+        and true cell point clouds.
+
+        Per slice (after centering and optional Procrustes alignment):
+
+            d_chamfer(P, T) = mean_p (min_t ‖p - t‖²)
+                            + mean_t (min_p ‖t - p‖²)
+
+        With ``squared=False`` the inner ‖·‖² becomes a plain ‖·‖
+        (L²); with ``squared=True`` (default) it stays squared (the
+        literature-standard formulation).
+
+        Why this loss exists alongside Sinkhorn
+        ---------------------------------------
+        Sinkhorn at small ε / blur has an intrinsically unstable
+        BACKWARD (log-sum-exp underflow in the dual potential, plus
+        SVD-of-near-degenerate-M inside the Procrustes alignment).
+        Chamfer has neither — its backward is just:
+
+            grad_p ‖p - nn(p)‖² = 2 · (p - nn(p))
+
+        bounded by twice the bounding-box diameter; identical
+        structure for the reverse direction. No spectral op, no log-
+        sum-exp, no Sinkhorn iteration. So Chamfer is the natural
+        fallback when Sinkhorn's NaN-backward proves unfixable.
+
+        Trade-off vs Sinkhorn
+        ---------------------
+        Chamfer is NOT a true OT metric — it allows many-to-one
+        matchings (multiple pred cells can claim the same true cell
+        as their nearest neighbour). The reverse-direction term
+        mitigates but doesn't eliminate this. In practice for scgg
+        the failure mode is rare because (a) we have same-cardinality
+        clouds, (b) other losses (pairwise/EDM) already constrain
+        global structure, and (c) Procrustes alignment keeps clouds
+        in similar orientation.
+
+        Gradient pattern: same as Sinkhorn — flows through pred_c
+        via the constant-R linear map (when ``procrustes_align``)
+        plus cdist's well-behaved backward. ``true_pos`` is detached.
+        """
+        slice_losses: List[torch.Tensor] = []
+        for true_pos, pred_pos, mask in zip(
+            masked_true.positions, masked_pred.positions, masked_true.node_mask,
+        ):
+            true_real = true_pos[mask].detach()
+            pred_real = pred_pos[mask]
+            n = true_real.shape[0]
+            # Chamfer is well-defined for any n ≥ 1, but n < 2 makes
+            # the loss trivially zero (single-cell cloud matches
+            # itself) — skip to match the other components' min-N
+            # behaviour.
+            if n < 2:
+                continue
+
+            # Optional subsampling for large slices. Indices MUST
+            # match between pred and true so we're comparing the same
+            # cell subset, same convention as the Sinkhorn component.
+            if self._ch_subsample is not None and n > self._ch_subsample:
+                with torch.no_grad():
+                    idx = torch.randperm(n, device=true_real.device)[:self._ch_subsample]
+                true_real = true_real[idx]
+                pred_real = pred_real[idx]
+
+            # (1) Centre both clouds for translation invariance.
+            true_c = true_real - true_real.mean(dim=0, keepdim=True)
+            pred_c = pred_real - pred_real.mean(dim=0, keepdim=True)
+
+            # (2) Differentiable Procrustes (constant-R) alignment.
+            #     Same helper as Sinkhorn — R is computed under
+            #     no_grad and detached, gradient flows through pred_c
+            #     as if R were a constant rotation.
+            if self._ch_procrustes_align:
+                pred_c = _procrustes_align_2d(pred_c, true_c)
+
+            # (3) Optional scale invariance.
+            if self._ch_scale_invariant:
+                with torch.no_grad():
+                    scale = true_c.pow(2).sum(dim=-1).mean().sqrt().clamp_min(1e-6)
+                true_c = true_c / scale
+                pred_c = pred_c / scale
+
+            # (4) Chamfer: forward + backward NN distances on the
+            #     aligned clouds. cdist returns ‖·‖ (L²); squaring
+            #     happens after the min so we don't backprop through
+            #     a sqrt at d=0 (gradient singularity).
+            d = torch.cdist(pred_c, true_c, p=2)        # (N, N)
+            # Min along dim=1 → for each pred row, the closest true
+            # column. Differentiable through the min entry (subgrad).
+            forward_min  = d.min(dim=1).values          # (N,)
+            backward_min = d.min(dim=0).values          # (N,)
+            if self._ch_squared:
+                forward_min  = forward_min  ** 2
+                backward_min = backward_min ** 2
+            slice_losses.append(forward_min.mean() + backward_min.mean())
 
         if not slice_losses:
             return _graph_zero(masked_pred)

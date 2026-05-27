@@ -1112,6 +1112,181 @@ def test_graph_zero_falls_back_to_positions_without_edm_D() -> None:
     )
 
 
+def _build_pred_true_dataholders(N: int = 32, B: int = 1, seed: int = 0):
+    """Helper: build a pred/true DataHolder pair for Chamfer testing."""
+    from utils.data.dataholder import DataHolder
+    torch.manual_seed(seed)
+    mask = torch.ones(B, N, dtype=torch.bool)
+    true_pos = torch.randn(B, N, 2) * 0.5
+    pred_pos = (true_pos + 0.1 * torch.randn(B, N, 2)).clone().requires_grad_(True)
+    common = dict(
+        node_features=torch.zeros(B, N, 4),
+        diffusion_time=torch.zeros(B, 1),
+        cell_class=torch.zeros(B, N, 1, dtype=torch.long),
+        cell_ID=torch.arange(N).unsqueeze(0).expand(B, N).unsqueeze(-1),
+        t_int=torch.zeros(B, 1, dtype=torch.long),
+        t=torch.zeros(B, 1),
+        node_mask=mask,
+    )
+    masked_true = DataHolder(positions=true_pos, **common)
+    masked_pred = DataHolder(positions=pred_pos, **common)
+    return masked_pred, masked_true, pred_pos
+
+
+def test_chamfer_zero_on_identical_clouds() -> None:
+    """When pred == true, Chamfer should be exactly zero (each cell's
+    nearest neighbour is itself at distance 0).
+    """
+    from metrics.loss_function import LossFunction
+
+    cfg = {
+        "model": {
+            "loss": {
+                "pairwise_distance_mse": {"enabled": False},
+                "chamfer": {
+                    "enabled": True, "weight": 1.0,
+                    "squared": True,
+                    # Procrustes is a NO-OP when pred ≡ true (M is a
+                    # positive multiple of identity), but turn it off
+                    # for this test so we're checking the raw Chamfer
+                    # formula.
+                    "procrustes_align": False,
+                    "scale_invariant": False,
+                },
+            },
+        },
+    }
+    lf = LossFunction(cfg)
+    masked_pred, masked_true, _ = _build_pred_true_dataholders()
+    # Force pred to equal true.
+    masked_pred.positions = masked_true.positions.clone().requires_grad_(True)
+    val = lf._compute_chamfer(masked_pred, masked_true)
+    assert torch.isfinite(val).all()
+    assert val.item() < 1e-10, (
+        f"Chamfer on identical clouds should be ~0; got {val.item():.3e}"
+    )
+
+
+def test_chamfer_gradient_finite_and_flows() -> None:
+    """Gradient must flow through pred.positions and be finite (the
+    whole point of this loss as a Sinkhorn fallback).
+    """
+    from metrics.loss_function import LossFunction
+
+    cfg = {
+        "model": {
+            "loss": {
+                "pairwise_distance_mse": {"enabled": False},
+                "chamfer": {
+                    "enabled": True, "weight": 1.0,
+                    "squared": True,
+                    "procrustes_align": True,    # exercise the detach-R path
+                    "scale_invariant": False,
+                },
+            },
+        },
+    }
+    lf = LossFunction(cfg)
+    masked_pred, masked_true, pred_pos = _build_pred_true_dataholders(seed=1)
+    val = lf._compute_chamfer(masked_pred, masked_true)
+    assert torch.isfinite(val).all(), f"Chamfer forward NaN: {val}"
+    val.backward()
+    assert pred_pos.grad is not None
+    assert torch.isfinite(pred_pos.grad).all(), (
+        f"Chamfer backward produced non-finite grad: {pred_pos.grad}"
+    )
+    assert pred_pos.grad.abs().sum().item() > 0, (
+        "Chamfer backward produced an all-zero grad (no signal flowing)"
+    )
+
+
+def test_chamfer_finite_at_near_degenerate_procrustes() -> None:
+    """The steady-state regime that broke Sinkhorn: pred ≈ true so M
+    = pred^T·true is near-diagonal with σ_max ≈ σ_min. Chamfer with
+    procrustes_align=True must still produce a finite gradient in
+    that regime — relies on _procrustes_align_2d's detach-R fix.
+    """
+    from metrics.loss_function import LossFunction
+
+    cfg = {
+        "model": {
+            "loss": {
+                "pairwise_distance_mse": {"enabled": False},
+                "chamfer": {
+                    "enabled": True, "weight": 1.0,
+                    "squared": True,
+                    "procrustes_align": True,
+                    "scale_invariant": False,
+                },
+            },
+        },
+    }
+    lf = LossFunction(cfg)
+    # Construct the near-degenerate regime: pred ≈ true with 1e-4
+    # noise. M = pred^T·true is approximately ‖true‖² · I, so
+    # σ_max ≈ σ_min — the SVD-backward NaN regime that broke
+    # Sinkhorn (loss bounded ~0.015, gradient NaN).
+    torch.manual_seed(11)
+    N, B = 32, 1
+    true_pos = torch.randn(B, N, 2) * 0.5
+    pred_pos = (true_pos + 1e-4 * torch.randn(B, N, 2)).clone().requires_grad_(True)
+    mask = torch.ones(B, N, dtype=torch.bool)
+    from utils.data.dataholder import DataHolder
+    common = dict(
+        node_features=torch.zeros(B, N, 4),
+        diffusion_time=torch.zeros(B, 1),
+        cell_class=torch.zeros(B, N, 1, dtype=torch.long),
+        cell_ID=torch.arange(N).unsqueeze(0).expand(B, N).unsqueeze(-1),
+        t_int=torch.zeros(B, 1, dtype=torch.long),
+        t=torch.zeros(B, 1),
+        node_mask=mask,
+    )
+    masked_true = DataHolder(positions=true_pos, **common)
+    masked_pred = DataHolder(positions=pred_pos, **common)
+    val = lf._compute_chamfer(masked_pred, masked_true)
+    assert torch.isfinite(val).all()
+    val.backward()
+    assert torch.isfinite(pred_pos.grad).all(), (
+        f"Chamfer at near-degenerate Procrustes regime produced "
+        f"non-finite grad — the detach-R fix in _procrustes_align_2d "
+        f"is supposed to prevent this. Got {pred_pos.grad}"
+    )
+
+
+def test_chamfer_silent_silencing_guard_raises() -> None:
+    """Chamfer is a pred.positions-based loss like Sinkhorn / shape /
+    knn_rank, so the EDM-MDS-detached silent-silencing guard must
+    flag it when mds_align_gradient=False."""
+    from metrics.loss_function import LossFunction
+
+    cfg = {
+        "model": {
+            "edm": {
+                "enabled": True, "mds_align": True,
+                "mds_align_gradient": False,
+            },
+            "loss": {
+                "pairwise_distance_mse": {"enabled": False},
+                "chamfer": {"enabled": True, "weight": 1.0},
+            },
+        },
+    }
+    raised = False
+    try:
+        LossFunction(cfg)
+    except ValueError as e:
+        raised = True
+        msg = str(e)
+        assert "chamfer" in msg, (
+            f"silent-silencing guard message must mention chamfer; "
+            f"got: {msg}"
+        )
+    assert raised, (
+        "Silent-silencing guard should raise when EDM+MDS detach is "
+        "on AND chamfer is enabled"
+    )
+
+
 def test_b3_14_gene_recon_ldm_mutex() -> None:
     """The LightningModule's __init__ must raise when gene_recon AND
     latent_diffusion are both enabled. Text-inspection because
@@ -1190,6 +1365,14 @@ def main() -> int:
          test_graph_zero_bypasses_mds_path),
         ("_graph_zero falls back to positions when no head stash",
          test_graph_zero_falls_back_to_positions_without_edm_D),
+        ("Chamfer: zero on identical clouds",
+         test_chamfer_zero_on_identical_clouds),
+        ("Chamfer: gradient flows and is finite",
+         test_chamfer_gradient_finite_and_flows),
+        ("Chamfer: finite gradient at near-degenerate Procrustes",
+         test_chamfer_finite_at_near_degenerate_procrustes),
+        ("Chamfer: silent-silencing guard catches EDM+chamfer w/o mds_grad",
+         test_chamfer_silent_silencing_guard_raises),
         ("B3.14 — gene_recon × LDM mutex raises",
          test_b3_14_gene_recon_ldm_mutex),
     ]

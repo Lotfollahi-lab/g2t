@@ -419,6 +419,78 @@ loss:
         # Default 0 = active from step 0 (the historic behaviour).
         warmup_steps: 0
 
+    # -----------------------------------------------------------------
+    # Chamfer distance — the Sinkhorn-free OT-flavoured fallback.
+    # -----------------------------------------------------------------
+    # For each cell in PRED, find its nearest neighbour in TRUE and
+    # accumulate the squared L² distance. Then do the same in the
+    # reverse direction and average. Per slice:
+    #
+    #   d_chamfer(P, T) = mean_p (min_t ‖p - t‖²) + mean_t (min_p ‖t - p‖²)
+    #
+    # Why this and not Sinkhorn
+    # -------------------------
+    # Sinkhorn at small blur has an unstable BACKWARD (log-sum-exp
+    # underflow + SVD-of-near-degenerate-M inside Procrustes) — the
+    # 2026-05-27 ablations got `train_loss/sinkhorn` ~0.015 (finite
+    # forward) but NaN gradient regardless of warmup/debias/blur.
+    # Chamfer has no Sinkhorn iteration and no spectral op; the
+    # backward is just min-gather + cdist-backward, both of which
+    # produce bounded gradients of magnitude ~2·(pred − nearest_true).
+    # It's also O(N²) memory like tensorized Sinkhorn (no asymptotic
+    # win), so it's a drop-in replacement performance-wise.
+    #
+    # Trade-off vs Sinkhorn
+    # ---------------------
+    # Chamfer is NOT a true OT metric — it allows many-to-one
+    # matchings (multiple pred cells can match the same true cell),
+    # which can produce a "mode collapse" failure: the prediction
+    # collapses onto a few high-density truth regions, ignoring
+    # lower-density ones. The reverse min term (each true matched to
+    # nearest pred) helps but doesn't fully prevent it.
+    #
+    # In practice for scgg this rarely bites because (a) we have
+    # SAME-cardinality clouds with cell identities preserved across
+    # P and T, and (b) other losses (edm_distance_mse, pairwise_mse)
+    # already constrain global structure. Chamfer just adds a fine-
+    # grained per-cell placement signal.
+    chamfer:
+        enabled: false
+        weight: 1.0       # at squared-L² scale, comparable to pairwise_distance_mse
+        # squared: True = standard squared-L² Chamfer (the literature
+        # default; gradient ∝ 2·(pred − nearest_true), bounded). False
+        # = plain L² Chamfer (gradient has a 1/d singularity at d=0,
+        # which is rare but possible — only use if you want to match
+        # Sinkhorn's L¹ behaviour for ablation.)
+        squared: true
+        # Differentiable Procrustes (rotation + reflection) alignment
+        # of pred onto true BEFORE Chamfer. Same rationale as
+        # sinkhorn.procrustes_align: Chamfer is NOT rotation-invariant
+        # on its own, and scgg's predictions live in an arbitrary
+        # frame (EDM Procrustes-to-noisy-x_t, FM rot/refl
+        # augmentation). With this on, Chamfer measures per-cell
+        # placement modulo the global frame — which is the signal we
+        # want.
+        #
+        # R is computed under torch.no_grad and detached before the
+        # final pred_c @ R multiply — same fixed-structure pattern
+        # as sinkhorn (see _procrustes_align_2d docstring).
+        procrustes_align: true
+        # Scale-invariant mode: divide both clouds by truth's RMS
+        # distance to centroid before Chamfer. Use if your positions
+        # live at different scales than the LUNA/MMC default and you
+        # don't want to retune weight.
+        scale_invariant: false
+        # Optional subsampling for very large slices. Chamfer is
+        # O(N²) memory (one cdist matrix per slice). Cap to 2000 if
+        # memory-bound.
+        subsample: null
+        # Warmup window during which the loss VALUE is logged but the
+        # gradient is skipped. Chamfer's backward is bounded so this
+        # is almost never needed — provided for symmetry with sinkhorn
+        # and so the per-component warmup machinery is consistent.
+        warmup_steps: 0
+
     # EDM (Euclidean Distance Matrix) squared-distance MSE —
     # automatically enabled by the EDMOutputWrapper, ignored otherwise.
     #
