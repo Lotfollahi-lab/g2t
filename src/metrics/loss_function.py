@@ -356,6 +356,43 @@ class LossFunction(nn.Module):
         self._ldm_fm_enabled = True
         self._ldm_kl_enabled = True
 
+        # Per-component warmup. For the first ``warmup_steps`` training
+        # steps, the named component's loss VALUE is still computed
+        # (under torch.no_grad — so it shows up on wandb for
+        # visibility) but its gradient contribution is skipped
+        # entirely. Use for losses whose backward is numerically
+        # unstable at training init (Sinkhorn at small ``blur`` is
+        # the canonical case — log-sum-exp underflow at random init
+        # positions produces NaN in the SamplesLoss backward).
+        # Default 0 = no warmup.
+        #
+        # IMPORTANT — design contract:
+        #   1. Loss value is still computed under no_grad and logged
+        #      to wandb under ``train_loss/<name>``. The
+        #      ``<name>_weighted`` key reports 0 during warmup so the
+        #      sum on the wandb chart accurately reflects what's
+        #      training the model. ``<name>_warmup_active`` flag
+        #      logged as 1.0 / 0.0 so you can SEE on the wandb chart
+        #      exactly when each warmup ends — no silent silencing.
+        #   2. The autograd graph through the component is NEVER
+        #      built during warmup, so the unstable backward can't
+        #      poison anything.
+        #   3. Step counter increments at each ``forward(...,
+        #      train_stage=True)`` call. Val-stage forwards don't
+        #      advance the counter.
+        self._warmup_steps = {
+            name: int(_cfg_get(cfg, "model", "loss", name,
+                               "warmup_steps", default=0))
+            for name in (
+                "sinkhorn", "shape_matching", "persistent_homology",
+                "knn_rank", "pairwise_distance_mse", "edm_distance_mse",
+                "knn_graph_loss", "coarse_centroid_mse",
+                "latent_fm_mse", "latent_kl",
+            )
+        }
+        # Global step counter — advanced only on training-stage forwards.
+        self._step_count = 0
+
         # The component registry. Each entry is
         # (name, enabled, weight, callable(self, pred, true) -> Tensor).
         # ``compute_loss`` iterates this list — adding a new component
@@ -1751,21 +1788,66 @@ class LossFunction(nn.Module):
                 before weighting, plus the weighted contribution under
                 ``"<name>_weighted"``). Disabled components are absent
                 from this dict.
+
+        Warmup: for components whose ``warmup_steps > 0`` and the
+        current ``self._step_count < warmup_steps``, the loss VALUE
+        is computed under ``torch.no_grad()`` (so it logs to wandb)
+        but skipped from the autograd graph (so its potentially-
+        unstable backward can't poison the rest of training). The
+        weighted contribution to total is exactly 0 during warmup;
+        full weight resumes once the counter passes the threshold.
+        A ``<name>_warmup_active`` scalar is logged so the wandb
+        chart shows when each warmup ends.
         """
         total = None
         per_component: Dict[str, float] = {}
         for name, enabled, weight, fn in self._components:
             if not enabled:
                 continue
-            val = fn(masked_pred, masked_true)
-            per_component[name] = float(val.detach().item())
-            weighted = weight * val
-            per_component[f"{name}_weighted"] = float(weighted.detach().item())
-            total = weighted if total is None else (total + weighted)
+            warmup_n = self._warmup_steps.get(name, 0)
+            in_warmup = warmup_n > 0 and self._step_count < warmup_n
+            if in_warmup:
+                # Compute the value WITHOUT building the autograd graph.
+                # Logged-but-not-trained: makes warmup VISIBLE on the
+                # wandb chart (value still moves; weighted shows 0).
+                with torch.no_grad():
+                    val = fn(masked_pred, masked_true)
+                per_component[name] = float(val.detach().item())
+                per_component[f"{name}_weighted"] = 0.0
+                per_component[f"{name}_warmup_active"] = 1.0
+                # Intentionally do NOT add to ``total``: total tracks
+                # only the gradient-bearing contribution, so the
+                # wandb-side "total" matches what the optimizer actually
+                # sees. (Adding 0.0 here would mathematically equal
+                # this but uselessly bloat the autograd graph.)
+            else:
+                val = fn(masked_pred, masked_true)
+                per_component[name] = float(val.detach().item())
+                weighted = weight * val
+                per_component[f"{name}_weighted"] = float(weighted.detach().item())
+                total = weighted if total is None else (total + weighted)
+                # Log the warmup flag as 0 once active, so wandb shows
+                # a step-function from 1→0 at the warmup boundary.
+                if warmup_n > 0:
+                    per_component[f"{name}_warmup_active"] = 0.0
         if total is None:
-            # All components disabled — define total as 0 attached to
-            # the prediction graph so backward is still well-defined.
+            # All ACTIVE components disabled (or all in warmup) —
+            # define total as 0 attached to the prediction graph so
+            # backward is still well-defined. Print a one-shot warning
+            # so the user isn't surprised by zero-gradient training
+            # during a long warmup.
             total = masked_pred.positions[0].sum() * 0.0
+            if not getattr(self, "_warned_empty_total", False):
+                print(
+                    "[LossFunction] WARNING: total loss has no "
+                    "gradient-bearing contribution this step "
+                    "(all active components either disabled or in "
+                    f"warmup at step {self._step_count}). Training "
+                    "will not update weights. This is expected for "
+                    "the first ``warmup_steps`` steps if you've "
+                    "warmed up every active component."
+                )
+                self._warned_empty_total = True
         per_component["total"] = float(total.detach().item())
         return total, per_component
 
@@ -1790,6 +1872,13 @@ class LossFunction(nn.Module):
         self.node_mask = masked_true.node_mask
 
         loss, per_component = self.compute_loss(masked_pred, masked_true)
+
+        # Advance the warmup step counter on TRAINING-stage forwards
+        # only. Val/test stages must not advance it, otherwise a long
+        # validation pass could push the counter past warmup
+        # thresholds before training has actually reached them.
+        if train_stage:
+            self._step_count += 1
 
         # Stash for log_epoch_metrics. Use a snapshot of the FLOAT
         # values (already detached inside compute_loss via .item()

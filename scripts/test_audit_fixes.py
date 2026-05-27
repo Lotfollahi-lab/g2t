@@ -841,6 +841,201 @@ def test_mds_eigh_no_nan_grad_with_tikhonov() -> None:
     )
 
 
+def test_warmup_skips_autograd_graph_during_warmup() -> None:
+    """During warmup, the loss VALUE is computed but the gradient
+    contribution is exactly zero. Verifies that backward through a
+    warmup'd component doesn't reach any model parameter."""
+    import torch.nn as nn
+    from utils.data.dataholder import DataHolder
+    from metrics.loss_function import LossFunction
+
+    cfg = {
+        "model": {
+            "loss": {
+                # Only the warmup'd loss enabled. If warmup skips
+                # backward correctly, no param should get gradient
+                # through it.
+                "pairwise_distance_mse": {
+                    "enabled": True, "weight": 1.0, "warmup_steps": 5,
+                },
+            },
+        },
+    }
+    lf = LossFunction(cfg)
+
+    # Build a trivial gradient-bearing surrogate so we can ask
+    # "did any parameter get gradient through the loss?".
+    w = nn.Parameter(torch.randn(1, 1))
+    pred_pos = torch.randn(1, 8, 2) * w  # gradient flows through w
+    true_pos = torch.randn(1, 8, 2)
+    mask = torch.ones(1, 8, dtype=torch.bool)
+    pred = DataHolder(
+        node_features=torch.zeros(1, 8, 4), positions=pred_pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+        cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1), node_mask=mask,
+    )
+    true = DataHolder(
+        node_features=torch.zeros(1, 8, 4), positions=true_pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+        cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1), node_mask=mask,
+    )
+
+    # Step 0: in warmup. Total should be 0 (no graph contribution).
+    loss, _ = lf.forward(pred, true, train_stage=True, log=False)
+    per_comp = lf._last_per_component
+    assert per_comp.get("pairwise_distance_mse_warmup_active") == 1.0, (
+        "warmup flag should be 1.0 during warmup"
+    )
+    assert per_comp.get("pairwise_distance_mse") is not None, (
+        "loss VALUE should still be computed for logging"
+    )
+    assert per_comp["pairwise_distance_mse_weighted"] == 0.0, (
+        "weighted contribution should be 0 during warmup"
+    )
+    # The total IS zero-graph-attached. Backward gives zero grad on w.
+    w.grad = None
+    loss.backward()
+    assert w.grad is None or w.grad.abs().sum().item() == 0.0, (
+        f"warmup'd loss should not propagate gradient; got w.grad="
+        f"{w.grad}"
+    )
+
+
+def test_warmup_unlocks_after_n_steps() -> None:
+    """After warmup_steps training-stage forwards, the component
+    re-engages and its gradient flows to parameters."""
+    import torch.nn as nn
+    from utils.data.dataholder import DataHolder
+    from metrics.loss_function import LossFunction
+
+    cfg = {
+        "model": {
+            "loss": {
+                "pairwise_distance_mse": {
+                    "enabled": True, "weight": 1.0, "warmup_steps": 3,
+                },
+            },
+        },
+    }
+    lf = LossFunction(cfg)
+
+    w = nn.Parameter(torch.randn(1, 1))
+    # Advance the counter by 3 training-stage forwards.
+    for _ in range(3):
+        pred_pos = torch.randn(1, 8, 2) * w
+        true_pos = torch.randn(1, 8, 2)
+        mask = torch.ones(1, 8, dtype=torch.bool)
+        pred = DataHolder(
+            node_features=torch.zeros(1, 8, 4), positions=pred_pos,
+            diffusion_time=torch.zeros(1, 1),
+            cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+            cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+            t_int=torch.zeros(1, 1, dtype=torch.long),
+            t=torch.zeros(1, 1), node_mask=mask,
+        )
+        true = DataHolder(
+            node_features=torch.zeros(1, 8, 4), positions=true_pos,
+            diffusion_time=torch.zeros(1, 1),
+            cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+            cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+            t_int=torch.zeros(1, 1, dtype=torch.long),
+            t=torch.zeros(1, 1), node_mask=mask,
+        )
+        lf.forward(pred, true, train_stage=True, log=False)
+    # Counter is now 3 → warmup window (0..3 exclusive) ended. Next
+    # forward should engage the loss.
+    pred_pos = torch.randn(1, 8, 2) * w
+    pred = DataHolder(
+        node_features=torch.zeros(1, 8, 4), positions=pred_pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+        cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1), node_mask=mask,
+    )
+    loss, _ = lf.forward(pred, true, train_stage=True, log=False)
+    per_comp = lf._last_per_component
+    assert per_comp.get("pairwise_distance_mse_warmup_active") == 0.0, (
+        "warmup flag should be 0.0 after warmup ends"
+    )
+    assert per_comp["pairwise_distance_mse_weighted"] != 0.0, (
+        f"weighted contribution should be nonzero post-warmup; got "
+        f"{per_comp['pairwise_distance_mse_weighted']}"
+    )
+    w.grad = None
+    loss.backward()
+    assert w.grad is not None and w.grad.abs().sum().item() > 0.0, (
+        f"post-warmup loss should propagate gradient; got w.grad="
+        f"{w.grad}"
+    )
+
+
+def test_warmup_counter_doesnt_advance_on_val_stage() -> None:
+    """Validation forwards must not advance the warmup counter —
+    otherwise a long val pass could push past warmup before the
+    training loop has caught up."""
+    import torch.nn as nn
+    from utils.data.dataholder import DataHolder
+    from metrics.loss_function import LossFunction
+
+    cfg = {
+        "model": {
+            "loss": {
+                "pairwise_distance_mse": {
+                    "enabled": True, "weight": 1.0, "warmup_steps": 3,
+                },
+            },
+        },
+    }
+    lf = LossFunction(cfg)
+    w = nn.Parameter(torch.randn(1, 1))
+    mask = torch.ones(1, 8, dtype=torch.bool)
+
+    def _step(train_stage):
+        pred_pos = torch.randn(1, 8, 2) * w
+        true_pos = torch.randn(1, 8, 2)
+        pred = DataHolder(
+            node_features=torch.zeros(1, 8, 4), positions=pred_pos,
+            diffusion_time=torch.zeros(1, 1),
+            cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+            cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+            t_int=torch.zeros(1, 1, dtype=torch.long),
+            t=torch.zeros(1, 1), node_mask=mask,
+        )
+        true = DataHolder(
+            node_features=torch.zeros(1, 8, 4), positions=true_pos,
+            diffusion_time=torch.zeros(1, 1),
+            cell_class=torch.zeros(1, 8, 1, dtype=torch.long),
+            cell_ID=torch.arange(8).unsqueeze(0).unsqueeze(-1),
+            t_int=torch.zeros(1, 1, dtype=torch.long),
+            t=torch.zeros(1, 1), node_mask=mask,
+        )
+        return lf.forward(pred, true, train_stage=train_stage, log=False)
+
+    # 10 val-stage forwards → counter should stay at 0.
+    for _ in range(10):
+        _step(train_stage=False)
+    assert lf._step_count == 0, (
+        f"counter should not advance on val stage; got "
+        f"{lf._step_count}"
+    )
+    # 2 train-stage forwards → counter = 2 (still in warmup of 3).
+    _step(train_stage=True)
+    _step(train_stage=True)
+    assert lf._step_count == 2
+    _step(train_stage=False)  # val: shouldn't advance
+    assert lf._step_count == 2, (
+        f"val forward should not advance the counter; expected 2, "
+        f"got {lf._step_count}"
+    )
+
+
 def test_b3_14_gene_recon_ldm_mutex() -> None:
     """The LightningModule's __init__ must raise when gene_recon AND
     latent_diffusion are both enabled. Text-inspection because
@@ -909,6 +1104,12 @@ def main() -> int:
          test_shape_matching_eigvalsh_no_nan_grad_at_init),
         ("MDS eigh: finite gradient on near-zero D_sq (Tikhonov on B)",
          test_mds_eigh_no_nan_grad_with_tikhonov),
+        ("Warmup: no autograd graph during warmup window",
+         test_warmup_skips_autograd_graph_during_warmup),
+        ("Warmup: gradient unlocks after warmup_steps training-steps",
+         test_warmup_unlocks_after_n_steps),
+        ("Warmup: val-stage forwards don't advance the counter",
+         test_warmup_counter_doesnt_advance_on_val_stage),
         ("B3.14 — gene_recon × LDM mutex raises",
          test_b3_14_gene_recon_ldm_mutex),
     ]

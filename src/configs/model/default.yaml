@@ -364,6 +364,21 @@ loss:
         # positions live at very different scales than the LUNA/MMC
         # default and you don't want to retune ``blur``.
         scale_invariant: false
+        # Number of training steps during which this loss is computed
+        # but NOT included in the autograd graph (i.e., the model is
+        # not trained by it). The loss value is still logged to
+        # wandb under ``train_loss/sinkhorn`` for visibility, with
+        # ``train_loss/sinkhorn_weighted = 0`` and
+        # ``train_loss/sinkhorn_warmup_active = 1`` during the
+        # warmup window — so you can see exactly when the warmup
+        # ends. Sinkhorn at small ``blur`` with random init
+        # positions produces NaN gradients from log-sum-exp
+        # underflow inside SamplesLoss's backward; warming up for
+        # a few hundred steps (say 200-500) lets pairwise/EDM
+        # losses pull the position output into a reasonable scale
+        # first, after which Sinkhorn's backward is well-behaved.
+        # Default 0 = active from step 0 (the historic behaviour).
+        warmup_steps: 0
 
     # EDM (Euclidean Distance Matrix) squared-distance MSE —
     # automatically enabled by the EDMOutputWrapper, ignored otherwise.
@@ -441,6 +456,17 @@ loss:
         enabled: false
         weight: 0.1
         variant: eigvals  # one of: eigvals | ratio | covariance
+        # Number of training steps to wait before this loss starts
+        # contributing to the gradient. See sinkhorn.warmup_steps
+        # above for the contract — value is still logged during
+        # warmup, ``shape_matching_warmup_active`` flag indicates
+        # the active window. Useful when combined with EDM
+        # mds_align_gradient=true: at init, pred.positions ≈ 0 so
+        # the eigvalsh-of-covariance backward hits a degenerate
+        # regime; a small warmup (say 100-300 steps) lets pairwise
+        # MSE pull the position output to a non-degenerate scale
+        # first. Default 0 = active from step 0.
+        warmup_steps: 0
 
     # Latent-diffusion losses. Always "enabled" in the loss registry
     # but no-op (graph-attached zero) when the LDM stashes aren't on
