@@ -302,6 +302,15 @@ class LossFunction(nn.Module):
             cfg, "model", "loss", "sinkhorn", "scale_invariant",
             default=False,
         ))
+        # Debiased Sinkhorn divergence. Default True (mathematically
+        # clean: S_ε(α, β) = 0 iff α = β). Set to False as a NaN-
+        # backward fallback — biased L_ε runs 1 OT problem instead
+        # of 3, removing two backward paths that can independently
+        # produce log-sum-exp underflow at small blur. See the
+        # default.yaml comment for the full hierarchy of fixes.
+        self._sk_debias = bool(_cfg_get(
+            cfg, "model", "loss", "sinkhorn", "debias", default=True,
+        ))
         # Lazy-init: only build the SamplesLoss object on first call,
         # so users who never enable the component never pay the
         # geomloss import cost.
@@ -517,7 +526,8 @@ class LossFunction(nn.Module):
                     f"scaling={self._sk_scaling:.3g}, "
                     f"backend={self._sk_backend}, "
                     f"procrustes_align={self._sk_procrustes_align}, "
-                    f"scale_invariant={self._sk_scale_invariant}"
+                    f"scale_invariant={self._sk_scale_invariant}, "
+                    f"debias={self._sk_debias}"
                 )
                 if self._sk_subsample:
                     extra += f", subsample={self._sk_subsample}"
@@ -1288,7 +1298,14 @@ class LossFunction(nn.Module):
                 # "tensorized" by default — see __init__ comment for
                 # why we don't trust "auto" / KeOps backends here.
                 backend=self._sk_backend,
-                debias=True,      # always — see docstring
+                # Debiased S_ε(α,β) = L_ε(α,β) − ½(L_ε(α,α)+L_ε(β,β))
+                # is mathematically cleaner (zero when α=β) but runs
+                # 3 OT problems in parallel, so it has 3× the NaN-
+                # backward surface area at small blur. Set
+                # ``model.loss.sinkhorn.debias=false`` to fall back to
+                # plain biased L_ε(α,β) — see default.yaml comment for
+                # the full hierarchy of NaN-mitigation knobs.
+                debias=self._sk_debias,
             )
 
         slice_losses: List[torch.Tensor] = []

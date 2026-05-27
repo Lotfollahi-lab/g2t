@@ -301,11 +301,28 @@ loss:
     sinkhorn:
         enabled: false
         weight: 0.1       # regulariser scale; co-magnitude with pairwise MSE at ~0.1
-        # blur: entropic regularisation strength. Smaller = closer
-        # to exact Wasserstein but slower convergence + possible
-        # NaNs. 0.01 is right for our normalised position scale
-        # ([-0.5, 0.5] cube). Bump to 0.05 if you see NaN loss.
-        blur: 0.01
+        # blur: entropic regularisation strength of the Sinkhorn
+        # iteration. Smaller = closer to exact Wasserstein but slower
+        # convergence + a SHARPER backward.
+        #
+        # Empirical finding (2026-05-27 ablation set): blur=0.01 on
+        # cortex-scale positions ([-0.5, 0.5] cube) NaN's the gradient
+        # even AFTER a 200-step warmup on edm_distance_mse — i.e.,
+        # the instability isn't init-related, it's intrinsic to the
+        # backward of debiased Sinkhorn at ε comparable to noise in
+        # the cost matrix. Log-sum-exp on individual rows underflows
+        # to -Inf in the dual potential, the gradient propagates
+        # Inf-Inf = NaN, and the position head's weights get poisoned
+        # on the optimizer step.
+        #
+        # Recommended starting value: 0.1. At cortex's normalised
+        # scale 0.1 ≈ typical inter-cell gap, so the Sinkhorn
+        # iteration is well-conditioned and the backward is bounded.
+        # If 0.1 also produces NaN, drop `debias` to False (see
+        # below) — that removes 2 of the 3 OT problems and is the
+        # next-cheapest fix. As a final fallback, switch to a non-
+        # Sinkhorn OT loss (Chamfer is a one-liner replacement here).
+        blur: 0.1
         # scaling: epsilon-annealing factor across Sinkhorn iterations.
         # 0.5 = fast / coarse; 0.99 = slow / precise. 0.9 is the
         # standard quality/speed compromise.
@@ -364,6 +381,16 @@ loss:
         # positions live at very different scales than the LUNA/MMC
         # default and you don't want to retune ``blur``.
         scale_invariant: false
+        # geomloss debiasing. True → compute the SYMMETRIC Sinkhorn
+        # divergence S_ε(α, β) = L_ε(α, β) − ½(L_ε(α, α) + L_ε(β, β))
+        # so the loss equals zero when α = β (no entropic bias).
+        # Mathematically cleaner, but the price is 3 OT problems per
+        # forward (αβ, αα, ββ) and therefore 3× the NaN-backward
+        # surface area. Set False to fall back to the plain biased
+        # Sinkhorn (L_ε(α, β) alone) — has a non-zero floor when α=β
+        # but is the standard go-to when debiased Sinkhorn NaN's at
+        # small blur. Try this BEFORE giving up on Sinkhorn entirely.
+        debias: true
         # Number of training steps during which this loss is computed
         # but NOT included in the autograd graph (i.e., the model is
         # not trained by it). The loss value is still logged to
@@ -371,12 +398,24 @@ loss:
         # ``train_loss/sinkhorn_weighted = 0`` and
         # ``train_loss/sinkhorn_warmup_active = 1`` during the
         # warmup window — so you can see exactly when the warmup
-        # ends. Sinkhorn at small ``blur`` with random init
-        # positions produces NaN gradients from log-sum-exp
-        # underflow inside SamplesLoss's backward; warming up for
-        # a few hundred steps (say 200-500) lets pairwise/EDM
-        # losses pull the position output into a reasonable scale
-        # first, after which Sinkhorn's backward is well-behaved.
+        # ends.
+        #
+        # When warmup helps: when the failure is init-related (the
+        # position head outputs near-degenerate clouds at step 0,
+        # which makes Sinkhorn iterations underflow). Letting
+        # edm_distance_mse / pairwise_distance_mse pull positions
+        # to a reasonable scale first lets the post-warmup Sinkhorn
+        # be well-conditioned.
+        #
+        # When warmup does NOT help (empirically observed
+        # 2026-05-27): when the failure is intrinsic to debiased
+        # Sinkhorn's backward at small blur (e.g., blur=0.01 on
+        # cortex). In that regime the loss NaN's the moment it
+        # enters the graph regardless of model state — warmup
+        # delays the crash but doesn't prevent it. The fix is to
+        # raise ``blur`` (to ~0.1) and/or set ``debias=False``,
+        # not to warm up longer.
+        #
         # Default 0 = active from step 0 (the historic behaviour).
         warmup_steps: 0
 
