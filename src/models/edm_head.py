@@ -77,20 +77,14 @@ def _classical_mds_2d(D_sq: torch.Tensor) -> torch.Tensor:
     B = 0.5 * (B + B.T)
 
     # Tikhonov regularization to break eigenvalue degeneracy.
-    # ``torch.linalg.eigh``'s backward formula contains
-    # ``1/(λ_i − λ_j)`` terms that diverge at near-degenerate
-    # eigenvalues — at training init the predicted D_sq is near zero,
-    # so B is near zero and its top eigenvalues are too close.
-    # Without regularization the backward through this op poisons
-    # the entire backward graph with NaN whenever ``mds_align_gradient
-    # = True`` is enabled (the default-False path skips backward
-    # through eigh entirely so doesn't see this).
-    #
-    # We add a STRICTLY-INCREASING diagonal perturbation so each
-    # eigenvalue gets a distinct shift, breaking ties without
-    # changing eigenvectors more than O(eps_reg). Magnitude scales
-    # with B's diagonal so the regularization stays subdominant for
-    # any realistic D_sq.
+    # Light touch (1e-6 scaled by B's magnitude) — heavier
+    # perturbation degrades MDS precision unnecessarily. The
+    # heavy lifting against eigh backward instabilities is done
+    # at the OUTER level via the strict Procrustes degeneracy
+    # check (which skips the SVD entirely when M is poorly
+    # conditioned) and the train.gradient_clip_val=1.0 default
+    # in setup.py (clips residual large-but-finite gradients
+    # before they overflow fp32).
     eps_reg = 1e-6 * B.diag().abs().max().clamp_min(1.0)
     reg = torch.arange(n, device=device, dtype=dtype) * eps_reg / float(n)
     B = B + torch.diag(reg)
@@ -118,20 +112,41 @@ def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
     which is R-transposed — applied the INVERSE rotation and broke
     the smoke test.)
 
-    Degenerate-M handling: when M is near-zero (training init, where
-    pred ≈ 0 → M ≈ 0), the SVD's singular values are both near zero
-    and the backward formula's ``1/(σ_i − σ_j)`` / ``1/(σ_i + σ_j)``
-    terms blow up to NaN/Inf. Mathematically the optimal R is
-    undefined when M = 0 — any orthogonal matrix minimises the
-    objective equally. We pick R = I in that regime and return
-    x_src unchanged. This is mathematically valid (not a silent
-    silencing of the alignment) and removes the only NaN-prone
-    backward in this op.
+    Degenerate-M handling: SVD's backward formula has
+    ``1/(σ_i² − σ_j²)`` terms that blow up to large-but-finite
+    values whenever the two singular values are close (not just
+    zero). Three regimes we skip alignment in:
+      1. M near-zero (max |M_ij| < 1e-6): no information to align.
+      2. M near-singular (σ_min/σ_max < 1e-3): one σ is much
+         smaller than the other, but σ_min² is still in the
+         denominator of the backward formula, giving extreme
+         gradient magnitudes.
+      3. M with degenerate σ (σ_max−σ_min)/σ_max < 1e-3: σ_diff
+         in the denominator is tiny, gradient explodes.
+    The check is run under no_grad so it doesn't itself contribute
+    to the autograd graph. In all three regimes we return x_src
+    unchanged (R = I is a valid choice mathematically when M is
+    degenerate). For non-degenerate M the standard SVD path runs.
     """
     M = x_src.T @ x_ref                            # (2, 2)
     with torch.no_grad():
-        M_max = M.abs().max()
-        degenerate = (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6
+        M_detached = M.detach()
+        M_max = M_detached.abs().max()
+        if (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6:
+            degenerate = True
+        else:
+            # Cheap 2x2 SVD on the detached matrix to inspect σ.
+            # svdvals returns singular values in DESCENDING order.
+            sigma = torch.linalg.svdvals(M_detached)
+            s_max = sigma[0].item()
+            s_min = sigma[-1].item()
+            if s_max < 1e-30:
+                degenerate = True
+            else:
+                # Two conditions, both bad for backward stability:
+                cond_singular  = (s_min / s_max) < 1e-3   # one σ near zero
+                cond_degenerate = ((s_max - s_min) / s_max) < 1e-3  # σ ≈ σ
+                degenerate = cond_singular or cond_degenerate
     if degenerate:
         return x_src
     U, _S, Vh = torch.linalg.svd(M)

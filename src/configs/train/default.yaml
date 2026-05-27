@@ -26,6 +26,22 @@ weight_decay: 1.0e-12
 detect_anomaly: false
 
 # ---------------------------------------------------------------------------
+# Gradient clipping (by norm) before each optimizer step.
+# ---------------------------------------------------------------------------
+# Bounds the L2 norm of the gradient vector across ALL parameters to
+# at most this value. Defense-in-depth against large-but-finite
+# gradients that accumulate to Inf — particularly relevant for runs
+# that flow gradient through eigh / SVD ops (e.g.
+# ``model.edm.mds_align_gradient=true`` or the Procrustes-aligned
+# Sinkhorn loss). PL surfaces a "clipped" log event when clipping
+# actually fires, so this isn't silent — you can SEE when training
+# is hitting the cap.
+#
+# Default 1.0 is a standard transformer-training value (Vaswani et
+# al., used in BERT / GPT / etc). Set to 0 to disable.
+gradient_clip_val: 1.0
+
+# ---------------------------------------------------------------------------
 # Train-time rotation+reflection augmentation.
 #
 # Each training step applies an INDEPENDENT random element of O(2)

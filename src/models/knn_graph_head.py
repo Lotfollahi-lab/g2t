@@ -77,13 +77,8 @@ def _laplacian_eigenmaps_2d(A: torch.Tensor) -> torch.Tensor:
     L = torch.diag(deg) - A_sym
     # Symmetrise L (numerical safety).
     L = 0.5 * (L + L.T)
-    # Tikhonov regularization with a strictly-increasing diagonal
-    # to break eigenvalue degeneracy under
-    # ``spectral_layout_gradient=True``. eigh's backward formula
-    # contains ``1/(λ_i − λ_j)`` terms that blow up at degenerate
-    # eigenvalues, which occur when the predicted graph is near-
-    # uniform (typical at training init). See the matching block in
-    # ``edm_head._classical_mds_2d`` for the full rationale.
+    # Light Tikhonov for backward stability. Heavy lifting is at
+    # the Procrustes degeneracy check + train.gradient_clip_val.
     eps_reg = 1e-6 * L.diag().abs().max().clamp_min(1.0)
     reg = torch.arange(n, device=device, dtype=dtype) * eps_reg / float(n)
     L = L + torch.diag(reg)
@@ -104,15 +99,28 @@ def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
 
     R = U @ Vh from SVD(x_src.T @ x_ref) — Schönemann 1966.
 
-    Degenerate-M handling: same as ``edm_head._procrustes_align`` —
-    when M is near-zero, the SVD backward formula's
-    ``1/(σ_i − σ_j)`` terms blow up to NaN/Inf, so we return x_src
-    unchanged (R = I is one valid choice when M = 0).
+    Degenerate-M handling: mirrors ``edm_head._procrustes_align``.
+    Skip alignment when M is near-zero OR near-singular OR has
+    near-degenerate singular values — all three regimes make the
+    SVD backward produce extreme gradients that accumulate to Inf
+    through the transformer chain.
     """
     M = x_src.T @ x_ref
     with torch.no_grad():
-        M_max = M.abs().max()
-        degenerate = (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6
+        M_detached = M.detach()
+        M_max = M_detached.abs().max()
+        if (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6:
+            degenerate = True
+        else:
+            sigma = torch.linalg.svdvals(M_detached)
+            s_max = sigma[0].item()
+            s_min = sigma[-1].item()
+            if s_max < 1e-30:
+                degenerate = True
+            else:
+                cond_singular  = (s_min / s_max) < 1e-3
+                cond_degenerate = ((s_max - s_min) / s_max) < 1e-3
+                degenerate = cond_singular or cond_degenerate
     if degenerate:
         return x_src
     U, _S, Vh = torch.linalg.svd(M)

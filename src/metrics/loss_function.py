@@ -98,15 +98,27 @@ def _procrustes_align_2d(
     module imports.
     """
     M = x_src.T @ x_ref                                       # (2, 2)
-    # Skip alignment when M is degenerate (near-zero or non-finite).
-    # The threshold is set well above floating-point noise but well
-    # below any realistic non-zero alignment matrix from a trained
-    # model. ``no_grad`` because this decision is a forward-only
-    # gate; we don't want grad flowing through .abs().max() (which
-    # would just be zero anyway).
+    # Skip alignment when SVD backward would produce extreme
+    # gradients. Three regimes — see the matching block in
+    # ``models.edm_head._procrustes_align`` for the full
+    # justification (same math, same fix, duplicated rather than
+    # imported so the loss module stays free of model-module
+    # imports).
     with torch.no_grad():
-        M_max = M.abs().max()
-        degenerate = (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6
+        M_detached = M.detach()
+        M_max = M_detached.abs().max()
+        if (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6:
+            degenerate = True
+        else:
+            sigma = torch.linalg.svdvals(M_detached)
+            s_max = sigma[0].item()
+            s_min = sigma[-1].item()
+            if s_max < 1e-30:
+                degenerate = True
+            else:
+                cond_singular  = (s_min / s_max) < 1e-3
+                cond_degenerate = ((s_max - s_min) / s_max) < 1e-3
+                degenerate = cond_singular or cond_degenerate
     if degenerate:
         return x_src
     U, _S, Vh = torch.linalg.svd(M, full_matrices=False)

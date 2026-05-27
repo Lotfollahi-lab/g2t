@@ -177,6 +177,20 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
     # MetricsCsvCallback injected by _luna_runner.py — that writes a
     # human-discoverable `<out_dir>/metrics.csv` directly, instead of
     # PL's default-buried `lightning_logs/<name>/version_N/metrics.csv`.
+    # Gradient clipping defends against the residual "large but
+    # finite gradient" case that survives the Tikhonov / degenerate-
+    # skip stabilisations in eigh / Procrustes backward — the
+    # accumulated value can still hit 1e30+ in fp32 through deep
+    # transformer chains, and anomaly mode's check_nan does NOT
+    # catch Inf-from-overflow (only NaN). Clipping by norm bounds
+    # the per-step gradient magnitude, surfacing instabilities as
+    # "clipped" events in PL's logging rather than silently
+    # poisoning weights via Inf.
+    #
+    # Configurable via ``cfg.train.gradient_clip_val`` (default 1.0
+    # — a standard transformer-training value, safe to leave on
+    # for any run). Set to 0 to disable.
+    grad_clip = float(getattr(cfg.train, "gradient_clip_val", 1.0))
     return Trainer(
         devices=gpus,
         max_epochs=max_epochs,
@@ -186,5 +200,7 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
         strategy='ddp_find_unused_parameters_true',
         log_every_n_steps=50 if fast_dev_run else 1,
         enable_progress_bar=cfg.general.enable_progress_bar,
+        gradient_clip_val=grad_clip if grad_clip > 0 else None,
+        gradient_clip_algorithm="norm",
     )
 
