@@ -686,6 +686,72 @@ class FullDenoisingDiffusion(pl.LightningModule):
         loss = training_step_func(self, data, i)
         return loss
 
+    def on_after_backward(self) -> None:
+        """Detect NaN/Inf in any parameter's gradient and fail loud.
+
+        The principled stabilisations elsewhere (Tikhonov on eigh /
+        eigvalsh, degenerate-skip on Procrustes) eliminate the
+        known NaN-prone gradient sites. This hook is the
+        belt-and-suspenders: if a NEW NaN source ever appears (a new
+        loss component, a new model wrapper, a corner case the
+        stabilisations don't cover), training halts immediately
+        with a clear pointer at the loss value at that step —
+        rather than silently writing NaN into the weights and
+        producing nonsense for the rest of the run.
+
+        Replaces the implicit "NaN poison propagates through
+        autograd → next forward crashes 200 lines deep in a model
+        module" failure mode with an explicit, debuggable error.
+        Cost: one extra reduction across all parameters per step
+        (~milliseconds on H100). The detector is unconditional
+        because the cost is negligible and the safety guarantee is
+        worth it.
+        """
+        # Scan param.grad once. We don't dump every parameter — the
+        # error message just names the first offender so the user
+        # has somewhere to start. Skip parameters without a grad
+        # (e.g. frozen layers, parameters that didn't participate
+        # in the loss this step).
+        bad_param = None
+        for name, p in self.named_parameters():
+            if p.grad is None:
+                continue
+            if not torch.isfinite(p.grad).all():
+                bad_param = name
+                break
+        if bad_param is not None:
+            # Surface the most recent loss components so the user
+            # can correlate "which loss spiked" with "which gradient
+            # NaN'd". self.train_loss._last_per_component is set
+            # inside LossFunction.forward() (the stash that
+            # log_epoch_metrics reads).
+            recent = getattr(
+                getattr(self, "train_loss", None),
+                "_last_per_component", None,
+            )
+            recent_str = ", ".join(
+                f"{k}={v:.4g}" for k, v in (recent or {}).items()
+            ) if recent else "(no loss snapshot)"
+            raise RuntimeError(
+                f"NaN / Inf gradient detected on parameter "
+                f"{bad_param!r} after backward. Training halted to "
+                f"prevent silent weight corruption. Last-step loss "
+                f"components: {recent_str}. Likely culprits: a "
+                f"newly-enabled auxiliary loss with an unstable "
+                f"backward path (e.g. an op whose Jacobian diverges "
+                f"at degenerate spectra — eigh / eigvalsh / SVD); a "
+                f"learning rate too high for the active loss "
+                f"weights; or fp16 underflow in a kernel. To "
+                f"diagnose: (1) check which loss spiked just before "
+                f"this step; (2) reproduce with "
+                f"torch.autograd.set_detect_anomaly(True) to find "
+                f"the exact op; (3) if it's a known unstable op, "
+                f"add Tikhonov regularization at that site (see "
+                f"models/edm_head.py::_classical_mds_2d for the "
+                f"pattern). DO NOT add a torch.nan_to_num hook here "
+                f"— that would silently produce wrong gradients."
+            )
+
     def on_train_epoch_end(self) -> None:
         on_train_epoch_end_func(self)
 

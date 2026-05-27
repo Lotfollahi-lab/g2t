@@ -726,6 +726,121 @@ def test_knn_graph_spectral_layout_gradient_flag_true_restores() -> None:
     )
 
 
+def test_procrustes_skip_when_degenerate() -> None:
+    """When x_src is near-zero (training init), Procrustes' M is
+    degenerate and SVD backward would NaN. The skip-when-degenerate
+    path passes through x_src unchanged — math: when M=0, identity
+    is one valid rotation, so x_src @ I = x_src is well-defined."""
+    from metrics.loss_function import _procrustes_align_2d
+
+    # Near-zero src — degenerate case.
+    x_src = torch.zeros(20, 2, requires_grad=True)
+    x_ref = torch.randn(20, 2)
+    out = _procrustes_align_2d(x_src, x_ref)
+    assert torch.equal(out, x_src), (
+        "degenerate path should pass through x_src unchanged"
+    )
+    # Backward must NOT produce NaN even though SVD was skipped.
+    out.sum().backward()
+    assert x_src.grad is not None and torch.isfinite(x_src.grad).all(), (
+        f"NaN in grad through degenerate Procrustes path; got "
+        f"{x_src.grad}"
+    )
+
+
+def test_procrustes_normal_path_for_nondegenerate() -> None:
+    """When x_src is non-degenerate, the SVD path runs normally."""
+    from metrics.loss_function import _procrustes_align_2d
+
+    torch.manual_seed(0)
+    x_src = torch.randn(20, 2) * 0.5
+    x_src = x_src - x_src.mean(0)
+    # Rotate by 90° to make a non-trivial alignment target.
+    theta = torch.tensor([[0.0, -1.0], [1.0, 0.0]])
+    x_ref = x_src @ theta
+    x_src_grad = x_src.clone().detach().requires_grad_(True)
+    out = _procrustes_align_2d(x_src_grad, x_ref)
+    # Aligned output should be close to x_ref.
+    err = (out - x_ref).abs().max().item()
+    assert err < 1e-4, (
+        f"normal Procrustes path failed to align: max err {err:.3e}"
+    )
+    # Gradient must flow.
+    out.sum().backward()
+    assert x_src_grad.grad is not None, "no grad through normal path"
+
+
+def test_shape_matching_eigvalsh_no_nan_grad_at_init() -> None:
+    """At training init, pred positions are near-zero → cov_pred ≈ 0
+    → eigvalsh has degenerate eigenvalues → backward would NaN
+    without Tikhonov regularization. Verify finite gradient flows."""
+    from utils.data.dataholder import DataHolder
+    from metrics.loss_function import LossFunction
+
+    cfg = {
+        "model": {
+            "loss": {
+                "pairwise_distance_mse": {"enabled": False},
+                "shape_matching": {
+                    "enabled": True, "weight": 1.0, "variant": "eigvals",
+                },
+            },
+        },
+    }
+    lf = LossFunction(cfg)
+    # Construct a near-zero pred (init regime).
+    pred_pos = torch.zeros(1, 24, 2, requires_grad=True)
+    true_pos = torch.randn(1, 24, 2) * 0.5
+    mask = torch.ones(1, 24, dtype=torch.bool)
+    masked_pred = DataHolder(
+        node_features=torch.zeros(1, 24, 4),
+        positions=pred_pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, 24, 1, dtype=torch.long),
+        cell_ID=torch.arange(24).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1),
+        node_mask=mask,
+    )
+    masked_true = DataHolder(
+        node_features=torch.zeros(1, 24, 4),
+        positions=true_pos,
+        diffusion_time=torch.zeros(1, 1),
+        cell_class=torch.zeros(1, 24, 1, dtype=torch.long),
+        cell_ID=torch.arange(24).unsqueeze(0).unsqueeze(-1),
+        t_int=torch.zeros(1, 1, dtype=torch.long),
+        t=torch.zeros(1, 1),
+        node_mask=mask,
+    )
+    loss = lf._compute_shape_matching(masked_pred, masked_true)
+    loss.backward()
+    assert pred_pos.grad is not None, "no gradient through shape_matching"
+    assert torch.isfinite(pred_pos.grad).all(), (
+        f"shape_matching produced NaN/Inf gradient at init "
+        f"(pred ≈ 0): max abs grad "
+        f"{pred_pos.grad.abs().max().item():.3e}"
+    )
+
+
+def test_mds_eigh_no_nan_grad_with_tikhonov() -> None:
+    """Classical MDS's eigh backward at degenerate eigenvalues was
+    the NaN source for the EDM path under mds_align_gradient=True.
+    Tikhonov regularization breaks the degeneracy. Verify a finite
+    gradient flows on a near-zero D_sq (init regime)."""
+    from models.edm_head import _classical_mds_2d
+
+    # Near-zero D_sq — what the EDM head produces at init.
+    n = 8
+    D_sq = torch.zeros(n, n, requires_grad=True)
+    pos = _classical_mds_2d(D_sq)
+    pos.pow(2).sum().backward()
+    assert D_sq.grad is not None, "no grad through MDS"
+    assert torch.isfinite(D_sq.grad).all(), (
+        f"MDS produced NaN/Inf gradient on near-zero D_sq: max abs "
+        f"grad {D_sq.grad.abs().max().item():.3e}"
+    )
+
+
 def test_b3_14_gene_recon_ldm_mutex() -> None:
     """The LightningModule's __init__ must raise when gene_recon AND
     latent_diffusion are both enabled. Text-inspection because
@@ -786,6 +901,14 @@ def main() -> int:
          test_knn_graph_spectral_layout_gradient_flag_default),
         ("kNN-graph spectral_layout_gradient ON: projector grad flows",
          test_knn_graph_spectral_layout_gradient_flag_true_restores),
+        ("Procrustes skip-when-degenerate: no NaN grad on near-zero src",
+         test_procrustes_skip_when_degenerate),
+        ("Procrustes normal path still aligns + has gradient",
+         test_procrustes_normal_path_for_nondegenerate),
+        ("shape_matching: finite gradient at init (Tikhonov on cov)",
+         test_shape_matching_eigvalsh_no_nan_grad_at_init),
+        ("MDS eigh: finite gradient on near-zero D_sq (Tikhonov on B)",
+         test_mds_eigh_no_nan_grad_with_tikhonov),
         ("B3.14 — gene_recon × LDM mutex raises",
          test_b3_14_gene_recon_ldm_mutex),
     ]

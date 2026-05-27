@@ -76,6 +76,25 @@ def _classical_mds_2d(D_sq: torch.Tensor) -> torch.Tensor:
     # Symmetrise (numerical safety — D_sq may have minor asymmetry).
     B = 0.5 * (B + B.T)
 
+    # Tikhonov regularization to break eigenvalue degeneracy.
+    # ``torch.linalg.eigh``'s backward formula contains
+    # ``1/(λ_i − λ_j)`` terms that diverge at near-degenerate
+    # eigenvalues — at training init the predicted D_sq is near zero,
+    # so B is near zero and its top eigenvalues are too close.
+    # Without regularization the backward through this op poisons
+    # the entire backward graph with NaN whenever ``mds_align_gradient
+    # = True`` is enabled (the default-False path skips backward
+    # through eigh entirely so doesn't see this).
+    #
+    # We add a STRICTLY-INCREASING diagonal perturbation so each
+    # eigenvalue gets a distinct shift, breaking ties without
+    # changing eigenvectors more than O(eps_reg). Magnitude scales
+    # with B's diagonal so the regularization stays subdominant for
+    # any realistic D_sq.
+    eps_reg = 1e-6 * B.diag().abs().max().clamp_min(1.0)
+    reg = torch.arange(n, device=device, dtype=dtype) * eps_reg / float(n)
+    B = B + torch.diag(reg)
+
     # Eigendecomposition (ascending). Top 2 = last 2.
     evals, evecs = torch.linalg.eigh(B)
     e2 = evals[-2:].clamp(min=1e-12)              # (2,) nonneg
@@ -261,31 +280,25 @@ class EDMOutputWrapper(nn.Module):
                 # wandb look reasonable" and "the auxiliary loss
                 # actually drives the model toward what it measures".
                 #
-                # Why it was off by default: eigh's backward formula
-                # has ``1/(λ_i − λ_j)`` terms that diverge at near-
-                # degenerate eigenvalues. We install a NaN-guard hook
-                # on the MDS output below that replaces any NaN/Inf
-                # gradient component with zero — so a single
-                # degenerate slice at most loses its own auxiliary-
-                # loss gradient contribution rather than poisoning the
-                # whole backward graph. The common case (well-
-                # separated eigvals on real point clouds) flows
-                # through cleanly.
+                # The eigh inside ``_classical_mds_2d`` has a
+                # backward formula containing ``1/(λ_i − λ_j)`` terms
+                # that diverge at near-degenerate eigenvalues. We
+                # stabilise this AT THE SOURCE (Tikhonov-style
+                # strictly-increasing diagonal perturbation inside
+                # ``_classical_mds_2d``) — not via a backward hook
+                # that hides NaN gradients. Silent NaN-to-zero was
+                # tried in an earlier revision; it produced
+                # wrong-but-finite gradients with no user signal,
+                # exactly the silent-silencing pattern the codebase
+                # now explicitly rejects. If a NaN gradient still
+                # appears here (e.g., from a new auxiliary loss with
+                # an unstable backward), the
+                # LightningModule.on_after_backward detector raises
+                # a loud RuntimeError naming the offending parameter.
                 new_pos = self._mds_align_positions(
                     D_sq, pred.positions, data.node_mask,
                 )
                 new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
-                # Hook MUST be registered on a tensor that
-                # requires_grad. Skip in eval / under no_grad context
-                # (e.g. inference), where the tensor won't have grad.
-                if new_pos.requires_grad:
-                    def _nan_to_zero(grad):
-                        # Replace NaN / ±Inf with 0. nan_to_num is
-                        # out-of-place and autograd-compatible.
-                        return torch.nan_to_num(
-                            grad, nan=0.0, posinf=0.0, neginf=0.0,
-                        )
-                    new_pos.register_hook(_nan_to_zero)
             else:
                 # Legacy detached path. The MDS step uses
                 # ``torch.linalg.eigh``, whose backward formula has

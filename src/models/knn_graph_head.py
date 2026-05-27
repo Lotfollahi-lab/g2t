@@ -77,6 +77,16 @@ def _laplacian_eigenmaps_2d(A: torch.Tensor) -> torch.Tensor:
     L = torch.diag(deg) - A_sym
     # Symmetrise L (numerical safety).
     L = 0.5 * (L + L.T)
+    # Tikhonov regularization with a strictly-increasing diagonal
+    # to break eigenvalue degeneracy under
+    # ``spectral_layout_gradient=True``. eigh's backward formula
+    # contains ``1/(λ_i − λ_j)`` terms that blow up at degenerate
+    # eigenvalues, which occur when the predicted graph is near-
+    # uniform (typical at training init). See the matching block in
+    # ``edm_head._classical_mds_2d`` for the full rationale.
+    eps_reg = 1e-6 * L.diag().abs().max().clamp_min(1.0)
+    reg = torch.arange(n, device=device, dtype=dtype) * eps_reg / float(n)
+    L = L + torch.diag(reg)
     # Eigendecomposition. Smallest 3 eigenvalues: 0 (constant), then 2
     # informative ones. Take eigenvectors 1 and 2 (0-indexed) skipping
     # the constant.
@@ -215,29 +225,24 @@ class KNNGraphOutputWrapper(nn.Module):
 
         if self.spectral_layout:
             if self.spectral_layout_gradient:
-                # GRADIENT-CARRYING spectral-layout path. Same trade-off
-                # as edm_head.py::mds_align_gradient: the Laplacian
-                # eigenmaps eigh has 1/(λ_i − λ_j) backward terms
+                # GRADIENT-CARRYING spectral-layout path. Laplacian
+                # eigenmaps' eigh backward has 1/(λ_i − λ_j) terms
                 # that diverge at near-degenerate eigenvalues. We
-                # install a torch.nan_to_num backward hook on the
-                # spectral-layout output below, so a degenerate slice
-                # at most loses its own auxiliary-loss gradient
-                # contribution rather than poisoning the entire
-                # backward graph. The common case (well-separated
-                # eigvals) flows through cleanly. Enable this when
-                # combining knn_graph with shape_matching / sinkhorn
-                # / knn_rank / persistent_homology / pairwise_distance_mse;
-                # otherwise those losses contribute zero gradient.
+                # stabilise this AT THE SOURCE — a strictly-
+                # increasing diagonal Tikhonov perturbation inside
+                # ``_laplacian_eigenmaps_2d`` breaks the degeneracy
+                # without changing the eigenvectors more than
+                # O(eps_reg). Silent NaN-to-zero hooks were tried
+                # in an earlier revision and rejected: they
+                # produced wrong-but-finite gradients with no user
+                # signal. If a NaN still escapes (e.g., a new aux
+                # loss with an unstable backward), the
+                # LightningModule.on_after_backward detector raises
+                # a loud RuntimeError naming the offending parameter.
                 new_pos = self._spectral_layout(
                     logits, pred.positions, data.node_mask,
                 )
                 new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
-                if new_pos.requires_grad:
-                    def _nan_to_zero(grad):
-                        return torch.nan_to_num(
-                            grad, nan=0.0, posinf=0.0, neginf=0.0,
-                        )
-                    new_pos.register_hook(_nan_to_zero)
             else:
                 # Legacy detached path. The k-NN loss reads
                 # ``pred.knn_logits`` directly (not pred.positions),

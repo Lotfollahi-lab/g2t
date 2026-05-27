@@ -72,12 +72,23 @@ def _procrustes_align_2d(
     Closed form (Schönemann 1966): ``R = U @ V^T`` where
     ``U·diag(S)·V^T = SVD(x_src^T · x_ref)``.
 
-    Differentiability: torch.linalg.svd is differentiable; backward
-    pass is well-defined as long as the two singular values are
-    distinct (the gauge ambiguity at degenerate singular values is
-    rare for 2-D point clouds with N ≫ 2 — would require the cloud
-    to be near-perfectly isotropic with the same eigenvalues as the
-    reference, which doesn't happen in our setting).
+    Degenerate-M handling: at training init, x_src ≈ 0 (the position
+    head's output is small under default Kaiming init), so M ≈ 0
+    and SVD's singular values are both near zero. The SVD backward
+    formula has ``1/(σ_i − σ_j)`` and ``1/(σ_i + σ_j)`` terms that
+    blow up to NaN/Inf at degenerate singular values. The
+    gradient then NaN-poisons the position head's weights on the
+    optimizer step, and every subsequent forward produces NaN
+    positions.
+
+    Mathematically, the optimal R is UNDEFINED when M = 0 — every
+    orthogonal R minimises ``||0·R − x_ref||`` equally. We choose
+    R = I in that regime, giving ``x_src @ I = x_src``. This is NOT
+    silencing the loss: the downstream Sinkhorn still fires on
+    (x_src, x_ref), with full gradient through x_src. We just skip
+    a rotation step that has no well-defined target. Once x_src
+    grows above the threshold (a few training steps in), the SVD
+    path engages normally.
 
     Used by ``LossFunction._compute_sinkhorn`` to make the Sinkhorn
     divergence rotation+reflection-invariant. Same closed-form
@@ -87,6 +98,17 @@ def _procrustes_align_2d(
     module imports.
     """
     M = x_src.T @ x_ref                                       # (2, 2)
+    # Skip alignment when M is degenerate (near-zero or non-finite).
+    # The threshold is set well above floating-point noise but well
+    # below any realistic non-zero alignment matrix from a trained
+    # model. ``no_grad`` because this decision is a forward-only
+    # gate; we don't want grad flowing through .abs().max() (which
+    # would just be zero anyway).
+    with torch.no_grad():
+        M_max = M.abs().max()
+        degenerate = (not torch.isfinite(M_max).item()) or M_max.item() < 1e-6
+    if degenerate:
+        return x_src
     U, _S, Vh = torch.linalg.svd(M, full_matrices=False)
     R = U @ Vh                                                # (2, 2)
     return x_src @ R                                          # (N, 2)
@@ -1595,6 +1617,30 @@ class LossFunction(nn.Module):
             # Symmetrise (numerical noise) before eigvalsh.
             cov_true = 0.5 * (cov_true + cov_true.T)
             cov_pred = 0.5 * (cov_pred + cov_pred.T)
+            # Tikhonov regularization: add a small NON-uniform diagonal
+            # to break eigenvalue degeneracy. At training init,
+            # pred ≈ 0 → cov_pred ≈ 0 with λ_1 = λ_2 = 0, and
+            # eigvalsh's backward formula contains ``1/(λ_i − λ_j)``
+            # terms that go to ±Inf at degenerate eigenvalues. The
+            # resulting NaN gradient poisons the position-head's
+            # weights on the optimizer step, and the model produces
+            # NaN positions on the next forward.
+            #
+            # Adding a NON-UNIFORM diagonal perturbation breaks the
+            # degeneracy: λ_1 and λ_2 differ by at least eps_reg
+            # (when no other gap separates them), so the backward
+            # is well-defined. The perturbation also shifts the
+            # eigenvalues by O(eps_reg), but eps_reg=1e-6 is far
+            # below any realistic anisotropy signal — the loss
+            # value is essentially unchanged for non-degenerate
+            # inputs. Same trick applied to cov_true so its
+            # eigenvalues are also broken (their gradient is zero
+            # so this is purely defensive).
+            eps_reg = 1e-6
+            reg = torch.tensor([[0.0, 0.0], [0.0, eps_reg]],
+                               device=cov_pred.device, dtype=cov_pred.dtype)
+            cov_pred = cov_pred + reg
+            cov_true = cov_true + reg
             # Eigenvalues — ascending by default.
             evals_true = torch.linalg.eigvalsh(cov_true)
             evals_pred = torch.linalg.eigvalsh(cov_pred)
