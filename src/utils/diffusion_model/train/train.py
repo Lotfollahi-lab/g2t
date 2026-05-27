@@ -88,6 +88,108 @@ def _apply_o2_augmentation(
     ).mask()
 
 
+def _apply_gene_augmentation(
+    batched_data: DataHolder,
+    dropout_p: float,
+    noise_sigma: float,
+    mixup_alpha: float,
+) -> DataHolder:
+    """Train-time augmentation on gene-expression INPUT.
+
+    Three independent mechanisms (each off when its parameter is 0):
+
+      * ``dropout_p`` ∈ [0, 1] — per-(cell, gene-channel) Bernoulli
+        zero-out. Forces the model to be robust to "gene wasn't
+        detected this cell" noise. 0.1-0.2 is typical.
+      * ``noise_sigma`` ≥ 0 — additive Gaussian noise (multiplied by
+        the batch-wise stddev of non-padding gene values so the
+        regularizer is scale-invariant). Forces robustness to
+        measurement noise. 0.05-0.1 typical.
+      * ``mixup_alpha`` > 0 — cell-level mixup. For each cell sample a
+        partner cell from the same slice (uniform over real cells),
+        blend gene vectors with λ ~ Beta(α, α). λ=0.5 (α large)
+        gives strong mixup; λ near 0 or 1 (α small) gives mild.
+        Position TARGETS are NOT mixed — the model still learns to
+        predict the original cell's position from the mixed-gene
+        input, which is a "denoising / disentanglement" auxiliary
+        signal. 0.2-0.4 typical for α.
+
+    Padding cells (node_mask=False) are untouched. The augmentation
+    runs INSIDE training_step, so it's free at validation/test/
+    inference time — the model trained under augmented input
+    generalises better but pays nothing at eval.
+
+    The three mechanisms compose linearly when more than one is
+    active — dropout → noise → mixup, applied in that order. In
+    practice you typically pick one as the primary regularizer.
+    """
+    if dropout_p <= 0 and noise_sigma <= 0 and mixup_alpha <= 0:
+        return batched_data
+
+    nf = batched_data.node_features                   # (B, N, G)
+    node_mask = batched_data.node_mask                # (B, N)
+    mask_3d = node_mask.unsqueeze(-1)                 # (B, N, 1)
+
+    # --- (1) Bernoulli dropout on gene channels ---------------------
+    if dropout_p > 0:
+        # Per-(cell, channel) draw. Drops the gene value to 0; the
+        # downstream gene encoder sees this as "this gene wasn't
+        # measured for this cell."
+        drop = (torch.rand_like(nf) < dropout_p) & mask_3d
+        nf = nf.masked_fill(drop, 0.0)
+
+    # --- (2) Additive Gaussian noise scaled by batch stddev ---------
+    if noise_sigma > 0:
+        # Scale by stddev of real (non-padding) gene values so the
+        # absolute noise level is consistent across batches /
+        # datasets with different normalisation. Computed under
+        # no_grad — it's a scalar adjustment to the noise, not a
+        # learnable scale.
+        with torch.no_grad():
+            real = nf[mask_3d.expand_as(nf)]
+            scale = real.float().std().clamp_min(1e-6)
+        noise = torch.randn_like(nf) * (noise_sigma * scale)
+        noise = noise * mask_3d.to(noise.dtype)        # zero noise on padding
+        nf = nf + noise
+
+    # --- (3) Cell-level within-slice mixup --------------------------
+    if mixup_alpha > 0:
+        B, N, G = nf.shape
+        # Sample a per-(slice, cell) partner index uniformly. We use
+        # a within-slice permutation so partner cells live in the
+        # SAME spatial context as the source cell — different slices
+        # may have different cell-type distributions, and mixing
+        # across slices could pull the model toward an average frame
+        # that doesn't match any real slice.
+        partner_idx = torch.stack([
+            torch.randperm(N, device=nf.device) for _ in range(B)
+        ], dim=0)                                       # (B, N)
+        # Gather partner features.
+        partner_nf = nf.gather(
+            1, partner_idx.unsqueeze(-1).expand(-1, -1, G),
+        )                                               # (B, N, G)
+        # λ ~ Beta(α, α), one per cell.
+        beta_dist = torch.distributions.Beta(
+            torch.tensor(float(mixup_alpha)),
+            torch.tensor(float(mixup_alpha)),
+        )
+        lam = beta_dist.sample((B, N, 1)).to(nf.device).to(nf.dtype)
+        # Mix. Padding cells are zero on both sides → still zero.
+        nf = lam * nf + (1.0 - lam) * partner_nf
+        nf = nf * mask_3d.to(nf.dtype)
+
+    return DataHolder(
+        node_features=nf,
+        positions=batched_data.positions,
+        diffusion_time=getattr(batched_data, "diffusion_time", None),
+        cell_class=batched_data.cell_class,
+        cell_ID=getattr(batched_data, "cell_ID", None),
+        t_int=getattr(batched_data, "t_int", None),
+        t=getattr(batched_data, "t", None),
+        node_mask=batched_data.node_mask,
+    ).mask()
+
+
 def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     """
     Training step for a single batch.
@@ -123,6 +225,28 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
         aug_ref = bool(getattr(train_cfg, "augment_reflection", False))
         if aug_rot or aug_ref:
             batched_data = _apply_o2_augmentation(batched_data, aug_rot, aug_ref)
+
+        # Gene-expression augmentation (dropout / noise / mixup on
+        # node_features). Three independent knobs, each off when 0;
+        # see ``_apply_gene_augmentation`` docstring. Composes with
+        # O(2) augmentation above — positions are augmented by O(2),
+        # genes by this block. Free at inference (train-only).
+        gene_dropout = float(
+            getattr(train_cfg, "gene_augment_dropout_p", 0.0)
+        )
+        gene_noise = float(
+            getattr(train_cfg, "gene_augment_noise_sigma", 0.0)
+        )
+        gene_mixup = float(
+            getattr(train_cfg, "gene_augment_mixup_alpha", 0.0)
+        )
+        if gene_dropout > 0 or gene_noise > 0 or gene_mixup > 0:
+            batched_data = _apply_gene_augmentation(
+                batched_data,
+                dropout_p=gene_dropout,
+                noise_sigma=gene_noise,
+                mixup_alpha=gene_mixup,
+            )
 
     # Auxiliary gene reconstruction: with probability 1 (every step
     # when enabled), mask out a fraction of each cell's gene values

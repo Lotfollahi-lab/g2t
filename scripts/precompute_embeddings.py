@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -218,9 +219,139 @@ _PER_SLICE_ENCODERS = {
 # embeddings for every cell jointly. Each entry in this set has a
 # matching ``_run_<name>_global`` function below; the main loop
 # dispatches accordingly.
-_GLOBAL_ENCODERS = {"scvi"}
+_GLOBAL_ENCODERS = {"scvi", "nicheformer"}
 
 _ALL_ENCODERS = sorted(set(_PER_SLICE_ENCODERS.keys()) | _GLOBAL_ENCODERS)
+
+
+# ---------------------------------------------------------------------------
+# Nicheformer helper import
+# ---------------------------------------------------------------------------
+
+
+def _import_nicheformer_helper(helper_dir: Optional[Path]):
+    """Import ``compute_nicheformer_embedding`` (+ companion helpers)
+    from the squint-reproducibility tree, which already vendors a
+    fully-functional wrapper around the official tokenization
+    notebook. We don't duplicate the logic here — the helper is
+    several hundred lines of mouse→human ortholog mapping, technology-
+    specific token vocab, and tokenization with the model's
+    ``technology_mean`` baseline.
+
+    helper_dir search order:
+      1. Explicit ``--nicheformer-helper-dir`` arg, if given.
+      2. Sibling-project default:
+         ``../../squint_claude_project/squint-reproducibility/
+            analysis/benchmarking/cell_type_identification/``
+         relative to this scripts/ directory.
+      3. Env var ``SQUINT_NICHEFORMER_HELPER_DIR``.
+
+    Raises SystemExit with a clear pointer if not found.
+    """
+    candidates: List[Path] = []
+    if helper_dir is not None:
+        candidates.append(Path(helper_dir))
+    # Heuristic relative to this script's location.
+    this = Path(__file__).resolve()
+    # scgg/scripts/ -> ../../.. -> workspace, then into squint tree.
+    candidates.append(
+        this.parent.parent.parent
+        / "squint_claude_project"
+        / "squint-reproducibility"
+        / "analysis" / "benchmarking" / "cell_type_identification"
+    )
+    env_dir = os.environ.get("SQUINT_NICHEFORMER_HELPER_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+
+    for c in candidates:
+        if (c / "_nicheformer_embedding.py").is_file():
+            if str(c) not in sys.path:
+                sys.path.insert(0, str(c))
+            from _nicheformer_embedding import (              # noqa: E402
+                NICHEFORMER_CONTEXT_LENGTH,
+                add_human_ortholog_ensembl_ids,
+                compute_nicheformer_embedding,
+            )
+            logger.info(
+                f"Nicheformer helper imported from {c}"
+            )
+            return (
+                compute_nicheformer_embedding,
+                add_human_ortholog_ensembl_ids,
+                NICHEFORMER_CONTEXT_LENGTH,
+            )
+    searched = "\n  ".join(str(c) for c in candidates)
+    raise SystemExit(
+        "Could not locate `_nicheformer_embedding.py` (squint helper).\n"
+        f"Searched:\n  {searched}\n"
+        "Pass --nicheformer_helper_dir=<path> or set the env var "
+        "SQUINT_NICHEFORMER_HELPER_DIR."
+    )
+
+
+def _resolve_nicheformer_artefacts(
+    model_dir: Path,
+    technology: str,
+    pretrained_path: Optional[Path],
+    h5ad_path: Optional[Path],
+    tech_mean_path: Optional[Path],
+) -> tuple:
+    """Resolve (ckpt, gene-ref h5ad, technology-mean .npy) by the
+    same conventional layout as the squint run_nicheformer.py script.
+
+    See that script's ``_resolve_nicheformer_paths`` for the full
+    candidate list; duplicated here so this module stays
+    self-contained (no import of the squint runner script, only of
+    its embedding helper).
+    """
+    def _first_existing(explicit: Optional[Path],
+                        candidates: List[Path],
+                        label: str,
+                        override_flag: str) -> Path:
+        if explicit is not None:
+            if not Path(explicit).is_file():
+                raise SystemExit(
+                    f"{override_flag}={explicit!r} does not exist."
+                )
+            return Path(explicit)
+        for c in candidates:
+            if c.is_file():
+                return c
+        searched = "\n  ".join(str(c) for c in candidates)
+        raise SystemExit(
+            f"Could not find {label} under --nicheformer_model_dir={model_dir}.\n"
+            f"Searched:\n  {searched}\n"
+            f"Pass {override_flag}=<path> to override."
+        )
+
+    ckpt = _first_existing(
+        pretrained_path,
+        [model_dir / "nicheformer.ckpt",
+         model_dir / "data" / "nicheformer.ckpt"],
+        "pretrained .ckpt",
+        "--nicheformer_pretrained_path",
+    )
+    h5ad = _first_existing(
+        h5ad_path,
+        [model_dir / "model.h5ad",
+         model_dir / "model_means" / "model.h5ad",
+         model_dir / "data" / "model_means" / "model.h5ad"],
+        "gene-reference model.h5ad",
+        "--nicheformer_model_h5ad_path",
+    )
+    mean = _first_existing(
+        tech_mean_path,
+        [model_dir / f"{technology}_mean.npy",
+         model_dir / "means" / f"{technology}_mean.npy",
+         model_dir / "model_means" / f"{technology}_mean.npy",
+         model_dir / "model_means" / f"{technology}_mean_script.npy",
+         model_dir / "data" / "model_means" / f"{technology}_mean.npy",
+         model_dir / "data" / "model_means" / f"{technology}_mean_script.npy"],
+        f"technology-mean .npy for technology={technology!r}",
+        "--nicheformer_technology_mean_path",
+    )
+    return ckpt, h5ad, mean
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +464,178 @@ def _run_scvi_global(
 
     # Split per slice. The concat order is files[0], files[1], ...
     # so cumulative-sum slicing recovers each h5ad's cells.
+    cumulative = 0
+    for path, n_i in zip(files, n_per_file):
+        ad_i = ad.read_h5ad(path)
+        if field in ad_i.obsm and not overwrite_field:
+            logger.info(f"  {path.name}: obsm[{field!r}] exists, skipping write")
+            cumulative += n_i
+            continue
+        ad_i.obsm[field] = latent[cumulative:cumulative + n_i].astype(np.float32)
+        cumulative += n_i
+        out_path = (out_dir / path.name) if out_dir is not None else path
+        ad_i.write_h5ad(out_path)
+        logger.info(
+            f"  → wrote {out_path} (obsm[{field!r}] shape="
+            f"{ad_i.obsm[field].shape})"
+        )
+
+
+def _run_nicheformer_global(
+    files: List[Path],
+    field: str,
+    embedding_dim: Optional[int],
+    out_dir: Optional[Path],
+    overwrite_field: bool,
+    helper_dir: Optional[Path],
+    model_dir: Path,
+    pretrained_path: Optional[Path],
+    h5ad_path: Optional[Path],
+    tech_mean_path: Optional[Path],
+    technology: str,
+    species: str,
+    modality: str,
+    gene_col: Optional[str],
+    gene_mapper_path: Optional[Path],
+    auto_map_symbols: bool,
+    batch_size: int,
+    max_seq_len: Optional[int],
+    device: Optional[str],
+) -> None:
+    """Run Nicheformer zero-shot embedding GLOBALLY across all slices.
+
+    Why global
+    ----------
+    Nicheformer's pretrained model is a single network — embeddings are
+    deterministic per-cell, independent of slice membership. We embed
+    in one pass across the concatenated AnnData for efficiency (one
+    model load + one tokenization sweep) and to keep the obsm slot
+    consistent across slices (no per-slice tokenization quirks).
+
+    Forward-only / zero-shot
+    ------------------------
+    Same mode as the squint Nicheformer baseline: no fine-tuning, just
+    ``model.get_embeddings(batch, layer=-1)`` per batch. The 512-dim
+    raw embedding is optionally PCA-projected down to
+    ``embedding_dim``; pass ``embedding_dim=None`` (or 0 / 512) to
+    keep all 512 dims.
+
+    Mouse → human Ensembl mapping
+    -----------------------------
+    Nicheformer's vocab is human Ensembl IDs. For mouse datasets, the
+    user must either:
+      * pass ``--nicheformer_auto_map_symbols`` — runtime mapping via
+        the squint helper's 4-step pipeline (mygene + Ensembl REST +
+        HomoloGene). Slow first call, ~90% coverage on a 500-gene
+        panel.
+      * pass ``--nicheformer_gene_mapper_path <mart_export.csv>`` — a
+        static Biomart export with ``Gene stable ID`` and
+        ``Human gene stable ID`` columns. Deterministic and
+        reproducible.
+      * pre-populate an ``adata.var`` column with human Ensembl IDs
+        upstream and pass ``--nicheformer_gene_col <colname>``.
+
+    The pretrained model + per-technology means must be available on
+    disk (see ``--nicheformer_model_dir`` and the resolution comment
+    in ``_resolve_nicheformer_artefacts``).
+    """
+    import anndata as ad
+    (compute_nicheformer_embedding,
+     add_human_ortholog_ensembl_ids,
+     NICHEFORMER_CONTEXT_LENGTH) = _import_nicheformer_helper(helper_dir)
+
+    # Resolve the three Nicheformer artefacts up front so we fail
+    # fast on a missing file rather than after the concat+map.
+    ckpt, ref_h5ad, tech_mean = _resolve_nicheformer_artefacts(
+        model_dir=model_dir,
+        technology=technology,
+        pretrained_path=pretrained_path,
+        h5ad_path=h5ad_path,
+        tech_mean_path=tech_mean_path,
+    )
+    logger.info(
+        f"Nicheformer artefacts:\n"
+        f"  ckpt:        {ckpt}\n"
+        f"  model.h5ad:  {ref_h5ad}\n"
+        f"  tech mean:   {tech_mean}"
+    )
+
+    if max_seq_len is None or max_seq_len <= 0:
+        max_seq_len = NICHEFORMER_CONTEXT_LENGTH
+    if max_seq_len > NICHEFORMER_CONTEXT_LENGTH:
+        raise SystemExit(
+            f"--nicheformer_max_seq_len={max_seq_len} exceeds "
+            f"Nicheformer's context length {NICHEFORMER_CONTEXT_LENGTH}."
+        )
+
+    # 1. Load + concat. We track per-file cell counts so we can split
+    #    the resulting embedding back per slice at the end.
+    logger.info(f"Nicheformer: loading {len(files)} slices...")
+    adatas: List = []
+    n_per_file: List[int] = []
+    for path in files:
+        ad_i = ad.read_h5ad(path)
+        ad_i.obs["_scgg_origin"] = path.stem
+        adatas.append(ad_i)
+        n_per_file.append(ad_i.n_obs)
+    big = ad.concat(
+        adatas, axis=0, join="inner", merge="unique",
+        label="_scgg_concat_label",
+    )
+    logger.info(
+        f"Nicheformer: concatenated {big.n_obs:,} cells × "
+        f"{big.n_vars} genes across {len(files)} slices."
+    )
+
+    # 2. (Optional) auto-map mouse symbols → human Ensembl. Same code
+    #    path the squint runner uses; updates a new ``var`` column.
+    resolved_gene_col = gene_col
+    if auto_map_symbols and resolved_gene_col is None and gene_mapper_path is None:
+        logger.info("Nicheformer: auto-mapping mouse symbols → human Ensembl...")
+        big = add_human_ortholog_ensembl_ids(
+            big, species=species, verbose=True, inplace=True,
+        )
+        resolved_gene_col = "human_ensembl_id"
+
+    # 3. Sanity: at least one of the three id-routing modes must be set.
+    if resolved_gene_col is None and gene_mapper_path is None:
+        raise SystemExit(
+            "Nicheformer needs human-Ensembl IDs. Pass exactly ONE of:\n"
+            "  --nicheformer_auto_map_symbols\n"
+            "  --nicheformer_gene_mapper_path <mart_export.csv>\n"
+            "  --nicheformer_gene_col <var-column with human Ensembl>"
+        )
+
+    # 4. Embed. ``n_latent`` controls the optional PCA projection
+    #    (None / 512 = keep all 512 raw dims).
+    n_latent = None if (embedding_dim is None or embedding_dim <= 0
+                        or embedding_dim >= 512) else int(embedding_dim)
+    logger.info(
+        f"Nicheformer: running zero-shot inference "
+        f"(batch_size={batch_size}, max_seq_len={max_seq_len}, "
+        f"n_latent={n_latent or 512})..."
+    )
+    big = compute_nicheformer_embedding(
+        adata=big,
+        pretrained_model_path=str(ckpt),
+        model_h5ad_path=str(ref_h5ad),
+        technology_mean_path=str(tech_mean),
+        technology=technology,
+        species=species,
+        modality=modality,
+        gene_col=resolved_gene_col,
+        gene_mapper_path=(str(gene_mapper_path) if gene_mapper_path else None),
+        obsm_key=field,
+        batch_size=int(batch_size),
+        device=device,
+        max_seq_len=int(max_seq_len),
+        n_latent=n_latent,
+    )
+    latent = big.obsm[field]
+    logger.info(f"Nicheformer: latent shape = {latent.shape}")
+
+    # 5. Split back per slice. Concat preserves file order; cumulative
+    #    counts recover each h5ad's rows.
     cumulative = 0
     for path, n_i in zip(files, n_per_file):
         ad_i = ad.read_h5ad(path)
@@ -521,6 +824,73 @@ def main() -> int:
              "counts. Default: round (LUNA's MMC values are non-integer "
              "normalised counts, scVI's ZINB likelihood needs ints).",
     )
+    # ---- Nicheformer flags ------------------------------------------------
+    p.add_argument(
+        "--nicheformer_helper_dir", type=Path, default=None,
+        help="Directory containing _nicheformer_embedding.py from "
+             "squint-reproducibility. Defaults to the sibling-project "
+             "path; can also be set via env var SQUINT_NICHEFORMER_HELPER_DIR.",
+    )
+    p.add_argument(
+        "--nicheformer_model_dir", type=Path, default=Path(
+            "/nfs/team361/sb75/squint-reproducibility/analysis/"
+            "benchmarking/nicheformer"
+        ),
+        help="Directory holding the pretrained Nicheformer .ckpt, "
+             "model.h5ad gene reference, and <tech>_mean.npy. Default "
+             "matches the squint cluster path.",
+    )
+    p.add_argument(
+        "--nicheformer_pretrained_path", type=Path, default=None,
+        help="Override: explicit .ckpt path.",
+    )
+    p.add_argument(
+        "--nicheformer_model_h5ad_path", type=Path, default=None,
+        help="Override: explicit gene-reference .h5ad path.",
+    )
+    p.add_argument(
+        "--nicheformer_technology_mean_path", type=Path, default=None,
+        help="Override: explicit technology-mean .npy.",
+    )
+    p.add_argument(
+        "--nicheformer_technology", type=str, default="merfish",
+        help="One of merfish/cosmx/visium/10x_*; controls the technology "
+             "token and which <tech>_mean.npy is loaded.",
+    )
+    p.add_argument(
+        "--nicheformer_species", type=str, default="mouse",
+        help="mouse | human. Controls the species token.",
+    )
+    p.add_argument(
+        "--nicheformer_modality", type=str, default="spatial",
+        help="spatial | dissociated. Controls the modality token.",
+    )
+    p.add_argument(
+        "--nicheformer_gene_col", type=str, default=None,
+        help="adata.var column already holding human Ensembl IDs.",
+    )
+    p.add_argument(
+        "--nicheformer_gene_mapper_path", type=Path, default=None,
+        help="Biomart export CSV with mouse→human ortholog Ensembl IDs.",
+    )
+    p.add_argument(
+        "--nicheformer_auto_map_symbols", action="store_true",
+        help="Derive human Ensembl IDs at runtime via the squint helper's "
+             "4-step mapping. Slow first call; needs internet.",
+    )
+    p.add_argument(
+        "--nicheformer_batch_size", type=int, default=32,
+        help="Nicheformer inference batch size. 32 is the squint default.",
+    )
+    p.add_argument(
+        "--nicheformer_max_seq_len", type=int, default=None,
+        help="Token sequence length per cell. Defaults to the model's "
+             "context length (1500). Smaller is faster.",
+    )
+    p.add_argument(
+        "--nicheformer_device", type=str, default=None,
+        help="Device string for torch (default: cuda if available).",
+    )
     p.add_argument(
         "--out_dir", default=None,
         help="Optional: write modified h5ads to this directory instead "
@@ -582,6 +952,28 @@ def main() -> int:
                 round_to_int=not args.scvi_no_round,
                 max_epochs=args.scvi_max_epochs,
                 n_layers=args.scvi_n_layers,
+            )
+        elif args.encoder == "nicheformer":
+            _run_nicheformer_global(
+                files=files,
+                field=field,
+                embedding_dim=args.embedding_dim,
+                out_dir=out_dir,
+                overwrite_field=args.overwrite_field,
+                helper_dir=args.nicheformer_helper_dir,
+                model_dir=args.nicheformer_model_dir,
+                pretrained_path=args.nicheformer_pretrained_path,
+                h5ad_path=args.nicheformer_model_h5ad_path,
+                tech_mean_path=args.nicheformer_technology_mean_path,
+                technology=args.nicheformer_technology,
+                species=args.nicheformer_species,
+                modality=args.nicheformer_modality,
+                gene_col=args.nicheformer_gene_col,
+                gene_mapper_path=args.nicheformer_gene_mapper_path,
+                auto_map_symbols=args.nicheformer_auto_map_symbols,
+                batch_size=args.nicheformer_batch_size,
+                max_seq_len=args.nicheformer_max_seq_len,
+                device=args.nicheformer_device,
             )
         else:
             raise ValueError(

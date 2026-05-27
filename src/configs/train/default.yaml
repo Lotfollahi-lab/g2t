@@ -76,6 +76,44 @@ augment_reflection: false # if true, also flip x-axis with p=0.5 (full O(2)
                           # the dataset has a real chirality signal.
 
 # ---------------------------------------------------------------------------
+# Train-time gene-expression augmentation.
+# ---------------------------------------------------------------------------
+# Three independent regularisers on the gene-expression INPUT (NOT
+# the positional target). Each is OFF by default; set the non-zero
+# parameter to enable. They compose: dropout → noise → mixup.
+#
+# Free at inference — the augmentation runs INSIDE training_step
+# and inference uses the un-augmented gene vectors directly. So
+# enabling any of these costs only train-time compute (tiny —
+# pointwise ops on the gene tensor) but applies forever after via
+# the trained weights.
+#
+# When to use which
+# -----------------
+# * gene_augment_dropout_p: gene-level "this gene wasn't measured"
+#   noise. Best when the dataset has known under-detection (low-
+#   expression genes get false zeros). Typical 0.1-0.2. Strongest
+#   regulariser of the three.
+#
+# * gene_augment_noise_sigma: additive Gaussian on gene values,
+#   scaled by the batch-stddev of real gene values so the absolute
+#   noise level is normalisation-agnostic. Targets measurement
+#   noise. Typical 0.05-0.1.
+#
+# * gene_augment_mixup_alpha: cell-level mixup. Each cell's gene
+#   vector is blended with a randomly-chosen within-slice partner
+#   with λ ~ Beta(α, α). Position TARGETS are NOT mixed — only the
+#   gene input. Forces the model to use spatial context (other cells'
+#   genes via attention) rather than relying purely on the focal
+#   cell's gene vector. Typical α = 0.2-0.4.
+#
+# Recommended starting ablation: pick ONE at a time. Stacking can
+# interact non-trivially and obscure which signal helped.
+gene_augment_dropout_p: 0.0
+gene_augment_noise_sigma: 0.0
+gene_augment_mixup_alpha: 0.0
+
+# ---------------------------------------------------------------------------
 # Exponential moving average of model weights.
 #
 # Each train step (after the optimizer update), maintain a shadow

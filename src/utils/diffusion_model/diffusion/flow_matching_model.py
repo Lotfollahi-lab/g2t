@@ -68,13 +68,144 @@ keeps the rest of the pipeline 100% framework-agnostic.
 
 from __future__ import annotations
 
-from typing import Optional
+import pickle
+from pathlib import Path
+from typing import Dict, Optional
 
 import torch
 import wandb
 
 from utils.data.dataholder import DataHolder
 from utils.data.load import remove_mean_with_mask
+
+
+# ---------------------------------------------------------------------------
+# Empirical-GMM prior helpers (rotation-averaged, per-cell-type)
+# ---------------------------------------------------------------------------
+
+
+def _load_prior_pool(path: str) -> dict:
+    """Load the prior pool pickle produced by
+    ``scripts/precompute_prior_pool.py``. Pre-computes per-class
+    Cholesky factors of the covariance matrices so sampling is just
+    a matmul + standard-normal draw.
+
+    Returns a dict with three keys:
+      * ``gmms``: ``{cell_class_int → {means_t, chols_t, weights_t, K}}``
+        with `means_t`, `chols_t`, `weights_t` as CPU torch tensors
+        (moved to device on first sample call).
+      * ``default_scale`` (float): the median per-slice bbox-diag
+        scale from the training set. Used at inference when we don't
+        have x_0 to compute a slice-specific scale.
+      * ``meta`` (dict): provenance for debugging.
+    """
+    with open(path, "rb") as f:
+        raw = pickle.load(f)
+    out_gmms: Dict[int, dict] = {}
+    for cls_int, gmm in raw["gmms"].items():
+        means = torch.from_numpy(gmm["means"]).float()              # (K, 2)
+        covs  = torch.from_numpy(gmm["covariances"]).float()        # (K, 2, 2)
+        weights = torch.from_numpy(gmm["weights"]).float()          # (K,)
+        # Precompute Cholesky once. Add a tiny diagonal jitter so the
+        # cholesky never fails on a numerically-singular covariance.
+        eye = torch.eye(2).unsqueeze(0).expand_as(covs)
+        chols = torch.linalg.cholesky(covs + 1.0e-6 * eye)          # (K, 2, 2)
+        out_gmms[int(cls_int)] = dict(
+            means_t=means, chols_t=chols, weights_t=weights, K=gmm["K"],
+        )
+    return dict(
+        gmms=out_gmms,
+        default_scale=float(raw["default_scale"]),
+        meta=raw.get("meta", {}),
+    )
+
+
+def _sample_x1_from_gmm_pool(
+    cell_class: torch.Tensor,
+    node_mask: torch.Tensor,
+    pool: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Sample one position per cell from the per-cell-type GMM pool.
+
+    Args:
+        cell_class: ``(B, N)`` or ``(B, N, 1)`` int tensor of cell-class
+            indices. Values matching keys in ``pool['gmms']`` get sampled
+            from their per-type GMM; unmatched values fall back to
+            ``N(0, I)``.
+        node_mask: ``(B, N)`` bool, True for real cells. Padding cells
+            get exactly ``(0, 0)`` (matches the existing ``noise * mask``
+            convention).
+        pool: as returned by ``_load_prior_pool``.
+        device, dtype: target tensor properties.
+
+    Returns:
+        ``(B, N, 2)`` float tensor of sampled positions in NORMALIZED
+        scale (so each component sits in roughly ``[-1, 1]²``). The
+        caller is responsible for rescaling to slice-specific or
+        default scale.
+    """
+    if cell_class.dim() == 3:
+        cell_class = cell_class.squeeze(-1)
+    B, N = cell_class.shape
+    out = torch.zeros(B, N, 2, device=device, dtype=dtype)
+
+    # Iterate unique classes in this batch — at most a few per batch,
+    # so the loop is cheap. Each iteration vectorizes over all cells of
+    # that class.
+    unique_cls = cell_class.unique().tolist()
+    for cls_int in unique_cls:
+        mask = (cell_class == cls_int) & node_mask                   # (B, N)
+        n_cells = int(mask.sum().item())
+        if n_cells == 0:
+            continue
+        gmm = pool["gmms"].get(int(cls_int))
+        if gmm is None:
+            # Cell class not in the pool (rare — e.g., a class present
+            # in test but not train). Fall back to N(0, I) for these
+            # cells. Logged once-per-call would be noisy; instead we
+            # rely on the precompute script's verbosity to surface
+            # missing classes.
+            samples = torch.randn(n_cells, 2, device=device, dtype=dtype)
+        else:
+            means = gmm["means_t"].to(device=device, dtype=dtype)    # (K, 2)
+            chols = gmm["chols_t"].to(device=device, dtype=dtype)    # (K, 2, 2)
+            weights = gmm["weights_t"].to(device=device, dtype=dtype)  # (K,)
+            # Sample mixture-component indices.
+            comp_idx = torch.multinomial(
+                weights, n_cells, replacement=True,
+            )                                                         # (n_cells,)
+            mean_per_cell = means.index_select(0, comp_idx)          # (n_cells, 2)
+            chol_per_cell = chols.index_select(0, comp_idx)          # (n_cells, 2, 2)
+            z = torch.randn(n_cells, 2, device=device, dtype=dtype)
+            # mean + chol @ z, batched.
+            samples = mean_per_cell + torch.einsum(
+                "ncd,nd->nc", chol_per_cell, z,
+            )
+        out[mask] = samples
+    return out
+
+
+def _per_slice_scale_from_x0(
+    positions: torch.Tensor, node_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute half-bbox-diagonal per slice from x_0 (training-time).
+
+    Returns ``(B, 1, 1)`` so it broadcasts against ``(B, N, 2)`` x_1.
+    Padding cells (mask=False) are excluded from the bbox calculation.
+    Slices with <2 valid cells fall back to scale = 1.0.
+    """
+    B = positions.shape[0]
+    scales = positions.new_ones((B, 1, 1))
+    for b in range(B):
+        m = node_mask[b]
+        pos = positions[b][m]
+        if pos.shape[0] < 2:
+            continue
+        bbox = pos.max(dim=0).values - pos.min(dim=0).values
+        scales[b, 0, 0] = 0.5 * bbox.norm().clamp_min(1.0e-8)
+    return scales
 
 
 class FlowMatchingModel:
@@ -107,6 +238,48 @@ class FlowMatchingModel:
                 f"Unknown model.flow_matching.prediction={self.prediction!r}. "
                 f"Expected 'x0' or 'v'."
             )
+
+        # ---- Optional empirical-GMM prior ----------------------------
+        # When ``prior_mode == "empirical_gmm"``, ``x_1`` (the FM noise
+        # endpoint) is sampled from a per-cell-type Gaussian Mixture
+        # fit OFFLINE on the training set by
+        # ``scripts/precompute_prior_pool.py``. The GMM is fit on
+        # per-slice-normalized but NOT rotated positions, so the
+        # prior is rotation-invariant in distribution.
+        #
+        # Default ``"gaussian"`` keeps the byte-identical legacy
+        # behavior (``x_1 ~ N(0, I)``).
+        self.prior_mode = "gaussian"
+        self.prior_pool: Optional[dict] = None
+        if fm_cfg is not None:
+            mode = str(getattr(fm_cfg, "prior_mode", "gaussian")).lower()
+            if mode not in ("gaussian", "empirical_gmm"):
+                raise ValueError(
+                    f"Unknown model.flow_matching.prior_mode={mode!r}. "
+                    f"Expected 'gaussian' or 'empirical_gmm'."
+                )
+            self.prior_mode = mode
+            if mode == "empirical_gmm":
+                pool_path = getattr(fm_cfg, "prior_pool_path", None)
+                if not pool_path:
+                    raise ValueError(
+                        "model.flow_matching.prior_mode='empirical_gmm' "
+                        "requires model.flow_matching.prior_pool_path to "
+                        "point at the .pkl produced by "
+                        "scripts/precompute_prior_pool.py."
+                    )
+                if not Path(pool_path).is_file():
+                    raise FileNotFoundError(
+                        f"prior_pool_path={pool_path!r} does not exist. "
+                        f"Run scripts/precompute_prior_pool.py to "
+                        f"generate it."
+                    )
+                self.prior_pool = _load_prior_pool(pool_path)
+                print(
+                    f"[FlowMatchingModel] empirical_gmm prior loaded: "
+                    f"{len(self.prior_pool['gmms'])} cell-class GMMs, "
+                    f"default_scale={self.prior_pool['default_scale']:.3g}"
+                )
 
         # ``max_diffusion_steps`` is the attribute the sample loop in
         # utils/diffusion_model/sample/sample.py uses to size the
@@ -150,12 +323,39 @@ class FlowMatchingModel:
         if wandb.run is not None and train_flag:
             wandb.log({"fm_t/histogram": wandb.Histogram(t_float[0].cpu().numpy())})
 
-        # x_1 ∼ 𝒩(0, I), masked and mean-subtracted per slice (same
-        # convention LUNA's NoiseModel uses for its diffusion noise —
-        # keeps the centroid at the origin, consistent with the
-        # backbone's translation-invariance assumption).
-        noise_pos = torch.randn(data.positions.shape, device=device)
-        noise_positions_masked = noise_pos * data.node_mask.unsqueeze(-1)
+        # Sample x_1 from the configured prior. Default "gaussian" is
+        # byte-identical to the legacy behavior (N(0, I), masked,
+        # mean-subtracted per slice — same as LUNA's NoiseModel).
+        # "empirical_gmm" samples from the per-cell-type GMM pool
+        # produced by precompute_prior_pool.py, then rescales to each
+        # slice's bounding-box scale (computed from x_0 at training).
+        if self.prior_mode == "empirical_gmm" and self.prior_pool is not None:
+            # Sample in normalized scale (roughly [-1, 1]² per cell).
+            x_1_norm = _sample_x1_from_gmm_pool(
+                cell_class=data.cell_class,
+                node_mask=data.node_mask,
+                pool=self.prior_pool,
+                device=device,
+                dtype=data.positions.dtype,
+            )
+            # Scale per slice using x_0's bounding-box diagonal — at
+            # training we know the slice's natural scale from x_0.
+            slice_scale = _per_slice_scale_from_x0(
+                positions=data.positions, node_mask=data.node_mask,
+            )                                                       # (B, 1, 1)
+            noise_positions_masked = (
+                x_1_norm * slice_scale
+            ) * data.node_mask.unsqueeze(-1)
+        else:
+            # Legacy Gaussian prior.
+            noise_pos = torch.randn(data.positions.shape, device=device)
+            noise_positions_masked = noise_pos * data.node_mask.unsqueeze(-1)
+
+        # Mean-subtract per slice — required regardless of prior so that
+        # the FM endpoint's centroid sits at the origin (matches x_0,
+        # which is also mean-centered by the data pipeline). With the
+        # empirical-GMM prior this also normalises away any global mean
+        # the GMM happens to put on a cell-type-uneven sample.
         x_1 = remove_mean_with_mask(
             x=noise_positions_masked, node_mask=data.node_mask
         )
@@ -194,7 +394,20 @@ class FlowMatchingModel:
         B, N = node_mask.shape
         device = node_mask.device
 
-        positions = torch.randn(B, N, 2, device=device)
+        # Same branching as apply_noise. At inference we don't have x_0
+        # so we use the train-median bbox-diag scale (``default_scale``)
+        # from the prior pool — a single global rescaling factor.
+        if self.prior_mode == "empirical_gmm" and self.prior_pool is not None:
+            positions = _sample_x1_from_gmm_pool(
+                cell_class=cell_class,
+                node_mask=node_mask,
+                pool=self.prior_pool,
+                device=device,
+                dtype=torch.float32,
+            )
+            positions = positions * float(self.prior_pool["default_scale"])
+        else:
+            positions = torch.randn(B, N, 2, device=device)
         positions = positions * node_mask.unsqueeze(-1)
         positions = remove_mean_with_mask(positions, node_mask)
 
