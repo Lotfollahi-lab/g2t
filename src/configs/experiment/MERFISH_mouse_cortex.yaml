@@ -11,12 +11,22 @@ dataset:
     gene_columns_start: 0
     gene_columns_end: 254
     train_data_path: /data/merfish_mouse_cortex_train.csv # path to the training dataset
-    test_data_path: /data/merfish_mouse_cortex_test.csv # path to the test dataset 
+    test_data_path: /data/merfish_mouse_cortex_test.csv # path to the test dataset
     validation_data_path: null # path to the validation dataset
     maximum_graph_size: # Configuration for maximum graph sizes during different stages (optional)
         train: null   # No downsampling; Set maximum size of the graph sampled during training to accommodate GPU memory constraints.
         test: null   # No downsampling; recommended to test on the full graph. Set to 'null' to use the full graph.
         validation: null # No downsampling; use the full graph if a validation dataset is available. Set to 'null' to use the full graph.
+    # PyTorch DataLoader worker count. Historically hardcoded to 32 in
+    # AbstractDataModule; surfaced here so it can be overridden per
+    # run/dataset. Default 32 reproduces the historic behaviour on
+    # small datasets (e.g. MMC cortex, ~6 slices, ~6k cells/slice —
+    # each forked worker's copy-on-write touch of the dataset is
+    # cheap). For large datasets (CNS scRNA, ABCA Animal-1, ~hundreds
+    # of slices or >100k cells/slice) the per-worker memory adds up
+    # to hundreds of GB and trips LSF cgroup limits → SIGKILL. Drop
+    # to 2-4 for those.
+    num_workers: 32
 
     
 
