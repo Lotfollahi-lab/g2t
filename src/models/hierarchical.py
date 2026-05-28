@@ -295,6 +295,11 @@ class HierarchicalModelWrapper(nn.Module):
         hidden_dims: Dict[str, int],
         output_dims: Dict[str, int],
         hierarchical_cfg,
+        # Optional input-projection knobs (forwarded transparently to
+        # the inner Model). Defaults preserve byte-identical behaviour.
+        input_activation: str = "relu",
+        input_layernorm: bool = False,
+        input_dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -341,6 +346,9 @@ class HierarchicalModelWrapper(nn.Module):
             hidden_mlp_dims=hidden_mlp_dims,
             hidden_dims=hidden_dims,
             output_dims=output_dims,
+            input_activation=input_activation,
+            input_layernorm=input_layernorm,
+            input_dropout=input_dropout,
         )
 
     def forward(self, data: DataHolder) -> DataHolder:

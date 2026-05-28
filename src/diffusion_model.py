@@ -362,6 +362,24 @@ class FullDenoisingDiffusion(pl.LightningModule):
             )
         elif backbone == "luna_transformer":
             if combined_enabled:
+                # Resolve the optional input-projection knobs ONCE so
+                # the wrappers (hier / c2f / hier+c2f) and the direct
+                # Model construction all see the same values. When
+                # ``cfg.model.input_projection`` is unset (the default),
+                # we produce relu / no-LN / no-dropout — byte-identical
+                # to the historic behaviour.
+                _ip_cfg = getattr(cfg.model, "input_projection", None)
+                _ip_kwargs = dict(
+                    input_activation=str(
+                        getattr(_ip_cfg, "activation", "relu")
+                    ) if _ip_cfg is not None else "relu",
+                    input_layernorm=bool(
+                        getattr(_ip_cfg, "layernorm", False)
+                    ) if _ip_cfg is not None else False,
+                    input_dropout=float(
+                        getattr(_ip_cfg, "dropout", 0.0)
+                    ) if _ip_cfg is not None else 0.0,
+                )
                 # Composed multi-scale: spatial-hierarchical patches +
                 # gene-coarse-to-fine clusters, both feeding ONE inner
                 # Model. See HierarchicalCoarseToFineWrapper.
@@ -374,8 +392,21 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     output_dims=self.output_dims,
                     hier_cfg=hier_cfg,
                     c2f_cfg=c2f_cfg,
+                    **_ip_kwargs,
                 )
             elif hier_enabled:
+                _ip_cfg = getattr(cfg.model, "input_projection", None)
+                _ip_kwargs = dict(
+                    input_activation=str(
+                        getattr(_ip_cfg, "activation", "relu")
+                    ) if _ip_cfg is not None else "relu",
+                    input_layernorm=bool(
+                        getattr(_ip_cfg, "layernorm", False)
+                    ) if _ip_cfg is not None else False,
+                    input_dropout=float(
+                        getattr(_ip_cfg, "dropout", 0.0)
+                    ) if _ip_cfg is not None else 0.0,
+                )
                 from models.hierarchical import HierarchicalModelWrapper
                 self.model = HierarchicalModelWrapper(
                     input_dims=self.input_dims,
@@ -384,8 +415,21 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     hidden_dims=cfg.model.hidden_dims,
                     output_dims=self.output_dims,
                     hierarchical_cfg=hier_cfg,
+                    **_ip_kwargs,
                 )
             elif c2f_enabled:
+                _ip_cfg = getattr(cfg.model, "input_projection", None)
+                _ip_kwargs = dict(
+                    input_activation=str(
+                        getattr(_ip_cfg, "activation", "relu")
+                    ) if _ip_cfg is not None else "relu",
+                    input_layernorm=bool(
+                        getattr(_ip_cfg, "layernorm", False)
+                    ) if _ip_cfg is not None else False,
+                    input_dropout=float(
+                        getattr(_ip_cfg, "dropout", 0.0)
+                    ) if _ip_cfg is not None else 0.0,
+                )
                 from models.coarse_to_fine import CoarseToFineWrapper
                 self.model = CoarseToFineWrapper(
                     input_dims=self.input_dims,
@@ -394,14 +438,28 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     hidden_dims=cfg.model.hidden_dims,
                     output_dims=self.output_dims,
                     c2f_cfg=c2f_cfg,
+                    **_ip_kwargs,
                 )
             else:
+                # Direct Model construction (no wrapper). Same kwargs
+                # resolution as the wrapper branches above — kept
+                # inline so each branch is self-contained for review.
+                _ip_cfg = getattr(cfg.model, "input_projection", None)
                 self.model = Model(
                     input_dims=self.input_dims,
                     n_layers=cfg.model.n_layers,
                     hidden_mlp_dims=cfg.model.hidden_mlp_dims,
                     hidden_dims=cfg.model.hidden_dims,
                     output_dims=self.output_dims,
+                    input_activation=str(
+                        getattr(_ip_cfg, "activation", "relu")
+                    ) if _ip_cfg is not None else "relu",
+                    input_layernorm=bool(
+                        getattr(_ip_cfg, "layernorm", False)
+                    ) if _ip_cfg is not None else False,
+                    input_dropout=float(
+                        getattr(_ip_cfg, "dropout", 0.0)
+                    ) if _ip_cfg is not None else 0.0,
                 )
         elif backbone == "vn_transformer":
             # scGG fundamental method #3: SE(2)-equivariant vector-

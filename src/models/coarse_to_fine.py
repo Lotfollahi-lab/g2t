@@ -689,8 +689,16 @@ class CoarseToFineWrapper(nn.Module):
         hidden_dims: Dict[str, int],
         output_dims: Dict[str, int],
         c2f_cfg,
+        # Optional input-projection knobs forwarded to inner Model.
+        input_activation: str = "relu",
+        input_layernorm: bool = False,
+        input_dropout: float = 0.0,
     ):
         super().__init__()
+        # Stash for the inner-Model construction below.
+        self._inner_input_activation = input_activation
+        self._inner_input_layernorm = input_layernorm
+        self._inner_input_dropout = input_dropout
 
         def _g(k, default):
             return (
@@ -840,6 +848,9 @@ class CoarseToFineWrapper(nn.Module):
             hidden_mlp_dims=hidden_mlp_dims,
             hidden_dims=hidden_dims,
             output_dims=output_dims,
+            input_activation=self._inner_input_activation,
+            input_layernorm=self._inner_input_layernorm,
+            input_dropout=self._inner_input_dropout,
         )
 
     # ------------------------------------------------------------------
@@ -1139,8 +1150,16 @@ class HierarchicalCoarseToFineWrapper(nn.Module):
         output_dims: Dict[str, int],
         hier_cfg,
         c2f_cfg,
+        # Optional input-projection knobs (forwarded to inner Model).
+        input_activation: str = "relu",
+        input_layernorm: bool = False,
+        input_dropout: float = 0.0,
     ):
         super().__init__()
+        # Stash for the inner-Model construction far below.
+        self._inner_input_activation = input_activation
+        self._inner_input_layernorm = input_layernorm
+        self._inner_input_dropout = input_dropout
 
         # Local import to avoid circular import at module load time
         # (hierarchical.py is in the same package).
@@ -1240,6 +1259,9 @@ class HierarchicalCoarseToFineWrapper(nn.Module):
             hidden_mlp_dims=hidden_mlp_dims,
             hidden_dims=hidden_dims,
             output_dims=output_dims,
+            input_activation=self._inner_input_activation,
+            input_layernorm=self._inner_input_layernorm,
+            input_dropout=self._inner_input_dropout,
         )
 
     def forward(

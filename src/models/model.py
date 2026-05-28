@@ -36,6 +36,9 @@ class Model(nn.Module):
         hidden_dims: dict,
         output_dims,
         positionMLP_eps: float = 1e-9,
+        input_activation: str = "relu",
+        input_layernorm: bool = False,
+        input_dropout: float = 0.0,
     ) -> None:
         """
         Constructor to initialize the Model instance.
@@ -46,6 +49,26 @@ class Model(nn.Module):
             hidden_mlp_dims (dict): Dimensions for hidden MLP layers.
             hidden_dims (dict): Dimensions for hidden layers.
             output_dims: Output dimensions.
+            input_activation: Activation function used inside the
+                node-features input MLP. ``"relu"`` (default) preserves
+                the historic behaviour. ``"gelu"`` / ``"silu"`` pass
+                real-valued (both-sign) signals through without zeroing
+                the negative half — important when the node features
+                are dense pretrained embeddings (e.g. Nicheformer,
+                scGPT) rather than non-negative gene values.
+            input_layernorm: If True, prepend a LayerNorm before the
+                node-features input MLP. Useful for pretrained
+                embeddings whose per-cell scale isn't controlled by
+                the data loader (calibrates the input statistics so
+                the first Linear sees a well-conditioned distribution).
+                Default False (preserves historic behaviour for
+                raw-gene inputs, which the dataloader already scales).
+            input_dropout: If > 0, insert a Dropout(p=input_dropout)
+                right after the optional LayerNorm and before the
+                first Linear. Acts as input-level regularisation —
+                especially helpful for deterministic pretrained
+                embeddings where the model can otherwise memorise
+                per-cell embedding patterns. Default 0.0 (off).
 
         Returns:
             None
@@ -57,17 +80,42 @@ class Model(nn.Module):
         self.output_dimensions_node_features = output_dims["node_features_dimensions"]
         self.output_dimensions_diffusion_time = output_dims["diffusion_time_dimensions"]
         self.positionMLP_eps = positionMLP_eps
+        self.input_activation_name = str(input_activation).lower()
+        self.input_layernorm = bool(input_layernorm)
+        self.input_dropout = float(input_dropout)
 
         act_fn_in = nn.ReLU()
         act_fn_out = nn.ReLU()
 
-        # MLP for processing input node features
-        self.mlp_in_node_features = nn.Sequential(
-            nn.Linear(self.input_dimensions_node_features, hidden_mlp_dims["X"]),
-            act_fn_in,
-            nn.Linear(hidden_mlp_dims["X"], hidden_dims["dx"]),
-            act_fn_in,
+        # Node-features input MLP. The historic 2-layer Linear→ReLU
+        # design is preserved when all knobs are at their defaults
+        # (activation=relu, layernorm=False, dropout=0.0) — same param
+        # count, same arithmetic, byte-identical to before.
+        #
+        # When ``input_activation`` is gelu/silu, the two ReLU steps
+        # are replaced with the chosen activation. This matters for
+        # dense, real-valued node features (pretrained embeddings):
+        # ReLU zeros out negative entries; GELU/SiLU pass them
+        # through with smooth saturation. For non-negative inputs
+        # (raw gene values), ReLU vs GELU is near-identity so the
+        # baseline-on-gene-expression behaviour barely shifts.
+        #
+        # LayerNorm and Dropout, when on, are inserted BEFORE the
+        # first Linear — they pre-condition the input rather than
+        # acting on the hidden representation. This is the standard
+        # DiT/Llama-style "norm at the boundary" pattern.
+        layers: list = []
+        if self.input_layernorm:
+            layers.append(nn.LayerNorm(self.input_dimensions_node_features))
+        if self.input_dropout > 0.0:
+            layers.append(nn.Dropout(self.input_dropout))
+        layers.append(
+            nn.Linear(self.input_dimensions_node_features, hidden_mlp_dims["X"])
         )
+        layers.append(self._make_activation())
+        layers.append(nn.Linear(hidden_mlp_dims["X"], hidden_dims["dx"]))
+        layers.append(self._make_activation())
+        self.mlp_in_node_features = nn.Sequential(*layers)
 
         # MLP for processing input diffusion time
         self.mlp_in_diffusion_time = nn.Sequential(
@@ -113,6 +161,27 @@ class Model(nn.Module):
 
         # MLP for processing output positions
         self.mlp_out_pos = PositionsMLP(hidden_mlp_dims["pos"])
+
+    def _make_activation(self) -> nn.Module:
+        """Return a fresh instance of the configured input activation.
+
+        Resolution: ``self.input_activation_name`` set from the
+        ``input_activation`` constructor kwarg. Allowed values:
+        ``"relu"`` (historic default), ``"gelu"``, ``"silu"``.
+        Raises ValueError on unknown name — fail-loud rather than
+        silently falling back to ReLU.
+        """
+        name = self.input_activation_name
+        if name == "relu":
+            return nn.ReLU()
+        if name == "gelu":
+            return nn.GELU()
+        if name == "silu":
+            return nn.SiLU()
+        raise ValueError(
+            f"Unknown input_activation={name!r}. Expected one of "
+            f"'relu', 'gelu', 'silu'."
+        )
 
     def forward(self, data: DataHolder) -> DataHolder:
         """

@@ -174,6 +174,44 @@ flow_matching:
     prior_pool_path: null
 nu:
     p: 2
+
+# ---------------------------------------------------------------------------
+# Input projection for the node-features MLP.
+# ---------------------------------------------------------------------------
+# These knobs only affect ``Model.mlp_in_node_features`` (the gene /
+# embedding → hidden projection at the very front of the network).
+# Defaults reproduce the historic behaviour byte-identically — leave
+# alone for byte-equivalence with prior runs.
+#
+# When the model input is RAW gene expression (the default — non-
+# negative, sparse, with magnitudes the dataloader has already
+# normalized), ReLU + no-LayerNorm + no-dropout is fine. ReLU acts
+# near-identity on the positive half of the gene distribution.
+#
+# When the model input is a PRETRAINED EMBEDDING (Nicheformer,
+# scGPT, scVI's latent — dense, real-valued, BOTH-SIGN), ReLU zeros
+# out the negative half of every dimension at the first hidden
+# layer — losing ~50% of the embedding's information that no later
+# layer can recover. For these inputs:
+#   * ``activation: "gelu"`` (or "silu") — passes the negative half
+#     through with smooth saturation. Mathematically a near-superset
+#     of ReLU on positives, so it doesn't degrade raw-gene runs.
+#   * ``layernorm: true`` — calibrates per-cell embedding scale,
+#     which the dataloader doesn't control for obsm-sourced inputs.
+#   * ``dropout: 0.0`` — pretrained embeddings are deterministic per
+#     cell, so the model can memorise patterns. A 0.1-0.2 dropout
+#     here acts as input-level regularisation. Off by default
+#     because raw-gene inputs already have measurement noise.
+#
+# Recommended starting overrides for a Nicheformer / pretrained run:
+#   model.input_projection.activation=gelu
+#   model.input_projection.layernorm=true
+#   model.input_projection.dropout=0.1
+input_projection:
+    activation: "relu"   # one of: relu | gelu | silu
+    layernorm: false
+    dropout: 0.0
+
 hidden_mlp_dims:
     X: 256 # hidden dimension of the MLP for cellular features
     y: 256 # hidden dimension of the MLP for diffusion time
