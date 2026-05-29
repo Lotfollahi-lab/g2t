@@ -517,10 +517,33 @@ def main() -> int:
     # is the wrong tree. initialize_config_dir takes an absolute path,
     # so it works whether luna_repo is the external LUNA checkout or
     # the vendored scgg/src/ copy.
+    # Diagnostic: what overrides did argparse actually receive?
+    # If this list doesn't contain the override the user passed, the
+    # upstream chain (submit_pipeline.sh → _run_pipeline.sh →
+    # run_luna_pipeline.py → run_luna_inference.py → run_luna_train.
+    # _invoke_luna → _luna_runner.py) dropped it.
+    print(
+        f"[luna_runner] args.override (n={len(args.override)}): "
+        f"{list(args.override)!r}",
+        flush=True,
+    )
+
     with initialize_config_dir(
         version_base="1.3", config_dir=str(config_dir), job_name="luna_runner",
     ):
         cfg = compose(config_name="config", overrides=list(args.override))
+
+    # Diagnostic: what did hydra resolve? Inspect the values the user
+    # likely overrode, so we know if compose accepted the override or
+    # silently dropped it (struct mode + missing schema entry).
+    print(
+        f"[luna_runner] post-compose cfg.dataset.num_workers="
+        f"{getattr(cfg.dataset, 'num_workers', '<MISSING>')}, "
+        f"cfg.train.batch_size={cfg.train.batch_size}, "
+        f"cfg.train.n_epochs={cfg.train.n_epochs}, "
+        f"cfg.general.mode={cfg.general.mode}",
+        flush=True,
+    )
 
     # Force the mode override regardless of what Hydra resolved (the
     # user may have left it on the experiment default).
