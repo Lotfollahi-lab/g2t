@@ -321,15 +321,36 @@ class EDMOutputWrapper(nn.Module):
         # where M = Wᵀ W is the learned Mahalanobis kernel. Init W = I
         # makes the anisotropic case start byte-identical to the
         # isotropic one; the optimizer is free to deviate.
-        diff = h.unsqueeze(2) - h.unsqueeze(1)     # (B, N, N, k)
+        # Memory-efficient pairwise squared distances.
+        #
+        # Naive formulation ``diff = h.u(2) - h.u(1); (diff*diff).sum(-1)``
+        # materialises a (B, N, N, k) tensor of size 4·B·N²·k bytes.
+        # At CNS scale (N ≈ 46k, k = 8) that's 68 GB FOR THE FORWARD
+        # ALONE, plus an equal-size activation stash for backward —
+        # OOMs even an H200 (139 GB) at batch_size=1.
+        #
+        # Algebraic identity: ||a − b||² = ||a||² + ||b||² − 2·a·b.
+        # The (B, N, k)·(B, k, N) → (B, N, N) matmul is computed
+        # without any intermediate tensor larger than the final
+        # output (8.5 GB at N=46k vs 68 GB). 8× peak-memory reduction;
+        # same forward value, same gradient direction. The matmul's
+        # backward only stashes the inputs (B, N, k) which is small.
+        #
+        # Anisotropic case: apply W to h first, then use the same
+        # identity on hW. Mathematically equivalent to the
+        # (h_i − h_j)ᵀ Wᵀ W (h_i − h_j) formulation.
         if self.gating_W is not None:
-            # Apply W to each diff vector: scaled[..., j] = sum_l W[j, l] diff[..., l]
-            # einsum is the cleanest way to express this batch-of-3D-arrays
-            # × (k, k) matrix contraction.
-            scaled = torch.einsum("bnmk,jk->bnmj", diff, self.gating_W)
-            D_sq = (scaled * scaled).sum(dim=-1)   # (B, N, N)
+            # h @ W^T per cell: (B, N, k) @ (k, k) → (B, N, k_out)
+            hW = torch.einsum("bnk,jk->bnj", h, self.gating_W)   # (B, N, k)
         else:
-            D_sq = (diff * diff).sum(dim=-1)       # (B, N, N)
+            hW = h
+        norms = (hW * hW).sum(dim=-1)                            # (B, N)
+        # outer sum + −2·dot. clamp_min(0) guards against fp32
+        # round-off producing tiny negatives when h_i ≈ h_j.
+        D_sq = (
+            norms.unsqueeze(2) + norms.unsqueeze(1)
+            - 2.0 * torch.bmm(hW, hW.transpose(1, 2))
+        ).clamp_min(0.0)                                          # (B, N, N)
 
         # Mask padding rows/cols to zero (so they don't enter the loss).
         m1 = data.node_mask                        # (B, N)
