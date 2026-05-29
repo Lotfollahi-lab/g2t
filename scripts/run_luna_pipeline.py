@@ -324,8 +324,23 @@ def _build_inference_cmd(
         cmd += ["--luna_repo", args.luna_repo]
     if args.no_inference_plots:
         cmd += ["--no_plots"]
-    if args.inference_override:
-        cmd += ["--override", *args.inference_override]
+    # IMPORTANT: forward BOTH ``--override`` AND ``--inference_override``
+    # to inference. Previously this only forwarded ``inference_override``,
+    # which silently dropped any general overrides the user passed via
+    # ``--override`` (e.g. ``dataset.num_workers=0``,
+    # ``dataset.gene_columns_end=600``). That bit hard when the user ran
+    # in ``--skip_training`` mode because the override was never
+    # consumed by a training cmd either — it simply vanished.
+    #
+    # Merging is the right semantics for hydra: inference uses the same
+    # LUNA ``main.py`` + same config tree as training, so an override
+    # the user wants applied "always" naturally applies to both phases.
+    # ``--inference_override`` retains its purpose (inference-ONLY
+    # overrides that should NOT be applied at training time, e.g.
+    # ``test.checkpoint_name=epoch=500.ckpt``); those stack on top.
+    merged_overrides = list(args.override or []) + list(args.inference_override or [])
+    if merged_overrides:
+        cmd += ["--override", *merged_overrides]
     return cmd
 
 
