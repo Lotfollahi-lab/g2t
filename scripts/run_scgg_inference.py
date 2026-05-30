@@ -75,6 +75,16 @@ def main():
                    choices=("disabled", "online", "offline", "dryrun"),
                    help="LUNA general.wandb (default 'disabled').")
     p.add_argument(
+        "--wandb_project", default=None,
+        help="Override the wandb project this inference run logs to. "
+             "Default: the 'scgg' project baked into run_scgg_train. "
+             "Required because run_scgg_pipeline.py forwards "
+             "--wandb_project here so train + inference share the same "
+             "wandb project — without this arg the pipeline crashed at "
+             "the inference subprocess with argparse 'unrecognized "
+             "arguments: --wandb_project'.",
+    )
+    p.add_argument(
         "--luna_repo", default=str(run_scgg_train._ENGINE_REPO_DEFAULT),
         help=f"Path to the external LUNA repo. Default: "
              f"{run_scgg_train._ENGINE_REPO_DEFAULT}",
@@ -136,6 +146,10 @@ def main():
             luna_repo=args.luna_repo,
             run_name=args.wandb_run_name,
             wandb_mode=args.wandb_mode,
+            # Default to 'scgg' for inference-from-pipeline runs so the
+            # inference wandb entry lands in the same project as training.
+            # Explicit --wandb_project overrides ad-hoc.
+            wandb_project=args.wandb_project or "scgg",
             extra_overrides=args.override,
             skip_training=True,
             load_checkpoint=args.checkpoint,
