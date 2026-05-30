@@ -1158,6 +1158,7 @@ def run_benchmark(
     make_plots: bool = False,
     output_subdir: Optional[str] = None,
     run_timestamp: Optional[str] = None,
+    exclude_test_files: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     """Train LUNA on Mouse 1, evaluate on Mouse 2.
 
@@ -1355,6 +1356,31 @@ def run_benchmark(
         data_path = Path(data_dir)
         train_files = _discover_split_files(data_path, "train")
         test_files = _discover_split_files(data_path, "test")
+        # Optional per-name exclusion (typical case: drop a few
+        # too-large CNS slices that GPU-OOM during inference). Match
+        # by basename — user passes e.g.
+        # ``exclude_test_files=["sagittal1_test.h5ad", "spinalcord_test.h5ad"]``.
+        # Train files are NEVER filtered by this flag (excluding from
+        # training would change what the checkpoint learned).
+        if exclude_test_files:
+            excluded_set = set(exclude_test_files)
+            kept = [p for p in test_files if p.name not in excluded_set]
+            dropped = [p.name for p in test_files if p.name in excluded_set]
+            if dropped:
+                logger.info(
+                    f"--exclude_test_files dropped {len(dropped)} file(s) "
+                    f"from the test set: {sorted(dropped)}"
+                )
+                # Warn if any requested exclusion didn't match — typo
+                # protection rather than silent no-op.
+                unmatched = excluded_set - set(dropped)
+                if unmatched:
+                    logger.warning(
+                        f"--exclude_test_files entries did NOT match any "
+                        f"*_test.h5ad in {data_path}: {sorted(unmatched)}. "
+                        f"Check the filenames you passed."
+                    )
+            test_files = kept
         logger.info(
             f"Silver dir: {data_path} "
             f"({len(train_files)} *_train.h5ad, {len(test_files)} *_test.h5ad)"
@@ -1369,7 +1395,15 @@ def run_benchmark(
 
         train_csv_path = work / "train.csv"
         test_csv_path = work / "test.csv"
-        if train_csv_path.exists() and test_csv_path.exists():
+        # Cache hit only when NO exclusions are requested — otherwise
+        # a stale test.csv from a prior un-excluded run would silently
+        # contain the excluded slices. Force rebuild when filtering.
+        cache_valid = (
+            train_csv_path.exists()
+            and test_csv_path.exists()
+            and not exclude_test_files
+        )
+        if cache_valid:
             logger.info("LUNA CSVs already exist under work/; reusing")
             head = pd.read_csv(train_csv_path, nrows=1, index_col=0)
             n_genes = len(head.columns) - 4
@@ -1776,6 +1810,16 @@ def main() -> int:
              "one timestamp across LSF logs + training dir + inference "
              "dir + wandb run.",
     )
+    p.add_argument(
+        "--exclude_test_files", default=None,
+        help="Comma-separated list of *_test.h5ad basenames to drop "
+             "from the assembled test set. Useful for skipping a few "
+             "too-large slices that GPU-OOM during inference. Example: "
+             "``--exclude_test_files sagittal1_test.h5ad,spinalcord_test.h5ad``. "
+             "Train files are NEVER filtered by this flag. Bypasses "
+             "the test.csv cache so the resulting CSV exactly reflects "
+             "the requested exclusion.",
+    )
     args = p.parse_args()
 
     try:
@@ -1800,6 +1844,10 @@ def main() -> int:
             load_checkpoint=args.load_checkpoint,
             make_plots=args.plots,
             run_timestamp=args.run_timestamp,
+            exclude_test_files=(
+                [s.strip() for s in args.exclude_test_files.split(",") if s.strip()]
+                if args.exclude_test_files else None
+            ),
         )
     except Exception:
         logger.exception("LUNA training failed")

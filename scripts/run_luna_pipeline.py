@@ -208,6 +208,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "flow).",
     )
     p.add_argument(
+        "--exclude_test_files", default=None,
+        help="Comma-separated *_test.h5ad basenames to drop from the "
+             "test set at inference time. Useful when one or two slices "
+             "GPU-OOM during inference (e.g. CNS sagittal1/2/3 + "
+             "spinalcord). Forwarded directly to run_luna_inference.py "
+             "→ run_luna_train.run_benchmark. Train files are never "
+             "filtered by this flag.",
+    )
+    p.add_argument(
         "--run_timestamp", default=None,
         help="Optional ``YYYYMMDD_HHMMSS`` timestamp to use as the run "
              "label. When set, the pipeline does NOT generate a fresh "
@@ -324,6 +333,8 @@ def _build_inference_cmd(
         cmd += ["--luna_repo", args.luna_repo]
     if args.no_inference_plots:
         cmd += ["--no_plots"]
+    if args.exclude_test_files:
+        cmd += ["--exclude_test_files", args.exclude_test_files]
     # IMPORTANT: forward BOTH ``--override`` AND ``--inference_override``
     # to inference. Previously this only forwarded ``inference_override``,
     # which silently dropped any general overrides the user passed via

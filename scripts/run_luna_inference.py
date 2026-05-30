@@ -92,6 +92,14 @@ def main():
         help="Skip per-section ground-truth-vs-prediction plots. Plots "
              "ON by default in inference mode (in <out_dir>/plots/).",
     )
+    p.add_argument(
+        "--exclude_test_files", default=None,
+        help="Comma-separated *_test.h5ad basenames to drop from the "
+             "test set. Useful for skipping too-large slices that "
+             "GPU-OOM during inference (e.g. CNS sagittal1/2/3 + "
+             "spinalcord). Forwarded to run_luna_train.run_benchmark "
+             "which performs the filtering before assembling test.csv.",
+    )
     args = p.parse_args()
 
     # Inference uses run_benchmark in skip-training mode. epochs/batch_size
@@ -115,6 +123,10 @@ def main():
             load_checkpoint=args.checkpoint,
             make_plots=not args.no_plots,
             output_subdir="luna_inference",
+            exclude_test_files=(
+                [s.strip() for s in args.exclude_test_files.split(",") if s.strip()]
+                if args.exclude_test_files else None
+            ),
         )
     except Exception:
         run_luna_train.logger.exception("LUNA inference failed")
