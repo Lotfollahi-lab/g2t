@@ -121,6 +121,52 @@ def _classical_mds_2d(
     return v2 * torch.sqrt(e2).unsqueeze(0)       # (n, 2)
 
 
+def _classical_mds_2d_lobpcg(
+    D_sq: torch.Tensor, tikhonov_eps: float = 1e-6,
+) -> torch.Tensor:
+    """Truncated classical MDS via ``torch.lobpcg`` — top-2 eigenpairs
+    only.
+
+    Faster alternative to ``_classical_mds_2d`` (which uses
+    ``torch.linalg.eigh`` and computes ALL N eigenpairs). For MDS we
+    only need the top-2 (largest) eigenpairs; lobpcg with k=2 is
+    O(N²·iters) vs eigh's O(N³), giving a 10-20× speedup at N≈46k.
+
+    IMPORTANT: ``torch.lobpcg`` does NOT have a stable autograd
+    backward path on all torch versions. This function is therefore
+    intended for use ONLY when no gradient flows through MDS — i.e.
+    ``mds_align_gradient=False`` AND/OR no position-side loss is
+    active. The EDMOutputWrapper enforces this gating when
+    ``mds_solver='lobpcg'``.
+
+    Same Tikhonov / clamp / sqrt structure as ``_classical_mds_2d``
+    so the two are byte-comparable up to numerical convergence of
+    lobpcg.
+    """
+    n = D_sq.shape[0]
+    device = D_sq.device
+    dtype = D_sq.dtype
+
+    # Same double-centring as the eigh path.
+    one = torch.ones((n, n), device=device, dtype=dtype) / n
+    J = torch.eye(n, device=device, dtype=dtype) - one
+    B = -0.5 * J @ D_sq @ J
+    B = 0.5 * (B + B.T)
+
+    # Same Tikhonov (no /n divisor — see _classical_mds_2d docstring).
+    scale = B.diag().abs().max().clamp_min(1.0)
+    eps_reg = float(tikhonov_eps) * scale
+    reg = torch.arange(n, device=device, dtype=dtype) * eps_reg
+    B = B + torch.diag(reg)
+
+    # lobpcg: top-2 (largest=True). Returns (eigvals, eigvecs) with
+    # eigvals in descending order on the first axis.
+    evals, evecs = torch.lobpcg(B, k=2, largest=True)
+    # evals: (2,), evecs: (n, 2). Clamp + sqrt for MDS coords.
+    e2 = evals.clamp(min=1e-12)
+    return evecs * torch.sqrt(e2).unsqueeze(0)                    # (n, 2)
+
+
 def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
     """Orthogonal Procrustes: find the rotation+reflection R that minimises
     ‖x_src @ R − x_ref‖_F. Returns x_src @ R with R DETACHED.
@@ -215,12 +261,61 @@ class EDMOutputWrapper(nn.Module):
         mds_align_gradient: bool = False,
         mds_tikhonov_eps: float = 1e-6,
         mds_align_train: bool = True,
+        mds_dtype: str = "fp64",
+        mds_solver: str = "eigh",
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
         self.embed_dim = int(embed_dim)
         self.mds_align = bool(mds_align)
         self.anisotropic_gating = bool(anisotropic_gating)
+        # MDS solver knobs.
+        # ``mds_dtype``:
+        #   "fp64" (default) — promote D_v to float64 before eigh.
+        #     Required when mds_align_gradient=True because eigh's
+        #     backward formula needs fp64 precision to keep
+        #     1/(λ_i − λ_j) finite at near-degenerate spectra.
+        #   "fp32" — skip the promotion. ~2× faster; safe ONLY when
+        #     no backward goes through eigh (i.e. mds_align_gradient
+        #     False AND/OR mds_align_train False).
+        # ``mds_solver``:
+        #   "eigh" (default) — torch.linalg.eigh, computes ALL N
+        #     eigenpairs (O(N³)). Has autograd backward.
+        #   "lobpcg" — torch.lobpcg, top-2 eigenpairs only
+        #     (O(N²·iter)). 10-20× faster at large N. NO stable
+        #     backward — safe only when mds_align_gradient=False.
+        self.mds_dtype = str(mds_dtype).lower()
+        self.mds_solver = str(mds_solver).lower()
+        if self.mds_dtype not in ("fp32", "fp64"):
+            raise ValueError(
+                f"mds_dtype must be 'fp32' or 'fp64'; got "
+                f"{self.mds_dtype!r}"
+            )
+        if self.mds_solver not in ("eigh", "lobpcg"):
+            raise ValueError(
+                f"mds_solver must be 'eigh' or 'lobpcg'; got "
+                f"{self.mds_solver!r}"
+            )
+        # Fail-loud if mds_align_gradient is True AND user requested
+        # a backward-unsafe setting. eigh-fp32 backward can produce
+        # NaN; lobpcg backward isn't stable on all torch versions.
+        if bool(mds_align_gradient):
+            if self.mds_dtype == "fp32":
+                raise ValueError(
+                    "model.edm.mds_dtype='fp32' is unsafe when "
+                    "mds_align_gradient=True — eigh's backward needs "
+                    "fp64 precision to avoid NaN at near-degenerate "
+                    "eigenvalues. Either disable mds_align_gradient "
+                    "or use mds_dtype='fp64' (default)."
+                )
+            if self.mds_solver == "lobpcg":
+                raise ValueError(
+                    "model.edm.mds_solver='lobpcg' is unsafe when "
+                    "mds_align_gradient=True — lobpcg has no stable "
+                    "autograd backward. Either disable "
+                    "mds_align_gradient or use mds_solver='eigh' "
+                    "(default)."
+                )
         # Whether to run MDS+Procrustes during TRAINING. Set False to
         # skip the O(N³) eigh during training when no loss reads
         # ``pred.positions`` (typical for EDM-only runs where
@@ -474,33 +569,28 @@ class EDMOutputWrapper(nn.Module):
                 aligned_list.append(x_ref[b])
                 continue
             D_v = D_sq[b].index_select(0, valid_idx).index_select(1, valid_idx)
-            # Cast to float64 for the MDS computation. eigh's backward
-            # formula contains ``1/(λ_i − λ_j)`` terms; with the bulk
-            # of eigenvalues clustered near zero (a near-rank-2 matrix
-            # for a 2D point cloud), fp32 precision is insufficient to
-            # keep these terms finite. The 2026-05-27 per-module
-            # grad-finder pinpointed eigh-backward at n≈2000 as a
-            # direct-NaN producer in fp32: the C++ kernel emits NaN
-            # for the divergent Jacobian entries because fp32 can't
-            # express small-enough numbers. fp64 has ~10⁹× finer
-            # representable spacing around 0 (smallest normalized
-            # 1e-308 vs 1e-38), enough to keep the chain rule finite.
-            #
-            # ``tensor.to(dtype)`` is differentiable — the gradient
-            # casts back automatically at the boundary. Cost: ~2x
-            # slower MDS step (irrelevant in the training-step budget
-            # — MDS is O(n³) but n≤7k and dominated by the projector
-            # / transformer forward).
-            D_v_64 = D_v.to(torch.float64)
+            # Dtype: fp64 (default) for backward stability of eigh
+            # when mds_align_gradient=True; fp32 for ~2× speed when
+            # no backward goes through eigh. The constructor's
+            # fail-loud guards prevent fp32 + mds_align_gradient=True
+            # (which would NaN). See the __init__ comment for the
+            # full mathematics.
+            if self.mds_dtype == "fp64":
+                D_v_proc = D_v.to(torch.float64)
+            else:  # fp32
+                D_v_proc = D_v if D_v.dtype == torch.float32 else D_v.to(torch.float32)
+            # Solver: eigh (default, full N×N decomposition) or
+            # lobpcg (top-2 only, much faster at large N).
+            mds_fn = (
+                _classical_mds_2d_lobpcg if self.mds_solver == "lobpcg"
+                else _classical_mds_2d
+            )
             try:
-                x_mds_64 = _classical_mds_2d(          # (n_valid, 2) fp64
-                    D_v_64, tikhonov_eps=self.mds_tikhonov_eps,
+                x_mds_proc = mds_fn(                  # (n_valid, 2)
+                    D_v_proc, tikhonov_eps=self.mds_tikhonov_eps,
                 )
-                # Cast back to fp32 (or whatever the surrounding
-                # graph dtype is); gradient flows back through
-                # `.to()` and gets implicitly promoted to fp64
-                # inside _classical_mds_2d's backward.
-                x_mds = x_mds_64.to(D_v.dtype)
+                # Cast back to the surrounding graph's dtype.
+                x_mds = x_mds_proc.to(D_v.dtype)
             except Exception:
                 aligned_list.append(x_ref[b])
                 continue

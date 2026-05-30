@@ -614,6 +614,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 mds_align_train=bool(
                     getattr(edm_cfg, "mds_align_train", True)
                 ),
+                # MDS solver precision + algorithm — see EDMOutputWrapper
+                # docstring for the safety guards. Defaults preserve
+                # historic behaviour (fp64 + eigh).
+                mds_dtype=str(getattr(edm_cfg, "mds_dtype", "fp64")),
+                mds_solver=str(getattr(edm_cfg, "mds_solver", "eigh")),
             )
 
         if knn_graph_enabled:

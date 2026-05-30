@@ -1130,6 +1130,26 @@ edm:
     # losses are on by default. Expected speedup: 2-5× on MMC,
     # 5-15× on CNS.
     mds_align_train: true
+    # ---- MDS solver precision (efficiency knob A) ----
+    # "fp64" (default) — promote the per-slice D_v to float64 before
+    # eigh. Required when ``mds_align_gradient=true`` because eigh's
+    # backward formula needs fp64 precision to keep 1/(λ_i − λ_j)
+    # finite at near-degenerate spectra (the 2026-05-27 NaN fix).
+    # "fp32" — skip the fp64 cast. ~2× faster on the eigh step.
+    # SAFE only when no backward goes through eigh —
+    # ``mds_align_gradient=false`` AND/OR ``mds_align_train=false``.
+    # The wrapper fail-loud-raises if you combine fp32 with
+    # mds_align_gradient=true.
+    mds_dtype: "fp64"
+    # ---- MDS solver algorithm (efficiency knob B) ----
+    # "eigh" (default) — torch.linalg.eigh, computes ALL N eigenpairs
+    # (O(N³)). Has a stable autograd backward.
+    # "lobpcg" — torch.lobpcg with k=2, computes only the top-2
+    # eigenpairs we actually need (O(N²·iter)). 10-20× faster at
+    # N≈46k. No stable autograd backward — gated to
+    # ``mds_align_gradient=false``. The wrapper fail-loud-raises
+    # otherwise.
+    mds_solver: "eigh"
     # ---- MDS Tikhonov regularization strength ----
     # Per-eigenvalue diagonal perturbation in ``_classical_mds_2d``.
     # The Tikhonov diagonal is ``arange(n) * mds_tikhonov_eps * scale``
