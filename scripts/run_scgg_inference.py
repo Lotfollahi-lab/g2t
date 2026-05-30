@@ -109,6 +109,15 @@ def main():
              "metadata_pred_std.csv for uncertainty estimation. "
              "Linearly scales inference wall-clock.",
     )
+    p.add_argument(
+        "--exclude_test_files", default=None,
+        help="Comma-separated list of *_test.h5ad basenames to drop "
+             "from the assembled test set BEFORE building test.csv. "
+             "Use to skip too-large slices that GPU-OOM during "
+             "inference (e.g. CNS sagittal1/2/3 + spinalcord). "
+             "Filenames must match exactly (no path). When set, the "
+             "on-disk test.csv cache is bypassed and rebuilt.",
+    )
     args = p.parse_args()
 
     # Inference uses run_benchmark in skip-training mode. epochs/batch_size
@@ -134,6 +143,10 @@ def main():
             output_subdir="scgg_inference",
             embedding_field=args.embedding_field,
             n_inference_samples=args.n_inference_samples,
+            exclude_test_files=(
+                [s.strip() for s in args.exclude_test_files.split(",") if s.strip()]
+                if args.exclude_test_files else None
+            ),
         )
     except Exception:
         run_scgg_train.logger.exception("LUNA inference failed")

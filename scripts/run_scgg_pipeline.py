@@ -201,6 +201,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "intermediates before evaluating.",
     )
     p.add_argument(
+        "--exclude_test_files", default=None,
+        help="Comma-separated *_test.h5ad basenames to drop from the "
+             "test set at inference time. Useful when one or two "
+             "slices GPU-OOM during inference (e.g. CNS "
+             "sagittal1/2/3 + spinalcord). Forwarded directly to "
+             "run_scgg_inference.py → run_scgg_train.run_benchmark. "
+             "Train files are never filtered by this flag.",
+    )
+    p.add_argument(
         "--run_timestamp", default=None,
         help="Optional ``YYYYMMDD_HHMMSS`` timestamp to use as the run "
              "label. When set, the pipeline does NOT generate a fresh "
@@ -324,8 +333,19 @@ def _build_inference_cmd(
         cmd += ["--n_inference_samples", str(args.n_inference_samples)]
     if args.no_inference_plots:
         cmd += ["--no_plots"]
-    if args.inference_override:
-        cmd += ["--override", *args.inference_override]
+    if args.exclude_test_files:
+        cmd += ["--exclude_test_files", args.exclude_test_files]
+    # IMPORTANT: forward BOTH ``--override`` AND ``--inference_override``
+    # to inference. Previously this only forwarded ``inference_override``,
+    # which silently dropped any general overrides the user passed via
+    # ``--override`` (e.g. ``dataset.num_workers=0``,
+    # ``dataset.gene_columns_end=600``). Mirrors the LUNA pipeline fix.
+    # ``--inference_override`` retains its purpose (inference-ONLY
+    # overrides that should NOT be applied at training); those stack
+    # on top of the merged list.
+    merged_overrides = list(args.override or []) + list(args.inference_override or [])
+    if merged_overrides:
+        cmd += ["--override", *merged_overrides]
     return cmd
 
 
