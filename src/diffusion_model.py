@@ -607,6 +607,13 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 mds_tikhonov_eps=float(
                     getattr(edm_cfg, "mds_tikhonov_eps", 1e-6)
                 ),
+                # Default True preserves historic behaviour (MDS runs
+                # every training step). Set False to skip during
+                # training when no loss reads pred.positions — major
+                # speedup at large N because eigh is O(N³).
+                mds_align_train=bool(
+                    getattr(edm_cfg, "mds_align_train", True)
+                ),
             )
 
         if knn_graph_enabled:

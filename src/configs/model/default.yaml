@@ -1108,6 +1108,28 @@ edm:
     # turn on for any run that combines EDM with a non-EDM
     # auxiliary loss.
     mds_align_gradient: false
+    # ---- Skip MDS during training (speed optimisation) ----
+    # MDS (eigh on N×N matrix) is O(N³) — for cortex N≈6k it's
+    # ~200ms/step; for CNS N≈46k it's multiple seconds/step. When the
+    # only active loss is ``edm_distance_mse`` (which reads
+    # ``pred.edm_D`` directly, not ``pred.positions``), the MDS step
+    # is pure overhead during training. Setting this to False skips
+    # MDS in train mode but ALWAYS runs it at inference (eval mode)
+    # so pred.positions remains the canonical layout for metrics /
+    # plots / per-slice CSV outputs.
+    #
+    # When to keep True (default): any loss reads pred.positions —
+    # sinkhorn, chamfer, shape_matching, knn_rank, persistent_homology,
+    # or pairwise_distance_mse left enabled. Skipping MDS would
+    # silently break those (pred.positions = backbone's raw output,
+    # not the MDS-aligned canonical frame).
+    #
+    # When safe to set False: EDM-only runs (typical scgg-on-MMC
+    # default). The wrapper-config auto-disable already turned off
+    # ``pairwise_distance_mse`` for you; no other position-side
+    # losses are on by default. Expected speedup: 2-5× on MMC,
+    # 5-15× on CNS.
+    mds_align_train: true
     # ---- MDS Tikhonov regularization strength ----
     # Per-eigenvalue diagonal perturbation in ``_classical_mds_2d``.
     # The Tikhonov diagonal is ``arange(n) * mds_tikhonov_eps * scale``

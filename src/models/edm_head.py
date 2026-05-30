@@ -214,12 +214,24 @@ class EDMOutputWrapper(nn.Module):
         anisotropic_gating: bool = False,
         mds_align_gradient: bool = False,
         mds_tikhonov_eps: float = 1e-6,
+        mds_align_train: bool = True,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
         self.embed_dim = int(embed_dim)
         self.mds_align = bool(mds_align)
         self.anisotropic_gating = bool(anisotropic_gating)
+        # Whether to run MDS+Procrustes during TRAINING. Set False to
+        # skip the O(N³) eigh during training when no loss reads
+        # ``pred.positions`` (typical for EDM-only runs where
+        # ``edm_distance_mse`` is the sole position-related loss — it
+        # reads pred.edm_D directly, not pred.positions). MDS still
+        # runs at inference (eval mode) regardless. Default True
+        # preserves the historic behaviour for runs that DO use
+        # position-side losses (sinkhorn / chamfer / shape /
+        # pairwise_distance_mse). Massive speedup at CNS scale:
+        # eigh on a 46k×46k matrix is multiple seconds per step.
+        self.mds_align_train = bool(mds_align_train)
         # Per-eigenvalue Tikhonov perturbation in classical MDS.
         # Forwarded to ``_classical_mds_2d`` so the strength is set
         # per-run rather than hardcoded. See the docstring in that
@@ -362,7 +374,20 @@ class EDMOutputWrapper(nn.Module):
         pred.edm_D = D_sq
         pred.edm_h = h
 
-        if self.mds_align:
+        # Skip MDS entirely during TRAINING when no loss reads
+        # pred.positions. The wrapper's auto-config in
+        # ``diffusion_model.py`` disables ``pairwise_distance_mse``
+        # whenever EDM is on, and the other position-side losses
+        # (sinkhorn / chamfer / shape) default off. With only
+        # ``edm_distance_mse`` active (which reads ``pred.edm_D``,
+        # not ``pred.positions``), the MDS step is pure overhead —
+        # an O(N³) eigh per slice per step. At CNS scale (N≈46k)
+        # this dominates training wall time. Set
+        # ``mds_align_train=false`` to skip it during training; at
+        # inference (eval mode) MDS always runs so pred.positions
+        # is the canonical layout for downstream metrics + plots.
+        skip_mds_for_training = self.training and not self.mds_align_train
+        if self.mds_align and not skip_mds_for_training:
             if self.mds_align_gradient:
                 # GRADIENT-CARRYING MDS path. The MDS-aligned positions
                 # have a live autograd connection back to ``D_sq``, so
