@@ -201,6 +201,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "intermediates before evaluating.",
     )
     p.add_argument(
+        "--skip_training", action="store_true",
+        help="Skip the train block and only run inference. Requires "
+             "--checkpoint=<path to an existing .ckpt>. Common use: "
+             "recovering an inference-failed run without retraining "
+             "(e.g. the train→infer subprocess crashed at the "
+             "inference step due to an argparse mismatch or OOM). "
+             "The dataset/data_dir/seed/wandb args behave exactly as "
+             "in a normal pipeline call.",
+    )
+    p.add_argument(
+        "--checkpoint", default=None,
+        help="Path to a scgg .ckpt produced by a previous training "
+             "run. REQUIRED when --skip_training is set; ignored "
+             "otherwise (the pipeline auto-discovers the training "
+             "output's checkpoint in the normal train→infer flow).",
+    )
+    p.add_argument(
         "--exclude_test_files", default=None,
         help="Comma-separated *_test.h5ad basenames to drop from the "
              "test set at inference time. Useful when one or two "
@@ -421,26 +438,47 @@ def main() -> int:
     logger.info(f"  infer artifacts → {infer_output_dir}")
     logger.info("=" * 60)
 
-    # ---- 1. Training ----
-    train_cmd = _build_train_cmd(args, train_output_dir, timestamp)
-    logger.info(f"[1/2] Training (mode=train_and_test). Command:")
-    for token in train_cmd:
-        logger.info(f"    {token}")
-    rc = subprocess.run(train_cmd).returncode
-    if rc != 0:
-        logger.error(f"Training failed (exit code {rc}). Aborting pipeline.")
-        return rc
-
-    # ---- Find checkpoint ----
-    checkpoint = _find_checkpoint(train_output_dir)
-    if checkpoint is None:
-        logger.error(
-            f"No checkpoint found under {train_output_dir} after training "
-            f"completed successfully. Expected {train_output_dir}/best_model.ckpt "
-            f"or a *.ckpt under {train_output_dir}/luna_run/checkpoints/."
+    # ---- Validate skip_training / checkpoint pairing ----
+    if args.skip_training and not args.checkpoint:
+        sys.exit("--skip_training requires --checkpoint=<path>.")
+    if args.skip_training and args.skip_inference:
+        sys.exit(
+            "--skip_training AND --skip_inference would do nothing. "
+            "Pick at most one."
         )
-        return 1
-    logger.info(f"Resolved checkpoint: {checkpoint}")
+
+    # ---- 1. Training (or skip + use provided checkpoint) ----
+    if args.skip_training:
+        checkpoint = Path(args.checkpoint).resolve()
+        if not checkpoint.is_file():
+            logger.error(
+                f"--checkpoint={checkpoint!s} does not exist."
+            )
+            return 1
+        logger.info(
+            f"[1/2] --skip_training set; using provided checkpoint: "
+            f"{checkpoint}"
+        )
+    else:
+        train_cmd = _build_train_cmd(args, train_output_dir, timestamp)
+        logger.info(f"[1/2] Training (mode=train_only). Command:")
+        for token in train_cmd:
+            logger.info(f"    {token}")
+        rc = subprocess.run(train_cmd).returncode
+        if rc != 0:
+            logger.error(f"Training failed (exit code {rc}). Aborting pipeline.")
+            return rc
+
+        # ---- Find checkpoint ----
+        checkpoint = _find_checkpoint(train_output_dir)
+        if checkpoint is None:
+            logger.error(
+                f"No checkpoint found under {train_output_dir} after training "
+                f"completed successfully. Expected {train_output_dir}/best_model.ckpt "
+                f"or a *.ckpt under {train_output_dir}/luna_run/checkpoints/."
+            )
+            return 1
+        logger.info(f"Resolved checkpoint: {checkpoint}")
 
     # ---- Skip inference if requested ----
     if args.skip_inference:
