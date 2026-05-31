@@ -2,7 +2,7 @@
 
 End-to-end orchestrator that mirrors run_luna_pipeline.py / run_scgg_pipeline.py:
 
-    [1/2] subprocess: run_celery_train.py   (writes celery_models/<slice>/model.obj)
+    [1/2] subprocess: run_celery_train.py   (writes model.obj — single global model)
     [2/2] subprocess: run_celery_inference.py (writes metrics.csv + per_slice_*.csv)
 
 Both training and inference artifacts land under the same per-run
@@ -130,12 +130,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--skip_training", action="store_true",
         help="Skip the train block; only run inference. Requires "
-             "--checkpoint=<celery_models dir or best_model.ckpt symlink>.",
+             "--checkpoint=<best_model.ckpt symlink or model.obj path>.",
     )
     p.add_argument(
         "--checkpoint", default=None,
         help="REQUIRED when --skip_training is set. Path to the "
-             "training run's best_model.ckpt symlink or celery_models/ dir.",
+             "training run's best_model.ckpt symlink, model.obj file, "
+             "or the directory containing model.obj.",
     )
     p.add_argument(
         "--exclude_test_files", default=None,
@@ -217,19 +218,20 @@ def _build_inference_cmd(
 
 
 def _find_checkpoint(train_output_dir: Path) -> Optional[Path]:
-    """Resolve the celery_models/ dir produced by training.
+    """Resolve the model.obj produced by the multi-slice training run.
 
     The training script writes a ``best_model.ckpt`` symlink that
-    points at ``celery_models/``. Prefer that; fall back to the dir
-    directly if the symlink is missing (e.g. an old training run from
-    before the symlink convention was added).
+    points at ``model.obj`` (a single CeLEry pickle, since the new
+    protocol trains ONE global model on all training slices
+    concatenated). Prefer the symlink; fall back to ``model.obj``
+    directly if the symlink is missing.
     """
     stable = train_output_dir / "best_model.ckpt"
     if stable.exists():
         return stable
-    models_dir = train_output_dir / "celery_models"
-    if models_dir.is_dir():
-        return models_dir
+    model_obj = train_output_dir / "model.obj"
+    if model_obj.is_file():
+        return model_obj
     return None
 
 

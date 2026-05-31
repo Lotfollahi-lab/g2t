@@ -1,37 +1,16 @@
-"""run_celery_inference.py — score CeLEry checkpoints on the held-out mouse.
+"""run_celery_inference.py — score the global CeLEry model on the held-out mouse.
 
-Companion to ``run_celery_train.py``. Reads the per-test-slice
-checkpoint tree produced by training:
-
-    <ckpt_root>/celery_models/<test_slice>/model.obj
-    <ckpt_root>/celery_models/<test_slice>/manifest.json
-
-…loads each CeLEry model with ``cel.Predict_cord``, inverse-transforms
-the [0,1] sigmoid output back to the reference's coordinate scale,
-writes ``metadata_pred.csv`` + ``metadata_true.csv`` per slice (the
-schema scgg/luna pipelines also produce — same column names, same
-dir nesting), and computes the LUNA-paper benchmark metrics.
-
-The output dir layout mirrors run_luna_inference.py exactly so the
-existing compute_extended_metrics.py + plot scripts find these files
-without changes:
-
-    <output_dir>/
-        luna_run/test_results/<run>/celery/<slice>/metadata_pred.csv
-        luna_run/test_results/<run>/celery/<slice>/metadata_true.csv
-        per_slice_metrics.csv
-        metrics.csv
-        aggregate_metrics.json
-        runtime.csv
-        compute_requirements.csv
-        config.yaml
-        plots/<slice>.svg   (if --plots)
+Companion to ``run_celery_train.py``. Loads the single ``model.obj``
+(trained on ALL training slices concatenated per LUNA Supp Note 2),
+predicts coordinates on each test slice, inverse-transforms back to
+that slice's original coord scale, and computes the LUNA-paper
+benchmark metrics.
 
 Inputs (CLI):
     --data_dir          silver h5ad directory with *_test.h5ad
     --checkpoint        path to the training run's ``best_model.ckpt``
-                        symlink (which points at celery_models/)
-                        OR directly at the celery_models/ dir.
+                        symlink (which points at model.obj) OR
+                        directly at a model.obj file.
 """
 
 from __future__ import annotations
@@ -44,7 +23,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -63,7 +42,6 @@ _per_cell_spearman_median = _luna._per_cell_spearman_median
 _plot_pred_vs_truth = _luna._plot_pred_vs_truth
 
 _load_h5ad_for_celery = _celery_train._load_h5ad_for_celery
-_align_genes = _celery_train._align_genes
 _invert_celery_normalisation = _celery_train._invert_celery_normalisation
 
 
@@ -90,50 +68,51 @@ _ARTIFACTS_ROOT = Path(
 # Checkpoint resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_celery_models_dir(checkpoint: Path) -> Path:
-    """Map ``--checkpoint`` to the celery_models/ root.
+def _resolve_celery_model_path(checkpoint: Path):
+    """Resolve --checkpoint to (model_dir, model_filename_stem).
 
-    The training script writes ``best_model.ckpt`` as a symlink to
-    ``celery_models/`` inside the same output dir. So:
-      - If --checkpoint IS that symlink → resolve it.
-      - If --checkpoint is the celery_models/ dir directly → use it.
-      - If --checkpoint is a specific model.obj → walk up to its
-        celery_models/ ancestor.
-      - Else, fail loudly.
+    The new training script writes ``model.obj`` at the output_dir
+    root + a ``best_model.ckpt`` symlink pointing at it. So:
+      - --checkpoint = best_model.ckpt symlink → follow it.
+      - --checkpoint = model.obj path → use it directly.
+      - --checkpoint = directory containing model.obj → use that file.
+
+    Returns:
+        (model_dir, filename_stem)
+        — model_dir is the path CeLEry's Predict_cord wants for ``path=``.
+        — filename_stem is what it wants for ``filename=`` (no .obj suffix).
     """
     p = Path(checkpoint).resolve()
-    if p.is_dir() and p.name == "celery_models":
-        return p
-    if p.is_dir() and (p / "celery_models").is_dir():
-        # User pointed at the training run's output dir.
-        return p / "celery_models"
     if p.is_file() and p.name == "model.obj":
-        # Walk up: <models>/<slice>/model.obj → <models>
-        return p.parent.parent
+        return p.parent, "model"
+    if p.is_dir() and (p / "model.obj").is_file():
+        return p, "model"
     if p.name == "best_model.ckpt":
+        # Resolve the symlink (or read the .ckpt itself if it's a regular file).
         target = Path(os.readlink(p)) if p.is_symlink() else p
         if not target.is_absolute():
             target = (p.parent / target).resolve()
-        if target.is_dir() and target.name == "celery_models":
-            return target
+        if target.is_file() and target.name == "model.obj":
+            return target.parent, "model"
+        if target.is_dir() and (target / "model.obj").is_file():
+            return target, "model"
     raise FileNotFoundError(
-        f"--checkpoint={checkpoint} does not resolve to a celery_models/ "
-        f"directory. Expected the path to point at a training-run "
-        f"output dir (so we can find celery_models/ inside), the "
-        f"best_model.ckpt symlink, or the celery_models/ dir directly."
+        f"--checkpoint={checkpoint} does not resolve to a CeLEry model.obj. "
+        f"Expected: a path to model.obj, a directory containing model.obj, "
+        f"or the best_model.ckpt symlink pointing at one."
     )
 
 
-def _load_slice_checkpoint(slice_dir: Path) -> Tuple[Dict, Path]:
-    """Read a per-slice checkpoint's manifest + return the model.obj path."""
-    manifest_path = slice_dir / "manifest.json"
-    model_path = slice_dir / "model.obj"
+def _load_manifest(model_dir: Path) -> Dict:
+    """Read the training run's manifest.json (slice bboxes, hparams)."""
+    manifest_path = model_dir / "manifest.json"
     if not manifest_path.exists():
-        raise FileNotFoundError(f"manifest.json missing: {manifest_path}")
-    if not model_path.exists():
-        raise FileNotFoundError(f"model.obj missing: {model_path}")
-    manifest = json.loads(manifest_path.read_text())
-    return manifest, model_path
+        raise FileNotFoundError(
+            f"manifest.json missing at {manifest_path}. The training run "
+            f"either crashed before writing it or used an old per-test-slice "
+            f"protocol; re-run training with the current multi-slice script."
+        )
+    return json.loads(manifest_path.read_text())
 
 
 # ---------------------------------------------------------------------------
@@ -142,68 +121,68 @@ def _load_slice_checkpoint(slice_dir: Path) -> Tuple[Dict, Path]:
 
 def _infer_one_slice(
     slice_label: str,
-    slice_dir: Path,
     test_h5ad: Path,
+    model_dir: Path,
+    filename_stem: str,
+    train_var_names: List[str],
     out_slice_dir: Path,
     n_inference_samples: int,
 ) -> Dict[str, object]:
-    """Load model + predict + write metadata_{pred,true}.csv for one slice.
+    """Load test slice, predict with the global CeLEry model, score.
 
-    CeLEry's output is a deterministic point estimate per call, so
-    when n_inference_samples > 1 we re-evaluate with re-z-scored
-    input each time and average. This matches LUNA + scgg's multi-
-    sample ensembling convention so the n_inference_samples knob
-    means the same thing across all four methods (though for CeLEry
-    the gain is tiny because the model is deterministic).
+    Train-time gene order (from manifest.var_names) is the source of
+    truth — we re-index the test AnnData to match before predicting,
+    which is critical because CeLEry's MLP reads features positionally.
+    A gene-order mismatch silently produces garbage predictions.
     """
     import CeLEry as cel  # type: ignore
 
-    manifest, model_path = _load_slice_checkpoint(slice_dir)
-    x_min, x_max = manifest["x_min"], manifest["x_max"]
-    y_min, y_max = manifest["y_min"], manifest["y_max"]
+    adata_qry, x_min, x_max, y_min, y_max = _load_h5ad_for_celery(test_h5ad)
 
-    # Reload the test slice as CeLEry expects.
-    adata_qry, _, _, _, _ = _load_h5ad_for_celery(test_h5ad)
+    # ---- Restrict to (and reorder by) the training gene panel ----
+    # Cells the model was trained on saw genes in a specific order;
+    # use that exact order at inference. Genes present in train but
+    # absent in test are an error (the model expects them as input);
+    # genes present in test but not train are dropped silently.
+    train_set = set(train_var_names)
+    test_set = set(adata_qry.var_names)
+    missing = train_set - test_set
+    if missing:
+        raise ValueError(
+            f"{test_h5ad.name}: {len(missing)} training genes are missing "
+            f"from this test slice (e.g. {sorted(missing)[:5]}). The "
+            f"CeLEry model can't predict without all input features."
+        )
+    adata_qry = adata_qry[:, list(train_var_names)].copy()
 
-    # Align genes to the reference's gene order. We need the reference
-    # AnnData to do this — load only its var_names (lightweight; the
-    # silver h5ads carry the full obs/X but we just need the gene
-    # names for the intersection).
-    import scanpy as sc
-    ref_path = Path(manifest["ref_path"])
-    adata_ref_genes_only = sc.read(ref_path).copy()
-    adata_ref_genes_only, adata_qry = _align_genes(
-        adata_ref_genes_only, adata_qry,
-    )
-
+    # ---- Z-score (matches training preprocessing) ----
     cel.get_zscore(adata_qry)
 
-    # CeLEry's Predict_cord expects (path, filename) without the .obj
-    # extension — it appends ".obj" internally. We saved as model.obj
-    # so filename="model".
+    # ---- Predict ----
     preds: List[np.ndarray] = []
-    for sample_idx in range(max(1, n_inference_samples)):
+    for _ in range(max(1, n_inference_samples)):
         pred_normed = cel.Predict_cord(
             data_test=adata_qry,
-            path=str(model_path.parent),
-            filename="model",
+            path=str(model_dir),
+            filename=filename_stem,
             location_data=None,
         )
         preds.append(np.asarray(pred_normed))
-
     pred_normed_mean = np.mean(np.stack(preds, axis=0), axis=0)
+
+    # ---- Inverse-transform to test slice's coord scale ----
+    # The model predicts in [0,1] (sigmoid output, training cells were
+    # per-slice normalised to [0,1] before concat). For RSSD on the
+    # ORIGINAL-scale truth, we need pred in original scale too. Use
+    # the TEST slice's own bounding box. Spearman / contact-F1 are
+    # rank- / percentile-based and unaffected by this transform; only
+    # RSSD needs scale parity.
     pred_orig_scale = _invert_celery_normalisation(
         pred_normed_mean, x_min, x_max, y_min, y_max,
     )
 
-    # Build metadata DFs in the exact schema scgg/luna pipelines write.
+    # ---- Build metadata DataFrames (same schema scgg/luna write) ----
     obs = adata_qry.obs
-    # cell_class was stashed in adata.uns['_celery_cell_class'] by
-    # _load_h5ad_for_celery (the loader strips obs to JUST coord_X/Y
-    # because CeLEry's internal wrap_gene_location can't handle
-    # non-numeric obs columns — see comment in run_celery_train.py).
-    # Fall back to obs[cell_class] for legacy h5ads where the loader
-    # didn't run, or where cell_class was never present.
     if "_celery_cell_class" in adata_qry.uns:
         cell_class_array = np.asarray(adata_qry.uns["_celery_cell_class"])
     elif "cell_class" in obs.columns:
@@ -218,7 +197,6 @@ def _infer_one_slice(
     }, index=obs.index)
     df_pred.index.name = "cell_ID"
 
-    # Ground truth: first two cols of obs (we put them there during loading).
     df_true = pd.DataFrame({
         "coord_X": obs.iloc[:, 0].to_numpy(dtype=np.float64),
         "coord_Y": obs.iloc[:, 1].to_numpy(dtype=np.float64),
@@ -239,7 +217,6 @@ def _infer_one_slice(
         "n_cells": int(adata_qry.n_obs),
         "spearman_per_cell_median": float(median_rho),
         "spearman_per_cell_mean": float(mean_rho),
-        "ref_slice": manifest.get("ref_slice", ""),
     }
 
 
@@ -261,13 +238,21 @@ def run_inference(
     make_plots: bool = True,
     run_timestamp: Optional[str] = None,
 ) -> Dict[str, float]:
-    """Score every per-slice CeLEry checkpoint and aggregate metrics."""
+    """Score the global CeLEry model on every test slice + aggregate."""
     data_path = Path(data_dir).resolve()
     if not data_path.exists():
         raise FileNotFoundError(f"--data_dir not found: {data_path}")
 
-    ckpt_root = _resolve_celery_models_dir(Path(checkpoint))
-    logger.info(f"celery_models root: {ckpt_root}")
+    model_dir, filename_stem = _resolve_celery_model_path(Path(checkpoint))
+    logger.info(f"model_dir: {model_dir}, filename: {filename_stem}.obj")
+    manifest = _load_manifest(model_dir)
+    train_var_names = manifest.get("var_names", [])
+    if not train_var_names:
+        raise ValueError(
+            f"manifest.json at {model_dir}/manifest.json has no 'var_names'. "
+            f"This means the training run used an older script; re-run "
+            f"training with the current multi-slice script."
+        )
 
     # ---- TS resolution ----
     if run_timestamp is not None:
@@ -278,12 +263,9 @@ def run_inference(
             )
         run_ts = run_timestamp
     else:
-        # Try to inherit from checkpoint path (so inference pairs
-        # with the training run's TS); fall back to fresh clock.
         m = re.search(r"\d{8}_\d{6}(?:_[A-Za-z0-9]+)?", str(checkpoint))
         run_ts = m.group(0) if m else datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # ---- Output dir ----
     dataset_name = data_path.name
     out = (
         Path(output_dir).resolve()
@@ -303,53 +285,43 @@ def run_inference(
     )
 
     logger.info("=" * 60)
-    logger.info("CeLEry inference-phase")
+    logger.info("CeLEry inference-phase (multi-slice global, LUNA protocol)")
     logger.info("=" * 60)
     logger.info(f"  data_dir            : {data_path}")
-    logger.info(f"  celery_models       : {ckpt_root}")
+    logger.info(f"  model_dir           : {model_dir}")
     logger.info(f"  output_dir          : {out}")
     logger.info(f"  run_ts              : {run_ts}")
-    logger.info(f"  seed                : {seed}")
     logger.info(f"  n_inference_samples : {n_inference_samples}")
-    if exclude_test_files:
-        logger.info(f"  exclude_test_files  : {exclude_test_files}")
+    logger.info(f"  train n_slices      : {manifest.get('n_train_slices', '?')}")
+    logger.info(f"  train n_genes       : {len(train_var_names)}")
     logger.info("=" * 60)
 
     tracker = _RuntimeTracker()
 
     # ---- wandb init ----
-    # Same pattern as run_celery_train.py / run_novosparc_pipeline.py.
-    # Inference is a SEPARATE wandb run from training (matches the
-    # scgg/luna convention — training and inference each get their
-    # own wandb entry, and the pipeline appends ``_inference`` to
-    # the run name so they pair up by name in the wandb UI).
     use_wandb = wandb_mode != "disabled"
-    wandb_run_obj = None
     if use_wandb:
         try:
             import wandb  # type: ignore
-            wandb_run_obj = wandb.init(
-                # Default project = "celery". Same convention as the
-                # train phase — keeps the CeLEry-vs-scgg comparison
-                # rows out of each other's wandb tables. Override
-                # with --wandb_project <other>.
+            wandb.init(
                 project=wandb_project or "celery",
                 name=wandb_run_name,
                 mode=wandb_mode,
                 config={
                     "method": "celery",
                     "phase": "inference",
+                    "training_mode": "multi_slice_global",
                     "data_dir": str(data_path),
-                    "celery_models": str(ckpt_root),
+                    "model_dir": str(model_dir),
                     "seed": seed,
                     "n_inference_samples": n_inference_samples,
                     "exclude_test_files": exclude_test_files or [],
                     "run_timestamp": run_ts,
                     "output_dir": str(out),
-                    "tags": ["celery", "inference", data_path.name],
+                    "tags": ["celery", "inference", dataset_name, "multi_slice"],
                 },
             )
-            logger.info(f"wandb initialised: {wandb_run_obj.url}")
+            logger.info("wandb initialised")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"wandb init failed: {e}; continuing without wandb")
             use_wandb = False
@@ -385,22 +357,14 @@ def run_inference(
     with tracker.phase("inference", flush_to=out / "runtime.csv"):
         for idx, test_h5ad in enumerate(test_files, start=1):
             slice_label = _section_label_from_filename(test_h5ad)
-            slice_ckpt_dir = ckpt_root / slice_label
-            if not slice_ckpt_dir.exists():
-                logger.warning(
-                    f"[{idx}/{len(test_files)}] {slice_label}: no checkpoint "
-                    f"at {slice_ckpt_dir} — skipping (train pass didn't cover "
-                    f"this slice). This usually means a different "
-                    f"exclude_test_files was used at train time."
-                )
-                n_failed += 1
-                continue
             try:
                 logger.info(f"[{idx}/{len(test_files)}] {slice_label}")
                 row = _infer_one_slice(
                     slice_label=slice_label,
-                    slice_dir=slice_ckpt_dir,
                     test_h5ad=test_h5ad,
+                    model_dir=model_dir,
+                    filename_stem=filename_stem,
+                    train_var_names=train_var_names,
                     out_slice_dir=test_results_dir / slice_label,
                     n_inference_samples=n_inference_samples,
                 )
@@ -408,32 +372,27 @@ def run_inference(
                 logger.info(
                     f"      n={row['n_cells']:5d}  "
                     f"spr_med={row['spearman_per_cell_median']:.4f}  "
-                    f"spr_mean={row['spearman_per_cell_mean']:.4f}  "
-                    f"ref={row['ref_slice']}"
+                    f"spr_mean={row['spearman_per_cell_mean']:.4f}"
                 )
-                # Per-slice wandb log — wandb's UI plots
-                # spearman_per_cell_median over slice_idx so a regression
-                # on a specific slice is immediately visible.
                 if use_wandb:
                     try:
                         import wandb  # type: ignore
                         wandb.log({
                             "slice_idx": idx,
                             "section_label": slice_label,
-                            "ref_slice": row["ref_slice"],
-                            f"spearman_per_cell_median/{slice_label}": row["spearman_per_cell_median"],
-                            f"spearman_per_cell_mean/{slice_label}": row["spearman_per_cell_mean"],
+                            f"spearman_per_cell_median/{slice_label}":
+                                row["spearman_per_cell_median"],
+                            f"spearman_per_cell_mean/{slice_label}":
+                                row["spearman_per_cell_mean"],
                             f"n_cells/{slice_label}": row["n_cells"],
-                            # Running aggregate so the wandb UI shows
-                            # the cumulative mean-of-medians curve.
                             "spearman_mean_of_medians_running": float(
-                                np.nanmean([r["spearman_per_cell_median"] for r in per_slice_rows])
+                                np.nanmean([r["spearman_per_cell_median"]
+                                            for r in per_slice_rows])
                             ),
                         })
                     except Exception as e:  # noqa: BLE001
                         logger.warning(f"wandb.log failed for {slice_label}: {e}")
 
-                # Optional per-slice GT-vs-pred scatter plot
                 if make_plots and plots_dir is not None:
                     try:
                         pred = pd.read_csv(
@@ -465,8 +424,7 @@ def run_inference(
 
     if not per_slice_rows:
         raise RuntimeError(
-            "No slices were successfully scored. Check the LSF stderr "
-            "for traceback details."
+            "No slices were successfully scored. Check the LSF stderr."
         )
 
     # ---- Aggregate ----
@@ -478,6 +436,7 @@ def run_inference(
 
     aggregate = {
         "method": "celery",
+        "training_mode": "multi_slice_global",
         "spearman_mean_of_medians": float(medians.mean()) if medians.size else float("nan"),
         "spearman_median_of_medians": float(np.median(medians)) if medians.size else float("nan"),
         "spearman_std_of_medians": float(medians.std()) if medians.size else float("nan"),
@@ -495,12 +454,12 @@ def run_inference(
         json.dumps(aggregate, indent=2, default=str)
     )
 
-    # config snapshot
     (out / "config.yaml").write_text(yaml.safe_dump({
         "method": "celery",
         "phase": "inference",
+        "training_mode": "multi_slice_global",
         "data_dir": str(data_path),
-        "celery_models": str(ckpt_root),
+        "model_dir": str(model_dir),
         "output_dir": str(out),
         "run_timestamp": run_ts,
         "seed": seed,
@@ -511,13 +470,13 @@ def run_inference(
         "exclude_test_files": exclude_test_files or [],
     }, default_flow_style=False))
 
-    # compute requirements
     tracker.write_compute_requirements_csv(
         out / "compute_requirements.csv",
         method="CeLEry",
         run_timestamp=run_ts,
         extra={
             "phase": "inference",
+            "training_mode": "multi_slice_global",
             "n_test_slices": len(test_files),
             "n_inference_samples": n_inference_samples,
         },
@@ -532,9 +491,6 @@ def run_inference(
     logger.info("=" * 60)
 
     # ---- wandb finish ----
-    # Aggregate dict goes into wandb.run.summary so the run overview
-    # row shows the headline metric AND every breakdown without
-    # opening the run page. Mirrors the novosparc pipeline pattern.
     if use_wandb:
         try:
             import wandb  # type: ignore
@@ -576,17 +532,15 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--data_dir", required=True)
     p.add_argument(
         "--checkpoint", required=True,
-        help="Path to the training run's ``best_model.ckpt`` symlink, "
-             "the celery_models/ dir, or a single model.obj. The "
-             "script auto-resolves these three forms to the "
-             "celery_models/ root.",
+        help="Path to the training run's best_model.ckpt symlink, "
+             "model.obj file, or the directory containing model.obj.",
     )
     p.add_argument("--output_dir", default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--n_inference_samples", type=int, default=1,
         help="CeLEry is deterministic so ensembling provides marginal "
-             "gain, but the flag exists for cross-pipeline parity.",
+             "gain; flag exists for cross-pipeline parity.",
     )
     p.add_argument(
         "--wandb_run_name", "--run_name",
@@ -622,7 +576,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             output_dir=args.output_dir,
             seed=args.seed,
             wandb_mode=args.wandb_mode,
-            # Mirrors the train script's default — see comments there.
             wandb_project=args.wandb_project or "celery",
             wandb_run_name=args.wandb_run_name,
             n_inference_samples=args.n_inference_samples,

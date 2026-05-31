@@ -2,51 +2,53 @@
 
 CeLEry (Zhang et al. 2023, Nat Commun) is the supervised coordinate-
 regression baseline LUNA's Fig 3 benchmarks against on the MMC cortex
-dataset. Per the LUNA paper, the benchmark protocol is:
+dataset. Per the **LUNA paper Supplementary Note 2** ("Baselines"), the
+benchmark protocol for CeLEry specifically is:
 
-  * Train and test mice are held out (one mouse = train set, the
-    other = test set), the same cross-mouse split the LUNA model
-    itself uses.
-  * CeLEry can only train on a SINGLE reference slice at a time, so
-    LUNA repeats the procedure per test slice: for each test slice,
-    randomly draw one slice from the training mouse, train CeLEry on
-    that one slice, predict positions on the test slice.
-  * "All methods used the same seed for random slice selection." We
-    honour that here with the standard ``--seed`` flag.
+  * "Notably, CeLEry is the only method capable of processing multiple
+    slices simultaneously. Consequently, we trained CeLEry using all
+    33 slices from the first animal and tested it on all 31 slices
+    from the second animal."
 
-So this script does N independent CeLEry trainings, one per test
-slice, with the reference picked from the training pool by a seeded
-np.random.Generator. Checkpoints are saved in a tree:
+So unlike novosparc / tangram / cytospace (which are trained per-
+reference-slice), CeLEry gets **ONE global training run on the
+concatenated training set**. This script implements that protocol.
 
-    <output_dir>/celery_models/<test_slice_label>/model.obj
-    <output_dir>/celery_models/<test_slice_label>/manifest.json
+Slice concatenation gotcha
+==========================
+Each silver h5ad has its own coordinate frame (the slice's own
+micron-scale (x, y) bounding box). CeLEry's MLP learns to map gene
+expression → 2D coords; if we concatenated training slices without
+normalising, the model would see contradictory targets (cells of the
+same cell type at very different (x,y) values across slices because
+each slice's frame is anchored to a different origin).
 
-The manifest captures which reference slice was used + the
-normalisation parameters needed to invert CeLEry's internal min-max
-scaling at inference time (CeLEry's sigmoid output lives in [0,1],
-but Spearman is rank-based so this doesn't actually affect the
-headline metric — we save them anyway because RSSD and contact F1
-need original-scale coordinates).
+Fix: **per-slice min-max normalise each training slice's coords to
+[0, 1] before concatenating**. CeLEry's sigmoid output natively lives
+in [0, 1], so this also matches the model's output assumption. The
+per-slice bounding boxes are stashed in ``manifest.json`` so inference
+can inverse-transform predictions to the test slice's own coord scale
+(needed for RSSD on the original-scale truth; Spearman is rank-based
+so the inverse is cosmetic for that metric).
 
-Inference (run_celery_inference.py) loads each per-slice checkpoint,
-predicts, inverse-transforms, scores, and writes metadata_pred.csv +
-metadata_true.csv per slice under
+Caveat — what LUNA actually used
+=================================
+Supp Note 2 doesn't spell out how LUNA normalised coords across the 33
+training slices before concatenating. Per-slice [0,1] is the natural
+choice given CeLEry's sigmoid output range, but if LUNA used a
+different convention (e.g. shared affine alignment) the numbers will
+still differ.
 
-    <output_dir>/luna_run/test_results/<run_name>/celery/<slice_label>/
-
-The directory naming mirrors run_luna_train.py's layout so the
-existing compute_extended_metrics.py + plot scripts work unchanged.
-
-Outputs (the contract every pipeline in this repo satisfies):
-    metrics.csv                       — single-row summary
-    per_slice_metrics.csv             — one row per test slice
+Outputs (the artifact contract every pipeline in this repo satisfies):
+    metrics.csv                       — single-row training summary
+    per_slice_metrics.csv             — one row per test slice (cell counts only)
     aggregate_metrics.json            — JSON summary
     runtime.csv                       — phase-by-phase timing
     compute_requirements.csv          — single-row resource summary
     config.yaml                       — invocation snapshot
-    celery_models/<slice>/model.obj   — per-slice CeLEry pickle
-    celery_models/<slice>/manifest.json
-    best_model.ckpt                   — convenience symlink → newest model.obj
+    model.obj                         — CeLEry pickle (single global model)
+    manifest.json                     — train slice list + per-slice bboxes
+    best_model.ckpt                   — symlink → model.obj (pipeline convention)
 """
 
 from __future__ import annotations
@@ -58,7 +60,6 @@ import os
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -69,15 +70,7 @@ import yaml
 
 
 # ---------------------------------------------------------------------------
-# Reuse helpers from run_luna_train.py:
-#   - _RuntimeTracker (timing + GPU/RSS sampling)
-#   - _discover_split_files (silver h5ad enumeration)
-#   - _section_label_from_filename (canonical slice naming)
-#   - _per_cell_spearman_median (per-cell Spearman aggregation)
-#   - _plot_pred_vs_truth (side-by-side GT-vs-pred scatter)
-# These have no CeLEry-specific behaviour; they're the shared
-# benchmarking primitives so all four methods report comparable
-# numbers from identical CSV columns.
+# Reuse helpers from run_luna_train.py — see the docstring there.
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
@@ -97,7 +90,7 @@ logger = logging.getLogger("celery_train")
 # Constants matching run_luna_train.py's conventions
 # ---------------------------------------------------------------------------
 
-ENGINE_OUTPUT_SUBDIR = "celery_model"  # <artifacts_root>/<dataset>/<this>/<TS>/
+ENGINE_OUTPUT_SUBDIR = "celery_model"
 
 _DEFAULT_ARTIFACTS_ROOT = Path(
     "/nfs/team361/sb75/scgg-reproducibility/artifacts"
@@ -117,98 +110,36 @@ _ARTIFACTS_ROOT = Path(
 
 
 # ---------------------------------------------------------------------------
-# Reference-slice picker
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _RefAssignment:
-    """One row of the per-test-slice reference assignment table.
-
-    Captured as JSON in the run's config.yaml so reviewers can audit
-    exactly which (train_slice, test_slice) pair each CeLEry model
-    was trained on. Reproducible from --seed.
-    """
-    test_slice: str
-    test_path: str
-    ref_slice: str
-    ref_path: str
-
-
-def _assign_references(
-    train_files: List[Path],
-    test_files: List[Path],
-    seed: int,
-) -> List[_RefAssignment]:
-    """Pick a training slice for each test slice (seeded).
-
-    Mirrors LUNA's "randomly selected a single slice from the
-    training mouse to serve as the reference, repeating the procedure
-    for each slice of the testing mouse" (paper §4). The seed
-    controls which reference each test slice gets — matching seed
-    across CeLEry runs reproduces the exact reference-slice
-    assignment, so that's the right knob for the multi-seed sweep.
-
-    With-replacement sampling: when the train mouse has fewer slices
-    than the test mouse (rare but possible), reuse training slices.
-    """
-    if not train_files:
-        raise ValueError("no training slices found — cannot pick a CeLEry reference")
-    if not test_files:
-        raise ValueError("no test slices found — nothing to evaluate")
-    rng = np.random.default_rng(seed)
-    train_indices = rng.integers(0, len(train_files), size=len(test_files))
-    assignments = []
-    for test_idx, train_idx in enumerate(train_indices):
-        t = test_files[test_idx]
-        r = train_files[int(train_idx)]
-        assignments.append(_RefAssignment(
-            test_slice=_section_label_from_filename(t),
-            test_path=str(t),
-            ref_slice=_section_label_from_filename(r),
-            ref_path=str(r),
-        ))
-    return assignments
-
-
-# ---------------------------------------------------------------------------
-# CeLEry IO helpers
+# Per-slice loading + coord normalization
 # ---------------------------------------------------------------------------
 
 def _load_h5ad_for_celery(
     h5ad_path: Path,
     coord_keys: Tuple[str, str] = ("coord_X", "coord_Y"),
 ):
-    """Read a silver h5ad and arrange it for CeLEry.
+    """Read a silver h5ad and arrange it for CeLEry, returning ORIGINAL coords.
 
     Silver h5ads in this repo store spatial coordinates in
     ``adata.obsm['spatial']`` (the canonical scanpy layout) by
     convention; some older or method-specific h5ads instead carry
     them as ``obs['coord_X'] / obs['coord_Y']`` columns. We prefer
-    obsm['spatial'] and fall back to obs columns — same precedence
-    as run_novosparc_pipeline.py and run_luna_train.py use.
+    obsm['spatial'] and fall back to obs columns.
 
     CeLEry's ``Fit_cord`` / ``Predict_cord`` reads coordinates from
     the first two columns of ``data_train.obs`` POSITIONALLY (it
-    ignores column names — see CeLEry/datasetgenemap.py). So we
-    INJECT the coords as the first two obs columns (overwriting
-    any existing ``coord_X`` / ``coord_Y`` of the same name, if
-    they exist) so CeLEry sees them at obs[:, 0:2].
-
-    Args:
-        h5ad_path: path to a silver h5ad. Coords must live at one of:
-            - ``adata.obsm['spatial']`` (preferred), or
-            - ``adata.obs[coord_keys[0]]`` + ``adata.obs[coord_keys[1]]``.
-        coord_keys: (x_col, y_col) fallback names + the names used
-            for the injected obs columns CeLEry will read positionally.
+    ignores column names — see CeLEry/datasetgenemap.py) AND it casts
+    the ENTIRE obs DataFrame to float32. So obs MUST contain ONLY the
+    two coord columns; ``cell_class`` (which has string values like
+    'Other') is stashed in ``adata.uns['_celery_cell_class']`` for
+    later recovery in metadata_true.csv writing.
 
     Returns:
         (adata, x_min, x_max, y_min, y_max)
-        — adata has obs reordered so cols 0/1 are (x, y); the four
-        scalars are the bounding-box of the reference's coordinate
-        cloud, needed to invert CeLEry's internal min-max scaling
-        when we score predictions on the original scale.
+        — adata.obs has been reduced to [coord_X, coord_Y]. The four
+        scalars are the bounding box of the ORIGINAL (pre-normalisation)
+        coordinate cloud. Caller decides whether to normalise.
     """
-    import scanpy as sc  # local import — keeps non-CeLEry callers free of scanpy
+    import scanpy as sc
 
     adata = sc.read(h5ad_path)
     obs = adata.obs.copy()
@@ -228,61 +159,57 @@ def _load_h5ad_for_celery(
     else:
         raise KeyError(
             f"{h5ad_path}: no spatial coordinates found. Expected "
-            f"adata.obsm['spatial'] (preferred) OR "
-            f"adata.obs[{coord_keys[0]!r}] + adata.obs[{coord_keys[1]!r}]. "
+            f"adata.obsm['spatial'] OR adata.obs[{coord_keys[0]!r}/{coord_keys[1]!r}]. "
             f"Have obs columns: {list(obs.columns)}, "
             f"obsm keys: {list(adata.obsm_keys())}"
         )
 
-    # ── Build a STRIPPED obs DataFrame with ONLY the coord columns ──
-    # CeLEry's wrap_gene_location() does
-    #     cord = adata.obs.to_numpy().astype('float32')
-    # when location_data is None (which Fit_cord / Predict_cord always
-    # do internally). That means EVERY column of obs has to be
-    # float-castable — leaving in cell_class / sample_id / mouse /
-    # _bronze_row_pos triggers ValueError: could not convert string
-    # to float: 'Other'.
-    #
-    # So we restrict obs to JUST (coord_X, coord_Y) for the CeLEry
-    # call, and stash the original cell_class array under
-    # adata.uns['_celery_cell_class'] so the inference path can
-    # recover it for metadata_true.csv.
+    # Stash cell_class (string) before stripping obs.
     if "cell_class" in obs.columns:
         cell_class_array = obs["cell_class"].astype(str).to_numpy()
     else:
         cell_class_array = None
 
+    # Replace obs with just the two numeric coord cols (CeLEry casts all
+    # of obs to float32; non-numeric cols would raise ValueError).
     obs_new = pd.DataFrame(
         {coord_keys[0]: x, coord_keys[1]: y},
         index=obs.index,
     )
     adata.obs = obs_new
     if cell_class_array is not None:
-        # Stash as numpy in uns — anndata serialises numpy arrays in
-        # uns without issue, and inference's _infer_one_slice reads
-        # this back to populate metadata_true.csv's cell_class column.
         adata.uns["_celery_cell_class"] = cell_class_array
 
     return adata, float(x.min()), float(x.max()), float(y.min()), float(y.max())
 
 
-def _align_genes(adata_ref, adata_qry):
-    """Restrict both AnnDatas to the intersection of var_names.
+def _normalize_coords_to_unit(
+    adata,
+    x_min: float, x_max: float,
+    y_min: float, y_max: float,
+    coord_keys: Tuple[str, str] = ("coord_X", "coord_Y"),
+):
+    """In-place [0,1] min-max normalise the coord columns of adata.obs.
 
-    CeLEry feeds the genes positionally to its MLP — train and test
-    AnnDatas MUST have identical gene order or the model will be
-    fitted on (gene_i_in_ref) and predicted on (gene_i_in_qry) which
-    are entirely different signals. We take the intersection and
-    sort lexicographically so the order is deterministic across
-    runs (sets in Python are insertion-ordered but the intersection
-    operator returns an arbitrary order).
+    Uses the supplied bounding box (not recomputed from adata.obs) so
+    the caller has a single source of truth that gets saved in the
+    manifest. CeLEry's sigmoid output lives in [0,1] so post-fit
+    predictions are in the same normalised frame.
+
+    Edge case: a degenerate axis (x_min == x_max) would divide by
+    zero. Handled by setting that axis to 0.5 (centroid) — CeLEry
+    can still train, the affected coordinate just provides no signal.
     """
-    common = sorted(set(adata_ref.var_names) & set(adata_qry.var_names))
-    if not common:
-        raise ValueError(
-            "no overlapping genes between reference and query AnnDatas"
-        )
-    return adata_ref[:, common].copy(), adata_qry[:, common].copy()
+    obs = adata.obs.copy()
+    dx = x_max - x_min
+    dy = y_max - y_min
+    obs[coord_keys[0]] = (
+        (obs[coord_keys[0]].to_numpy() - x_min) / dx if dx > 0 else 0.5
+    )
+    obs[coord_keys[1]] = (
+        (obs[coord_keys[1]].to_numpy() - y_min) / dy if dy > 0 else 0.5
+    )
+    adata.obs = obs
 
 
 def _invert_celery_normalisation(
@@ -290,20 +217,15 @@ def _invert_celery_normalisation(
     x_min: float, x_max: float,
     y_min: float, y_max: float,
 ) -> np.ndarray:
-    """Map CeLEry's [0,1] sigmoid output back to the reference's coordinate scale.
+    """Map CeLEry's [0,1] sigmoid output back to a target coord scale.
 
-    CeLEry's ``datasetgenemap.py`` does:
-        cordx_norm = (cordx - xmin) / (xmax - xmin)
-    with a ±1 buffer on the min/max bounds. Inverse:
-        cordx = cordx_norm * (xmax - xmin) + xmin
-    We don't replicate the ±1 buffer because:
-      (a) Spearman is rank-based — the buffer is a rank-preserving
-          affine, so it cancels out.
-      (b) RSSD uses Kabsch alignment which absorbs any global
-          translation + scale, so it cancels too.
-    The buffer only matters if a downstream consumer cares about
-    absolute Euclidean error on the same scale as the reference,
-    which none of LUNA's reported metrics do.
+    For multi-slice CeLEry, predictions come out in the "shared
+    normalised [0,1] frame" used during training (since every train
+    slice was normalised to [0,1] before concatenation). At inference
+    we want pred and true on the SAME scale so RSSD's Kabsch
+    alignment can do its job — so we inverse-transform using the
+    TEST slice's own bounding box. Spearman is rank-based so the
+    inverse is cosmetic for that metric.
     """
     pred = np.asarray(pred_normed, dtype=np.float64)
     out = np.empty_like(pred)
@@ -313,12 +235,81 @@ def _invert_celery_normalisation(
 
 
 # ---------------------------------------------------------------------------
-# Per-slice CeLEry training
+# Multi-slice gene alignment + concatenation
 # ---------------------------------------------------------------------------
 
-def _train_one_slice(
-    assignment: _RefAssignment,
-    ckpt_dir: Path,
+def _common_genes_across_slices(adatas: List) -> List[str]:
+    """Intersection of var_names across all slices, lex-sorted for determinism."""
+    gene_sets = [set(a.var_names) for a in adatas]
+    common = sorted(set.intersection(*gene_sets))
+    if not common:
+        raise ValueError(
+            "no overlapping genes across the training slices — "
+            "CeLEry needs a shared gene panel for multi-slice training."
+        )
+    return common
+
+
+def _concat_normalized_slices(
+    train_files: List[Path],
+):
+    """Load every train slice, normalise coords to [0,1], concatenate.
+
+    Returns:
+        (adata_concat, slice_bboxes)
+        — adata_concat: AnnData with X stacked across slices, obs containing
+          only normalised coord_X / coord_Y as cols 0/1.
+        — slice_bboxes: list of dicts {slice_name, path, x_min, x_max,
+          y_min, y_max, n_cells} for the manifest.
+    """
+    import scanpy as sc
+    import anndata as ad
+
+    adatas = []
+    bboxes = []
+    for p in train_files:
+        slice_label = _section_label_from_filename(p)
+        logger.info(f"  loading {slice_label}: {p.name}")
+        a, x_min, x_max, y_min, y_max = _load_h5ad_for_celery(p)
+        _normalize_coords_to_unit(a, x_min, x_max, y_min, y_max)
+        adatas.append(a)
+        bboxes.append({
+            "slice_name": slice_label,
+            "path": str(p),
+            "x_min": x_min, "x_max": x_max,
+            "y_min": y_min, "y_max": y_max,
+            "n_cells": int(a.n_obs),
+        })
+
+    # Restrict to common genes BEFORE concat — anndata's concat would
+    # require this anyway (default join="inner"), but doing it
+    # explicitly gives us a clean log line + deterministic gene order.
+    common = _common_genes_across_slices(adatas)
+    logger.info(
+        f"  common genes across {len(adatas)} train slice(s): {len(common)}"
+    )
+    adatas = [a[:, common].copy() for a in adatas]
+
+    # Concatenate. join="inner" is redundant after the common-genes
+    # restriction; pairwise=False because we don't have multi-sample
+    # uns-level structures to merge.
+    adata_concat = ad.concat(adatas, axis=0, join="inner", merge="first")
+    # Restore var_names (concat collapses them sometimes).
+    adata_concat = adata_concat[:, common].copy()
+    logger.info(
+        f"  concatenated: {adata_concat.n_obs} cells × "
+        f"{adata_concat.n_vars} genes"
+    )
+    return adata_concat, bboxes
+
+
+# ---------------------------------------------------------------------------
+# Global CeLEry training
+# ---------------------------------------------------------------------------
+
+def _train_global_model(
+    train_files: List[Path],
+    out_dir: Path,
     *,
     num_epochs_max: int,
     batch_size: int,
@@ -326,51 +317,34 @@ def _train_one_slice(
     hidden_dims: List[int],
     num_workers: int,
     seed: int,
-) -> Dict[str, float]:
-    """Train ONE CeLEry model on the reference→test pair for one test slice.
+) -> Dict[str, object]:
+    """Train ONE CeLEry model on all training slices concatenated.
 
-    Saves ``model.obj`` (the CeLEry pickle) + ``manifest.json`` (the
-    reference-slice metadata + normalisation params) under
-    ``ckpt_dir/<test_slice>/``.
-
-    Returns a runtime info dict with: train_seconds, n_ref_cells,
-    n_qry_cells, n_genes_common.
+    Mirrors the LUNA-paper Supp Note 2 protocol for CeLEry. Returns a
+    dict with training stats; checkpoint is written to
+    ``out_dir/model.obj`` and ``out_dir/manifest.json``.
     """
-    import CeLEry as cel  # type: ignore  # local import — env-gated
+    import CeLEry as cel  # type: ignore
 
-    slice_dir = ckpt_dir / assignment.test_slice
-    slice_dir.mkdir(parents=True, exist_ok=True)
+    # ---- 1. Build the concatenated training AnnData ----
+    adata_concat, slice_bboxes = _concat_normalized_slices(train_files)
 
-    ref_path = Path(assignment.ref_path)
-    qry_path = Path(assignment.test_path)
+    # ---- 2. Z-score gene expression (CeLEry's documented preprocessing) ----
+    # cel.get_zscore mutates in-place: per-gene mean-centering + unit-variance
+    # scaling using THIS AnnData's statistics. Computed across all
+    # 33 slices' cells pooled — which is the correct scope for a model
+    # that should generalise across the entire training mouse.
+    cel.get_zscore(adata_concat)
 
-    logger.info(f"    loading ref  : {ref_path.name}")
-    adata_ref, x_min, x_max, y_min, y_max = _load_h5ad_for_celery(ref_path)
-    logger.info(f"    loading qry  : {qry_path.name}")
-    adata_qry, _, _, _, _ = _load_h5ad_for_celery(qry_path)
-
-    adata_ref, adata_qry = _align_genes(adata_ref, adata_qry)
-    n_genes = adata_ref.n_vars
-    n_ref = adata_ref.n_obs
-    n_qry = adata_qry.n_obs
-    logger.info(
-        f"    ref={n_ref} cells, qry={n_qry} cells, common genes={n_genes}"
-    )
-
-    # CeLEry expects z-scored features per the paper's preprocessing.
-    cel.get_zscore(adata_ref)
-    cel.get_zscore(adata_qry)
-
-    # Save normalisation params first — useful even if training
-    # subsequently fails (we can re-attempt with a fresh model.obj
-    # while keeping the manifest stable).
+    # ---- 3. Save manifest BEFORE training so a fit-crash still leaves
+    # the bbox metadata on disk for debugging.
     manifest = {
-        **asdict(assignment),
-        "x_min": x_min, "x_max": x_max,
-        "y_min": y_min, "y_max": y_max,
-        "n_ref_cells": n_ref,
-        "n_qry_cells": n_qry,
-        "n_genes_common": n_genes,
+        "training_mode": "multi_slice_global",
+        "n_train_slices": len(train_files),
+        "n_train_cells_total": int(adata_concat.n_obs),
+        "n_genes": int(adata_concat.n_vars),
+        "var_names": list(adata_concat.var_names),
+        "slice_bboxes": slice_bboxes,
         "celery_hparams": {
             "num_epochs_max": num_epochs_max,
             "batch_size": batch_size,
@@ -380,38 +354,42 @@ def _train_one_slice(
             "seednum": seed,
         },
     }
-    (slice_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
+    # ---- 4. Fit ----
+    logger.info("=" * 60)
+    logger.info(f"Training CeLEry on {adata_concat.n_obs} cells × "
+                f"{adata_concat.n_vars} genes")
+    logger.info(f"  hparams: lr={learning_rate}, batch={batch_size}, "
+                f"epochs={num_epochs_max}, hidden={hidden_dims}")
+    logger.info("=" * 60)
     t0 = time.perf_counter()
     cel.Fit_cord(
-        data_train=adata_ref,
+        data_train=adata_concat,
         hidden_dims=list(hidden_dims),
         num_epochs_max=int(num_epochs_max),
         batch_size=int(batch_size),
         num_workers=int(num_workers),
         initial_learning_rate=float(learning_rate),
-        path=str(slice_dir),
-        filename="model",  # → <slice_dir>/model.obj
+        path=str(out_dir),
+        filename="model",  # → <out_dir>/model.obj
         seednum=int(seed),
     )
     dt = time.perf_counter() - t0
-    logger.info(f"    trained in {dt:.1f}s")
+    logger.info(f"  Trained in {dt:.1f}s")
 
-    ckpt = slice_dir / "model.obj"
+    ckpt = out_dir / "model.obj"
     if not ckpt.exists():
         raise RuntimeError(
-            f"CeLEry training completed but no checkpoint at {ckpt} "
-            f"— this usually means Fit_cord raised silently. Check "
-            f"the CeLEry stderr above."
+            f"CeLEry training completed but no checkpoint at {ckpt} — "
+            f"this usually means Fit_cord raised silently. Check stderr."
         )
 
     return {
-        "test_slice": assignment.test_slice,
-        "ref_slice": assignment.ref_slice,
         "train_seconds": dt,
-        "n_ref_cells": n_ref,
-        "n_qry_cells": n_qry,
-        "n_genes_common": n_genes,
+        "n_train_slices": len(train_files),
+        "n_train_cells_total": int(adata_concat.n_obs),
+        "n_genes": int(adata_concat.n_vars),
     }
 
 
@@ -436,22 +414,18 @@ def run_benchmark(
     output_subdir: Optional[str] = None,
     run_timestamp: Optional[str] = None,
 ) -> Dict[str, float]:
-    """Train one CeLEry model per test slice; return the headline metric.
+    """Train ONE global CeLEry model on all training slices concatenated.
 
-    Mirrors ``run_luna_train.run_benchmark`` in signature where it
-    makes sense; arguments specific to LUNA's vendored engine (Hydra
-    overrides, n_inference_samples, etc.) are omitted because CeLEry
-    doesn't have those concepts.
+    See module docstring for the protocol justification (LUNA Supp
+    Note 2). ``exclude_test_files`` is accepted for cross-pipeline
+    parity (forwarded to the inference subprocess); CeLEry's training
+    phase always uses ALL training slices regardless.
     """
     if data_dir is None:
         raise ValueError(
-            "--data_dir is required for CeLEry training: silver h5ad "
-            "directory containing *_train.h5ad and *_test.h5ad files."
+            "--data_dir is required: silver h5ad directory with "
+            "*_train.h5ad and *_test.h5ad files."
         )
-    # CeLEry's DNN class hardcodes a 3-layer MLP (it indexes
-    # hidden_dims[0], [1], [2] directly in CeLEry/DNN.py). Passing
-    # fewer raises IndexError mid-training; validate up-front so
-    # the user sees a clear message before N slices are wasted.
     if len(hidden_dims) != 3:
         raise ValueError(
             f"--hidden_dims must have EXACTLY 3 widths (CeLEry's "
@@ -462,8 +436,7 @@ def run_benchmark(
     if not data_path.exists():
         raise FileNotFoundError(f"--data_dir not found: {data_path}")
 
-    # ---- 1. Resolve TS and output dir ----
-    # Same three-source TS logic as the other pipelines.
+    # ---- TS + output dir resolution (same convention as scgg/luna) ----
     if run_timestamp is not None:
         if not re.fullmatch(r"\d{8}_\d{6}(?:_[A-Za-z0-9]+)?", run_timestamp):
             raise ValueError(
@@ -483,7 +456,6 @@ def run_benchmark(
     )
     out.mkdir(parents=True, exist_ok=True)
 
-    # Configure logging to the out_dir as well as stdout.
     log_path = out / "train.log"
     logging.basicConfig(
         level=logging.INFO,
@@ -496,7 +468,7 @@ def run_benchmark(
     )
 
     logger.info("=" * 60)
-    logger.info("CeLEry training-phase")
+    logger.info("CeLEry training-phase (multi-slice global, LUNA protocol)")
     logger.info("=" * 60)
     logger.info(f"  data_dir       : {data_path}")
     logger.info(f"  output_dir     : {out}")
@@ -507,34 +479,24 @@ def run_benchmark(
     logger.info(f"  learning_rate  : {learning_rate}")
     logger.info(f"  hidden_dims    : {hidden_dims}")
     logger.info(f"  num_workers    : {num_workers}")
-    if exclude_test_files:
-        logger.info(f"  exclude_test_files : {exclude_test_files}")
     logger.info("=" * 60)
 
     tracker = _RuntimeTracker()
 
     # ---- wandb init ----
-    # Mirrors run_novosparc_pipeline.py's pattern: try-import + try-init
-    # so a wandb failure (auth, network, etc.) downgrades to "log
-    # locally only" instead of taking down the whole training run.
-    # The wandb run carries the same TS the on-disk artifacts use, so
-    # a wandb run page and the artifacts dir pair up at a glance.
     use_wandb = wandb_mode != "disabled"
     wandb_run_obj = None
     if use_wandb:
         try:
             import wandb  # type: ignore
             wandb_run_obj = wandb.init(
-                # Default project = "celery". Distinct from the scgg
-                # project so the CeLEry-vs-scgg comparison rows don't
-                # share a wandb table. Override at submission time
-                # with --wandb_project <other>.
                 project=wandb_project or "celery",
                 name=wandb_run_name or run_name,
                 mode=wandb_mode,
                 config={
                     "method": "celery",
                     "phase": "training",
+                    "training_mode": "multi_slice_global",
                     "data_dir": str(data_path),
                     "seed": seed,
                     "num_epochs_max": num_epochs_max,
@@ -542,11 +504,9 @@ def run_benchmark(
                     "learning_rate": learning_rate,
                     "hidden_dims": list(hidden_dims),
                     "num_workers": num_workers,
-                    "exclude_test_files": exclude_test_files or [],
                     "run_timestamp": run_ts,
                     "output_dir": str(out),
-                    # Tags useful for filtering in the wandb UI.
-                    "tags": ["celery", "training", dataset_name],
+                    "tags": ["celery", "training", dataset_name, "multi_slice"],
                 },
             )
             logger.info(f"wandb initialised: {wandb_run_obj.url}")
@@ -554,103 +514,55 @@ def run_benchmark(
             logger.warning(f"wandb init failed: {e}; continuing without wandb")
             use_wandb = False
 
-    # ---- 2. Discover train + test slices ----
+    # ---- Discover train + test slices ----
     with tracker.phase("discover_h5ads", flush_to=out / "runtime.csv"):
         train_files = _discover_split_files(data_path, "train")
         test_files = _discover_split_files(data_path, "test")
+        # exclude_test_files applies to the INFERENCE phase, not
+        # training — but we record the count here for the manifest /
+        # metrics.csv.
         if exclude_test_files:
             excluded_set = set(exclude_test_files)
-            kept = [p for p in test_files if p.name not in excluded_set]
-            dropped = [p.name for p in test_files if p.name in excluded_set]
-            if dropped:
-                logger.info(
-                    f"--exclude_test_files dropped {len(dropped)} file(s): {dropped}"
-                )
-            unmatched = excluded_set - set(dropped)
-            if unmatched:
-                logger.warning(
-                    f"--exclude_test_files entries did NOT match any "
-                    f"*_test.h5ad: {sorted(unmatched)}"
-                )
-            test_files = kept
-
-        logger.info(f"  found {len(train_files)} train slice(s)")
-        logger.info(f"  found {len(test_files)} test slice(s)")
-        if not train_files or not test_files:
-            raise RuntimeError("no train or test slices to score against")
-
-    # ---- 3. Assign references ----
-    with tracker.phase("assign_references", flush_to=out / "runtime.csv"):
-        assignments = _assign_references(train_files, test_files, seed=seed)
-        assn_table = pd.DataFrame([asdict(a) for a in assignments])
-        assn_path = out / "ref_assignments.csv"
-        assn_table.to_csv(assn_path, index=False)
-        logger.info(f"  wrote {assn_path}")
-
-    # ---- 4. Train one CeLEry per test slice ----
-    ckpt_dir = out / "celery_models"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    train_info_rows: List[Dict[str, float]] = []
-    with tracker.phase("training", flush_to=out / "runtime.csv"):
-        for idx, asn in enumerate(assignments, start=1):
+            test_files_kept = [p for p in test_files if p.name not in excluded_set]
             logger.info(
-                f"[{idx}/{len(assignments)}] test={asn.test_slice}  "
-                f"ref={asn.ref_slice}"
+                f"  (note: --exclude_test_files {sorted(excluded_set)} will "
+                f"drop {len(test_files) - len(test_files_kept)} test slice(s) "
+                f"at inference time)"
             )
-            info = _train_one_slice(
-                asn,
-                ckpt_dir=ckpt_dir,
-                num_epochs_max=num_epochs_max,
-                batch_size=batch_size,
-                learning_rate=learning_rate,
-                hidden_dims=list(hidden_dims),
-                num_workers=num_workers,
-                seed=seed,
-            )
-            train_info_rows.append(info)
+        else:
+            test_files_kept = test_files
+        logger.info(f"  found {len(train_files)} train slice(s)")
+        logger.info(f"  found {len(test_files_kept)} test slice(s) "
+                    f"(after exclude_test_files)")
+        if not train_files:
+            raise RuntimeError("no train slices to train on")
 
-            # Per-slice wandb log. The ``slice_idx`` step counter lets
-            # the wandb UI plot train_seconds as a curve over the N
-            # per-slice trainings, so slowdowns / outliers stand out.
-            if use_wandb:
-                try:
-                    import wandb  # type: ignore
-                    wandb.log({
-                        "slice_idx": idx,
-                        "test_slice": info["test_slice"],
-                        "ref_slice": info["ref_slice"],
-                        f"train_seconds/{info['test_slice']}": info["train_seconds"],
-                        f"n_ref_cells/{info['test_slice']}": info["n_ref_cells"],
-                        f"n_qry_cells/{info['test_slice']}": info["n_qry_cells"],
-                        f"n_genes_common/{info['test_slice']}": info["n_genes_common"],
-                        # Scalar series the UI can plot as curves:
-                        "train_seconds_running_mean": float(
-                            np.mean([r["train_seconds"] for r in train_info_rows])
-                        ),
-                    })
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"wandb.log failed for {info['test_slice']}: {e}")
+    # ---- Train ONE global CeLEry model ----
+    with tracker.phase("training", flush_to=out / "runtime.csv"):
+        train_info = _train_global_model(
+            train_files=train_files,
+            out_dir=out,
+            num_epochs_max=num_epochs_max,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            hidden_dims=list(hidden_dims),
+            num_workers=num_workers,
+            seed=seed,
+        )
 
-    # ---- 5. Write the "best_model.ckpt" convenience symlink ----
-    # The pipeline orchestrator's checkpoint resolver expects a
-    # ``best_model.ckpt`` in the output_dir root. For CeLEry there
-    # isn't a single best model — we point the symlink at the
-    # checkpoints DIRECTORY so the orchestrator can pass that path
-    # to the inference subprocess, which then resolves per-slice.
+    # ---- best_model.ckpt symlink — points at the single model.obj.
+    # Pipeline orchestrator's _find_checkpoint(train_output_dir)
+    # resolves this to find the artifact to hand to inference.
     best_ptr = out / "best_model.ckpt"
     if best_ptr.exists() or best_ptr.is_symlink():
         best_ptr.unlink()
-    # Use a relative symlink so the file moves cleanly if the
-    # artifacts root is moved later.
-    os.symlink("celery_models", best_ptr)
-    logger.info(f"  pinned best_model.ckpt → celery_models/")
+    os.symlink("model.obj", best_ptr)
+    logger.info("  pinned best_model.ckpt → model.obj")
 
-    # ---- 6. Write summary CSVs ----
-    # config.yaml snapshot — mirrors run_luna_train.py's invocation snapshot.
-    config_path = out / "config.yaml"
-    config_path.write_text(yaml.safe_dump({
+    # ---- Summary CSVs ----
+    (out / "config.yaml").write_text(yaml.safe_dump({
         "method": "celery",
+        "training_mode": "multi_slice_global",
         "data_dir": str(data_path),
         "output_dir": str(out),
         "run_timestamp": run_ts,
@@ -665,44 +577,39 @@ def run_benchmark(
         "wandb_run_name": wandb_run_name,
         "exclude_test_files": exclude_test_files or [],
         "n_train_slices": len(train_files),
-        "n_test_slices": len(test_files),
+        "n_test_slices": len(test_files_kept),
     }, default_flow_style=False))
 
-    # train_info table — one row per test slice with per-slice
-    # training stats. Useful for sanity-checking that CeLEry didn't
-    # silently skip any slice.
-    train_info_df = pd.DataFrame(train_info_rows)
-    train_info_df.to_csv(out / "celery_train_info.csv", index=False)
-
-    # Training-side metrics.csv is intentionally a stub here —
-    # the per-slice Spearman comes from the SEPARATE inference
-    # subprocess (run_celery_inference.py), which uses these
-    # checkpoints. Mirrors the LUNA pipeline's mode=train_only
-    # convention.
     placeholder_metrics = {
         "method": "celery",
-        "n_test_slices": len(assignments),
-        "n_models_trained": len(train_info_rows),
+        "training_mode": "multi_slice_global",
+        "n_train_slices": len(train_files),
+        "n_test_slices": len(test_files_kept),
+        "n_train_cells_total": int(train_info["n_train_cells_total"]),
+        "train_seconds": float(train_info["train_seconds"]),
         "spearman_mean_of_medians": float("nan"),  # filled in by inference
     }
     pd.DataFrame([placeholder_metrics]).to_csv(out / "metrics.csv", index=False)
+    # Per-slice CSV is empty-ish at train time; populated by inference.
     pd.DataFrame([
-        {"section_label": r["test_slice"], "n_cells": r["n_qry_cells"]}
-        for r in train_info_rows
+        {"section_label": _section_label_from_filename(p), "n_cells": 0}
+        for p in test_files_kept
     ]).to_csv(out / "per_slice_metrics.csv", index=False)
     (out / "aggregate_metrics.json").write_text(json.dumps(
         placeholder_metrics, indent=2, default=str
     ))
 
-    # ---- 7. Compute requirements ----
+    # ---- Compute requirements ----
     peak = tracker.peak_summary()
     tracker.write_compute_requirements_csv(
         out / "compute_requirements.csv",
         method="CeLEry",
         run_timestamp=run_ts,
         extra={
+            "training_mode": "multi_slice_global",
             "n_train_slices": len(train_files),
-            "n_test_slices": len(test_files),
+            "n_test_slices": len(test_files_kept),
+            "n_train_cells_total": int(train_info["n_train_cells_total"]),
             "num_epochs_max": num_epochs_max,
             "batch_size": batch_size,
             "learning_rate": learning_rate,
@@ -716,20 +623,14 @@ def run_benchmark(
     logger.info("=" * 60)
 
     # ---- wandb finish ----
-    # Push aggregate counters + resource peaks into wandb.run.summary
-    # so the wandb run-overview table shows the comparison-friendly
-    # numbers without having to dig into per-step plots.
     if use_wandb:
         try:
             import wandb  # type: ignore
-            train_seconds = [r["train_seconds"] for r in train_info_rows]
             summary = {
-                "n_test_slices": len(assignments),
-                "n_models_trained": len(train_info_rows),
-                "train_seconds_total": float(np.sum(train_seconds)) if train_seconds else 0.0,
-                "train_seconds_mean": float(np.mean(train_seconds)) if train_seconds else 0.0,
-                "train_seconds_median": float(np.median(train_seconds)) if train_seconds else 0.0,
-                "train_seconds_max": float(np.max(train_seconds)) if train_seconds else 0.0,
+                "n_train_slices": len(train_files),
+                "n_test_slices": len(test_files_kept),
+                "n_train_cells_total": int(train_info["n_train_cells_total"]),
+                "train_seconds": float(train_info["train_seconds"]),
                 "peak_gpu_mib": peak.get("peak_gpu_mib"),
                 "peak_rss_mib": peak.get("peak_rss_mib"),
             }
@@ -755,76 +656,51 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument(
-        "--data_dir", required=True,
-        help="Silver h5ad directory containing *_train.h5ad and *_test.h5ad files.",
-    )
-    p.add_argument(
-        "--output_dir", default=None,
-        help="Where to write artifacts. Default: "
-             "<ARTIFACTS_ROOT>/<data_dir_name>/celery_model/<TS>/",
-    )
-    p.add_argument(
-        "--seed", type=int, default=0,
-        help="Seed for both the reference-slice random pick AND "
-             "CeLEry's internal seednum. Matches the LUNA paper's "
-             "shared-seed protocol.",
-    )
+    p.add_argument("--data_dir", required=True)
+    p.add_argument("--output_dir", default=None)
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--epochs", type=int, default=500,
-        help="num_epochs_max for CeLEry's Fit_cord. Default 500 "
-             "matches CeLEry's source-default. Aliased as --epochs "
-             "for cross-pipeline parity (LUNA + scgg use --epochs).",
+        help="num_epochs_max for CeLEry's Fit_cord. CeLEry source default 500.",
     )
     p.add_argument(
         "--batch_size", type=int, default=4,
-        help="CeLEry Fit_cord batch_size. Default 4 matches CeLEry's "
-             "source-default.",
+        help="CeLEry Fit_cord batch_size. CeLEry source default 4. "
+             "With multi-slice training and ~165k cells (33 MMC slices "
+             "× ~5000), larger batches (32-128) are typically faster "
+             "without quality loss — worth tuning.",
     )
     p.add_argument(
         "--lr", type=float, default=1e-3,
-        help="CeLEry initial_learning_rate. Default 1e-3.",
+        help="initial_learning_rate. CeLEry source default 1e-3. "
+             "LUNA's Supp Note 2 hyperparameter sweep tested "
+             "5e-5..1.0 across 9 values; the best for MMC is in "
+             "Supp Note 2 (we use the source default here).",
     )
     p.add_argument(
         "--hidden_dims", type=int, nargs="+", default=[30, 25, 15],
-        help="Hidden-layer widths for CeLEry's MLP. Default "
-             "[30, 25, 15] matches the CeLEry paper's "
-             "2-D coordinate-regression head.",
+        help="3 hidden-layer widths. CeLEry's DNN.__init__ hardcodes "
+             "exactly 3 layers; longer lists raise IndexError. "
+             "LUNA's Supp Note 2 swept latent dim ∈ {32, 64, 128, 256} "
+             "and n_layers ∈ {3, 4, 5, 7, 8, 9, 10} — but >3 layers "
+             "requires patching CeLEry's DNN class.",
     )
-    p.add_argument(
-        "--num_workers", type=int, default=0,
-        help="DataLoader num_workers for CeLEry. Default 0 — keeps "
-             "memory usage predictable on LSF and avoids fork-based "
-             "RSS multiplication on large data.",
-    )
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument(
         "--wandb_run_name", "--run_name",
         dest="wandb_run_name", default=None,
-        help="Run name (forwarded to wandb if --wandb_mode != disabled).",
     )
     p.add_argument(
         "--wandb_mode", default="disabled",
         choices=("disabled", "online", "offline", "dryrun"),
-        help="wandb mode (default 'disabled' — CeLEry doesn't log "
-             "training-loss curves natively, so wandb gets only "
-             "config + summary metrics).",
     )
-    p.add_argument(
-        "--wandb_project", default=None,
-        help="wandb project. Default: scgg.",
-    )
+    p.add_argument("--wandb_project", default=None)
     p.add_argument(
         "--exclude_test_files", default=None,
-        help="Comma-separated *_test.h5ad basenames to drop before "
-             "training. Mirrors the same flag on scgg/luna; useful "
-             "for skipping too-large slices on CNS data.",
+        help="Comma-separated *_test.h5ad basenames; affects inference only "
+             "(CeLEry trains on ALL train slices regardless).",
     )
-    p.add_argument(
-        "--run_timestamp", default=None,
-        help="Optional YYYYMMDD_HHMMSS timestamp. Pinned by the LSF "
-             "submitter so the LSF logs, the artifacts dir, and the "
-             "wandb tag all share one TS.",
-    )
+    p.add_argument("--run_timestamp", default=None)
     return p.parse_args(argv)
 
 
@@ -847,9 +723,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             hidden_dims=tuple(args.hidden_dims),
             num_workers=args.num_workers,
             wandb_mode=args.wandb_mode,
-            # CLI-side default = "celery"; mirrors the wandb.init
-            # default above. Users who want CeLEry runs in the scgg
-            # project pass --wandb_project scgg explicitly.
             wandb_project=args.wandb_project or "celery",
             wandb_run_name=args.wandb_run_name,
             run_name=args.wandb_run_name,
