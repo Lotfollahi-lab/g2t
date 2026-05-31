@@ -317,7 +317,11 @@ def run_inference(
         try:
             import wandb  # type: ignore
             wandb_run_obj = wandb.init(
-                project=wandb_project or "scgg",
+                # Default project = "celery". Same convention as the
+                # train phase — keeps the CeLEry-vs-scgg comparison
+                # rows out of each other's wandb tables. Override
+                # with --wandb_project <other>.
+                project=wandb_project or "celery",
                 name=wandb_run_name,
                 mode=wandb_mode,
                 config={
@@ -606,7 +610,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             output_dir=args.output_dir,
             seed=args.seed,
             wandb_mode=args.wandb_mode,
-            wandb_project=args.wandb_project or "scgg",
+            # Mirrors the train script's default — see comments there.
+            wandb_project=args.wandb_project or "celery",
             wandb_run_name=args.wandb_run_name,
             n_inference_samples=args.n_inference_samples,
             exclude_test_files=exclude_test_files,

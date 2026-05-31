@@ -180,17 +180,26 @@ def _load_h5ad_for_celery(
 ):
     """Read a silver h5ad and arrange it for CeLEry.
 
+    Silver h5ads in this repo store spatial coordinates in
+    ``adata.obsm['spatial']`` (the canonical scanpy layout) by
+    convention; some older or method-specific h5ads instead carry
+    them as ``obs['coord_X'] / obs['coord_Y']`` columns. We prefer
+    obsm['spatial'] and fall back to obs columns — same precedence
+    as run_novosparc_pipeline.py and run_luna_train.py use.
+
     CeLEry's ``Fit_cord`` / ``Predict_cord`` reads coordinates from
     the first two columns of ``data_train.obs`` POSITIONALLY (it
     ignores column names — see CeLEry/datasetgenemap.py). So we
-    construct a DataFrame whose first two columns are exactly
-    ``coord_X`` and ``coord_Y``, preserving every other obs column
-    behind them.
+    INJECT the coords as the first two obs columns (overwriting
+    any existing ``coord_X`` / ``coord_Y`` of the same name, if
+    they exist) so CeLEry sees them at obs[:, 0:2].
 
     Args:
-        h5ad_path: path to a silver h5ad (must have ``obs`` with the
-            coord columns + ``X`` cells×genes).
-        coord_keys: (x_col, y_col) names in adata.obs.
+        h5ad_path: path to a silver h5ad. Coords must live at one of:
+            - ``adata.obsm['spatial']`` (preferred), or
+            - ``adata.obs[coord_keys[0]]`` + ``adata.obs[coord_keys[1]]``.
+        coord_keys: (x_col, y_col) fallback names + the names used
+            for the injected obs columns CeLEry will read positionally.
 
     Returns:
         (adata, x_min, x_max, y_min, y_max)
@@ -203,18 +212,39 @@ def _load_h5ad_for_celery(
 
     adata = sc.read(h5ad_path)
     obs = adata.obs.copy()
-    if coord_keys[0] not in obs.columns or coord_keys[1] not in obs.columns:
-        raise KeyError(
-            f"{h5ad_path}: obs missing coord columns {coord_keys}; "
-            f"have {list(obs.columns)}"
-        )
-    # Force x/y to columns 0/1 — CeLEry reads positionally.
-    other_cols = [c for c in obs.columns if c not in coord_keys]
-    obs = obs[[coord_keys[0], coord_keys[1], *other_cols]]
-    adata.obs = obs
 
-    x = obs[coord_keys[0]].to_numpy(dtype=np.float64)
-    y = obs[coord_keys[1]].to_numpy(dtype=np.float64)
+    if "spatial" in adata.obsm_keys():
+        spatial = np.asarray(adata.obsm["spatial"], dtype=np.float64)
+        if spatial.ndim != 2 or spatial.shape[1] < 2:
+            raise ValueError(
+                f"{h5ad_path}: obsm['spatial'] has unexpected shape "
+                f"{spatial.shape}; expected (N, 2) or (N, >=2)."
+            )
+        x = spatial[:, 0]
+        y = spatial[:, 1]
+    elif coord_keys[0] in obs.columns and coord_keys[1] in obs.columns:
+        x = obs[coord_keys[0]].to_numpy(dtype=np.float64)
+        y = obs[coord_keys[1]].to_numpy(dtype=np.float64)
+    else:
+        raise KeyError(
+            f"{h5ad_path}: no spatial coordinates found. Expected "
+            f"adata.obsm['spatial'] (preferred) OR "
+            f"adata.obs[{coord_keys[0]!r}] + adata.obs[{coord_keys[1]!r}]. "
+            f"Have obs columns: {list(obs.columns)}, "
+            f"obsm keys: {list(adata.obsm_keys())}"
+        )
+
+    # Inject (and overwrite if present) coord_X / coord_Y as obs cols 0/1
+    # so CeLEry's positional indexing picks them up. Preserve all other
+    # obs columns behind them.
+    other_cols = [c for c in obs.columns if c not in coord_keys]
+    obs_new = pd.DataFrame(index=obs.index)
+    obs_new[coord_keys[0]] = x
+    obs_new[coord_keys[1]] = y
+    for c in other_cols:
+        obs_new[c] = obs[c].values
+    adata.obs = obs_new
+
     return adata, float(x.min()), float(x.max()), float(y.min()), float(y.max())
 
 
@@ -477,7 +507,11 @@ def run_benchmark(
         try:
             import wandb  # type: ignore
             wandb_run_obj = wandb.init(
-                project=wandb_project or "scgg",
+                # Default project = "celery". Distinct from the scgg
+                # project so the CeLEry-vs-scgg comparison rows don't
+                # share a wandb table. Override at submission time
+                # with --wandb_project <other>.
+                project=wandb_project or "celery",
                 name=wandb_run_name or run_name,
                 mode=wandb_mode,
                 config={
@@ -795,7 +829,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             hidden_dims=tuple(args.hidden_dims),
             num_workers=args.num_workers,
             wandb_mode=args.wandb_mode,
-            wandb_project=args.wandb_project or "scgg",
+            # CLI-side default = "celery"; mirrors the wandb.init
+            # default above. Users who want CeLEry runs in the scgg
+            # project pass --wandb_project scgg explicitly.
+            wandb_project=args.wandb_project or "celery",
             wandb_run_name=args.wandb_run_name,
             run_name=args.wandb_run_name,
             exclude_test_files=exclude_test_files,
