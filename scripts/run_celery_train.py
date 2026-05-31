@@ -234,16 +234,34 @@ def _load_h5ad_for_celery(
             f"obsm keys: {list(adata.obsm_keys())}"
         )
 
-    # Inject (and overwrite if present) coord_X / coord_Y as obs cols 0/1
-    # so CeLEry's positional indexing picks them up. Preserve all other
-    # obs columns behind them.
-    other_cols = [c for c in obs.columns if c not in coord_keys]
-    obs_new = pd.DataFrame(index=obs.index)
-    obs_new[coord_keys[0]] = x
-    obs_new[coord_keys[1]] = y
-    for c in other_cols:
-        obs_new[c] = obs[c].values
+    # ── Build a STRIPPED obs DataFrame with ONLY the coord columns ──
+    # CeLEry's wrap_gene_location() does
+    #     cord = adata.obs.to_numpy().astype('float32')
+    # when location_data is None (which Fit_cord / Predict_cord always
+    # do internally). That means EVERY column of obs has to be
+    # float-castable — leaving in cell_class / sample_id / mouse /
+    # _bronze_row_pos triggers ValueError: could not convert string
+    # to float: 'Other'.
+    #
+    # So we restrict obs to JUST (coord_X, coord_Y) for the CeLEry
+    # call, and stash the original cell_class array under
+    # adata.uns['_celery_cell_class'] so the inference path can
+    # recover it for metadata_true.csv.
+    if "cell_class" in obs.columns:
+        cell_class_array = obs["cell_class"].astype(str).to_numpy()
+    else:
+        cell_class_array = None
+
+    obs_new = pd.DataFrame(
+        {coord_keys[0]: x, coord_keys[1]: y},
+        index=obs.index,
+    )
     adata.obs = obs_new
+    if cell_class_array is not None:
+        # Stash as numpy in uns — anndata serialises numpy arrays in
+        # uns without issue, and inference's _infer_one_slice reads
+        # this back to populate metadata_true.csv's cell_class column.
+        adata.uns["_celery_cell_class"] = cell_class_array
 
     return adata, float(x.min()), float(x.max()), float(y.min()), float(y.max())
 

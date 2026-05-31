@@ -198,11 +198,23 @@ def _infer_one_slice(
 
     # Build metadata DFs in the exact schema scgg/luna pipelines write.
     obs = adata_qry.obs
-    cell_class_col = "cell_class" if "cell_class" in obs.columns else None
+    # cell_class was stashed in adata.uns['_celery_cell_class'] by
+    # _load_h5ad_for_celery (the loader strips obs to JUST coord_X/Y
+    # because CeLEry's internal wrap_gene_location can't handle
+    # non-numeric obs columns — see comment in run_celery_train.py).
+    # Fall back to obs[cell_class] for legacy h5ads where the loader
+    # didn't run, or where cell_class was never present.
+    if "_celery_cell_class" in adata_qry.uns:
+        cell_class_array = np.asarray(adata_qry.uns["_celery_cell_class"])
+    elif "cell_class" in obs.columns:
+        cell_class_array = obs["cell_class"].to_numpy()
+    else:
+        cell_class_array = None
+
     df_pred = pd.DataFrame({
         "coord_X": pred_orig_scale[:, 0],
         "coord_Y": pred_orig_scale[:, 1],
-        **({"cell_class": obs[cell_class_col].to_numpy()} if cell_class_col else {}),
+        **({"cell_class": cell_class_array} if cell_class_array is not None else {}),
     }, index=obs.index)
     df_pred.index.name = "cell_ID"
 
@@ -210,7 +222,7 @@ def _infer_one_slice(
     df_true = pd.DataFrame({
         "coord_X": obs.iloc[:, 0].to_numpy(dtype=np.float64),
         "coord_Y": obs.iloc[:, 1].to_numpy(dtype=np.float64),
-        **({"cell_class": obs[cell_class_col].to_numpy()} if cell_class_col else {}),
+        **({"cell_class": cell_class_array} if cell_class_array is not None else {}),
     }, index=obs.index)
     df_true.index.name = "cell_ID"
 
