@@ -399,22 +399,55 @@ def main() -> int:
         sys.exit("--train_csv and --test_csv must be passed together.")
 
     # ---- Pin a single timestamp and on-disk location ----
-    # When --run_timestamp is passed, use it verbatim (lets the LSF
-    # submit script pre-compute the TS and pin its log dir to the
-    # same path). Otherwise generate one fresh here. Either way the
-    # training and inference outputs share a single TS so they pair
-    # up by eye in the artifacts tree.
+    # Three sources, in order of precedence:
+    #   1. ``--run_timestamp`` explicit — lets the LSF submit script
+    #      pre-compute a TS and pin its log dir to the same path.
+    #   2. When ``--skip_training`` is set, regex-extract the TS from
+    #      the ``--checkpoint`` path — so an inference-only recovery
+    #      run lands under the SAME ``<TS>/`` as the original training
+    #      (i.e. ``scgg_inference/<old_TS>/`` pairs with
+    #      ``scgg_model/<old_TS>/``). This is the behaviour the user
+    #      almost always wants for "fix the failed inference"
+    #      workflows — without it the recovery run gets a fresh TS
+    #      and the train↔infer pairing is broken visually.
+    #   3. Fresh wall-clock — fresh train+infer run with no external
+    #      pin.
+    import re as _re
+    _TS_RE = r"\d{8}_\d{6}(?:_[A-Za-z0-9]+)?"
     if args.run_timestamp:
         # Lightweight format check — downstream code (_luna_runner.py)
         # regex-extracts the TS from the checkpoint path looking for
         # YYYYMMDD_HHMMSS, so we enforce the same shape here.
-        import re as _re
-        if not _re.fullmatch(r"\d{8}_\d{6}(?:_[A-Za-z0-9]+)?", args.run_timestamp):
+        if not _re.fullmatch(_TS_RE, args.run_timestamp):
             sys.exit(
                 f"--run_timestamp must match YYYYMMDD_HHMMSS or "
                 f"YYYYMMDD_HHMMSS_<suffix>; got {args.run_timestamp!r}."
             )
         timestamp = args.run_timestamp
+    elif args.skip_training and args.checkpoint:
+        # Search the checkpoint path for the FIRST TS-shaped token.
+        # The pipeline's standard layout puts it at
+        # ``<ARTIFACTS>/<dataset>/scgg_model/<TS>/best_model.ckpt``,
+        # so the first match is the right one. If the checkpoint
+        # lives outside the artifacts tree (e.g. a manually-copied
+        # ckpt elsewhere), fall back to a fresh TS so we don't
+        # invent a path component out of thin air.
+        m = _re.search(_TS_RE, str(args.checkpoint))
+        if m:
+            timestamp = m.group(0)
+            logger.info(
+                f"[--skip_training] inherited timestamp {timestamp!r} "
+                f"from checkpoint path so inference artifacts pair with "
+                f"the original training run."
+            )
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            logger.warning(
+                f"[--skip_training] could not extract a YYYYMMDD_HHMMSS "
+                f"timestamp from --checkpoint={args.checkpoint!r}; "
+                f"using fresh wall-clock TS {timestamp!r} instead. "
+                f"Pass --run_timestamp=<TS> to override."
+            )
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     artifacts_root = Path(os.environ.get(
