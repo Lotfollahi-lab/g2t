@@ -60,6 +60,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -355,7 +356,7 @@ def _train_global_model(
     # ---- 3. Save manifest BEFORE training so a fit-crash still leaves
     # the bbox metadata on disk for debugging.
     manifest = {
-        "training_mode": "multi_slice_global",
+        "training_mode": "multi_slice",
         "n_train_slices": len(train_files),
         "n_train_cells_total": int(adata_concat.n_obs),
         "n_genes": int(adata_concat.n_vars),
@@ -410,6 +411,236 @@ def _train_global_model(
 
 
 # ---------------------------------------------------------------------------
+# Per-reference training mode (the LUNA main-text protocol's secondary
+# mode — for novosparc / tangram / cytospace; LUNA used multi_slice
+# for CeLEry specifically, but the per-reference mode is also useful
+# for comparison and was our original implementation).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _RefAssignment:
+    """One row of the per-test-slice reference assignment table.
+
+    Captured in ``celery_models/<test_slice>/manifest.json`` so reviewers
+    can audit exactly which (ref, test) pair each per-reference CeLEry
+    model was trained on. Reproducible from ``--seed``.
+    """
+    test_slice: str
+    test_path: str
+    ref_slice: str
+    ref_path: str
+
+
+def _assign_references(
+    train_files: List[Path],
+    test_files: List[Path],
+    seed: int,
+) -> List[_RefAssignment]:
+    """Pick a training slice for each test slice (seeded with-replacement).
+
+    Mirrors LUNA's "randomly selected a single slice from the training
+    mouse to serve as the reference, repeating the procedure for each
+    slice of the testing mouse" (paper §4). With-replacement sampling
+    handles the case where the train mouse has fewer slices than the
+    test mouse, though for MMC both have 30+ slices so it's
+    effectively without-replacement most of the time.
+    """
+    if not train_files:
+        raise ValueError("no training slices — cannot pick a CeLEry reference")
+    if not test_files:
+        raise ValueError("no test slices — nothing to evaluate")
+    rng = np.random.default_rng(seed)
+    train_indices = rng.integers(0, len(train_files), size=len(test_files))
+    return [
+        _RefAssignment(
+            test_slice=_section_label_from_filename(t),
+            test_path=str(t),
+            ref_slice=_section_label_from_filename(train_files[int(train_indices[i])]),
+            ref_path=str(train_files[int(train_indices[i])]),
+        )
+        for i, t in enumerate(test_files)
+    ]
+
+
+def _train_one_slice_per_reference(
+    assignment: _RefAssignment,
+    ckpt_dir: Path,
+    *,
+    num_epochs_max: int,
+    batch_size: int,
+    learning_rate: float,
+    hidden_dims: List[int],
+    num_workers: int,
+    seed: int,
+) -> Dict[str, object]:
+    """Train ONE CeLEry model on the reference→test pair for one test slice.
+
+    Saves ``model.obj`` + ``manifest.json`` under ``ckpt_dir/<test_slice>/``.
+    """
+    import CeLEry as cel  # type: ignore
+
+    slice_dir = ckpt_dir / assignment.test_slice
+    slice_dir.mkdir(parents=True, exist_ok=True)
+
+    ref_path = Path(assignment.ref_path)
+    qry_path = Path(assignment.test_path)
+
+    logger.info(f"    loading ref  : {ref_path.name}")
+    adata_ref, x_min, x_max, y_min, y_max = _load_h5ad_for_celery(ref_path)
+    logger.info(f"    loading qry  : {qry_path.name}")
+    adata_qry, _, _, _, _ = _load_h5ad_for_celery(qry_path)
+
+    # Restrict to common genes (matches multi-slice's deterministic
+    # sorted-intersection approach).
+    common = _common_genes_across_slices([adata_ref, adata_qry])
+    adata_ref = adata_ref[:, common].copy()
+    adata_qry = adata_qry[:, common].copy()
+    logger.info(
+        f"    ref={adata_ref.n_obs} cells, qry={adata_qry.n_obs} cells, "
+        f"common genes={len(common)}"
+    )
+
+    # Per-slice z-score (matches what test-time inference does — same
+    # bug fix as for multi_slice mode).
+    cel.get_zscore(adata_ref)
+    cel.get_zscore(adata_qry)
+
+    # Save manifest first so a fit-crash still leaves bbox metadata
+    # on disk for debugging.
+    manifest = {
+        **asdict(assignment),
+        "training_mode": "per_reference",
+        "x_min": x_min, "x_max": x_max,
+        "y_min": y_min, "y_max": y_max,
+        "n_ref_cells": int(adata_ref.n_obs),
+        "n_qry_cells": int(adata_qry.n_obs),
+        "n_genes_common": int(adata_ref.n_vars),
+        "var_names": list(adata_ref.var_names),
+        "celery_hparams": {
+            "num_epochs_max": num_epochs_max,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "hidden_dims": list(hidden_dims),
+            "num_workers": num_workers,
+            "seednum": seed,
+        },
+    }
+    (slice_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    t0 = time.perf_counter()
+    cel.Fit_cord(
+        data_train=adata_ref,
+        hidden_dims=list(hidden_dims),
+        num_epochs_max=int(num_epochs_max),
+        batch_size=int(batch_size),
+        num_workers=int(num_workers),
+        initial_learning_rate=float(learning_rate),
+        path=str(slice_dir),
+        filename="model",
+        seednum=int(seed),
+    )
+    dt = time.perf_counter() - t0
+    logger.info(f"    trained in {dt:.1f}s")
+
+    ckpt = slice_dir / "model.obj"
+    if not ckpt.exists():
+        raise RuntimeError(
+            f"CeLEry training completed but no checkpoint at {ckpt}. "
+            f"Check the CeLEry stderr above."
+        )
+
+    return {
+        "test_slice": assignment.test_slice,
+        "ref_slice": assignment.ref_slice,
+        "train_seconds": dt,
+        "n_ref_cells": int(adata_ref.n_obs),
+        "n_qry_cells": int(adata_qry.n_obs),
+        "n_genes_common": int(adata_ref.n_vars),
+    }
+
+
+def _train_per_reference(
+    train_files: List[Path],
+    test_files: List[Path],
+    out_dir: Path,
+    *,
+    num_epochs_max: int,
+    batch_size: int,
+    learning_rate: float,
+    hidden_dims: List[int],
+    num_workers: int,
+    seed: int,
+) -> Dict[str, object]:
+    """Train N CeLEry models (one per test slice with a random reference).
+
+    The original implementation, restored as the ``per_reference``
+    branch of the ``--training_mode`` flag. Each per-test-slice
+    model lives at ``out_dir/celery_models/<test_slice>/model.obj``.
+    A top-level ``manifest.json`` records the assignments + which
+    training_mode this dir was built with (so inference can dispatch
+    correctly).
+    """
+    assignments = _assign_references(train_files, test_files, seed=seed)
+    ckpt_dir = out_dir / "celery_models"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-slice assignment table for reproducibility audits.
+    assn_table = pd.DataFrame([asdict(a) for a in assignments])
+    assn_table.to_csv(out_dir / "ref_assignments.csv", index=False)
+    logger.info(f"  wrote {out_dir / 'ref_assignments.csv'}")
+
+    train_info_rows: List[Dict[str, float]] = []
+    for idx, asn in enumerate(assignments, start=1):
+        logger.info(
+            f"[{idx}/{len(assignments)}] test={asn.test_slice}  "
+            f"ref={asn.ref_slice}"
+        )
+        info = _train_one_slice_per_reference(
+            asn,
+            ckpt_dir=ckpt_dir,
+            num_epochs_max=num_epochs_max,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            hidden_dims=list(hidden_dims),
+            num_workers=num_workers,
+            seed=seed,
+        )
+        train_info_rows.append(info)
+
+    # Top-level manifest — lets inference detect mode without
+    # walking the celery_models/ tree.
+    (out_dir / "manifest.json").write_text(json.dumps({
+        "training_mode": "per_reference",
+        "n_train_slices_pool": len(train_files),
+        "n_models_trained": len(train_info_rows),
+        "n_test_slices": len(test_files),
+        "celery_hparams": {
+            "num_epochs_max": num_epochs_max,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "hidden_dims": list(hidden_dims),
+            "num_workers": num_workers,
+            "seednum": seed,
+        },
+    }, indent=2))
+
+    train_info_df = pd.DataFrame(train_info_rows)
+    train_info_df.to_csv(out_dir / "celery_train_info.csv", index=False)
+
+    total_train_seconds = float(
+        sum(r["train_seconds"] for r in train_info_rows)
+    )
+    total_train_cells = int(sum(r["n_ref_cells"] for r in train_info_rows))
+
+    return {
+        "train_seconds": total_train_seconds,
+        "n_train_slices": len(train_files),
+        "n_train_cells_total": total_train_cells,
+        "n_models_trained": len(train_info_rows),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main training driver
 # ---------------------------------------------------------------------------
 
@@ -422,6 +653,7 @@ def run_benchmark(
     learning_rate: float = 1e-3,
     hidden_dims: Tuple[int, ...] = (30, 25, 15),
     num_workers: int = 0,
+    training_mode: str = "multi_slice",
     wandb_mode: str = "disabled",
     wandb_project: Optional[str] = None,
     wandb_run_name: Optional[str] = None,
@@ -512,7 +744,7 @@ def run_benchmark(
                 config={
                     "method": "celery",
                     "phase": "training",
-                    "training_mode": "multi_slice_global",
+                    "training_mode": training_mode,
                     "data_dir": str(data_path),
                     "seed": seed,
                     "num_epochs_max": num_epochs_max,
@@ -553,32 +785,63 @@ def run_benchmark(
         if not train_files:
             raise RuntimeError("no train slices to train on")
 
-    # ---- Train ONE global CeLEry model ----
-    with tracker.phase("training", flush_to=out / "runtime.csv"):
-        train_info = _train_global_model(
-            train_files=train_files,
-            out_dir=out,
-            num_epochs_max=num_epochs_max,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-            hidden_dims=list(hidden_dims),
-            num_workers=num_workers,
-            seed=seed,
+    # ---- Validate training mode ----
+    training_mode = str(training_mode).lower()
+    if training_mode not in ("multi_slice", "per_reference"):
+        raise ValueError(
+            f"training_mode must be 'multi_slice' or 'per_reference'; "
+            f"got {training_mode!r}"
         )
+    logger.info(f"  training_mode  : {training_mode}")
 
-    # ---- best_model.ckpt symlink — points at the single model.obj.
-    # Pipeline orchestrator's _find_checkpoint(train_output_dir)
-    # resolves this to find the artifact to hand to inference.
+    # ---- Train ----
+    # ``multi_slice`` (LUNA Supp Note 2 protocol): one global model on
+    # all train slices concatenated; best_model.ckpt → model.obj.
+    # ``per_reference``: N models, one per test slice, each trained
+    # on a randomly-selected single training slice as reference;
+    # best_model.ckpt → celery_models/.
+    with tracker.phase("training", flush_to=out / "runtime.csv"):
+        if training_mode == "multi_slice":
+            train_info = _train_global_model(
+                train_files=train_files,
+                out_dir=out,
+                num_epochs_max=num_epochs_max,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                hidden_dims=list(hidden_dims),
+                num_workers=num_workers,
+                seed=seed,
+            )
+        else:
+            train_info = _train_per_reference(
+                train_files=train_files,
+                test_files=test_files_kept,
+                out_dir=out,
+                num_epochs_max=num_epochs_max,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                hidden_dims=list(hidden_dims),
+                num_workers=num_workers,
+                seed=seed,
+            )
+
+    # ---- best_model.ckpt symlink ----
+    # multi_slice → model.obj (single file)
+    # per_reference → celery_models/ (directory containing per-test-slice subdirs)
     best_ptr = out / "best_model.ckpt"
     if best_ptr.exists() or best_ptr.is_symlink():
         best_ptr.unlink()
-    os.symlink("model.obj", best_ptr)
-    logger.info("  pinned best_model.ckpt → model.obj")
+    if training_mode == "multi_slice":
+        os.symlink("model.obj", best_ptr)
+        logger.info("  pinned best_model.ckpt → model.obj")
+    else:
+        os.symlink("celery_models", best_ptr)
+        logger.info("  pinned best_model.ckpt → celery_models/")
 
     # ---- Summary CSVs ----
     (out / "config.yaml").write_text(yaml.safe_dump({
         "method": "celery",
-        "training_mode": "multi_slice_global",
+        "training_mode": training_mode,
         "data_dir": str(data_path),
         "output_dir": str(out),
         "run_timestamp": run_ts,
@@ -598,7 +861,7 @@ def run_benchmark(
 
     placeholder_metrics = {
         "method": "celery",
-        "training_mode": "multi_slice_global",
+        "training_mode": training_mode,
         "n_train_slices": len(train_files),
         "n_test_slices": len(test_files_kept),
         "n_train_cells_total": int(train_info["n_train_cells_total"]),
@@ -622,7 +885,7 @@ def run_benchmark(
         method="CeLEry",
         run_timestamp=run_ts,
         extra={
-            "training_mode": "multi_slice_global",
+            "training_mode": training_mode,
             "n_train_slices": len(train_files),
             "n_test_slices": len(test_files_kept),
             "n_train_cells_total": int(train_info["n_train_cells_total"]),
@@ -703,6 +966,17 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument(
+        "--training_mode", default="multi_slice",
+        choices=("multi_slice", "per_reference"),
+        help="multi_slice: one global model trained on the concat of "
+             "all training slices (LUNA Supp Note 2 protocol for "
+             "CeLEry). per_reference: N models, one per test slice "
+             "with a randomly-selected single training slice as "
+             "reference (the protocol LUNA's paper uses for "
+             "novosparc/tangram/cytospace — and our original "
+             "CeLEry implementation). Default: multi_slice.",
+    )
+    p.add_argument(
         "--wandb_run_name", "--run_name",
         dest="wandb_run_name", default=None,
     )
@@ -738,6 +1012,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             learning_rate=args.lr,
             hidden_dims=tuple(args.hidden_dims),
             num_workers=args.num_workers,
+            training_mode=args.training_mode,
             wandb_mode=args.wandb_mode,
             wandb_project=args.wandb_project or "celery",
             wandb_run_name=args.wandb_run_name,

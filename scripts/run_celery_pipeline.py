@@ -92,6 +92,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "internal seednum. Same-seed runs reproduce the exact "
              "per-test-slice reference assignment.",
     )
+    p.add_argument(
+        "--training_mode", default="multi_slice",
+        choices=("multi_slice", "per_reference"),
+        help="multi_slice (default, LUNA Supp Note 2 protocol for "
+             "CeLEry): one global model on the concat of all training "
+             "slices. per_reference: N models, one per test slice, "
+             "each trained on a randomly-selected single training "
+             "slice. Inference auto-detects the mode from the "
+             "training run's manifest.json.",
+    )
 
     # ---- Wandb ----
     p.add_argument("--wandb_project", default=None)
@@ -181,6 +191,8 @@ def _build_train_cmd(
         cmd += ["--hidden_dims", *[str(d) for d in args.hidden_dims]]
     if args.num_workers is not None:
         cmd += ["--num_workers", str(args.num_workers)]
+    if args.training_mode:
+        cmd += ["--training_mode", args.training_mode]
     if args.wandb_project:
         cmd += ["--wandb_project", args.wandb_project]
     if args.wandb_run_name:

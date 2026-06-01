@@ -23,7 +23,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -68,51 +68,84 @@ _ARTIFACTS_ROOT = Path(
 # Checkpoint resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_celery_model_path(checkpoint: Path):
-    """Resolve --checkpoint to (model_dir, model_filename_stem).
+def _resolve_celery_checkpoint(checkpoint: Path):
+    """Resolve --checkpoint to (mode, root_dir, top_manifest).
 
-    The new training script writes ``model.obj`` at the output_dir
-    root + a ``best_model.ckpt`` symlink pointing at it. So:
-      - --checkpoint = best_model.ckpt symlink → follow it.
-      - --checkpoint = model.obj path → use it directly.
-      - --checkpoint = directory containing model.obj → use that file.
+    Supports BOTH training modes:
+      - ``multi_slice``: best_model.ckpt → model.obj at the run root.
+        Returns (mode="multi_slice", root_dir=<dir containing model.obj>,
+        top_manifest=<read manifest.json>).
+      - ``per_reference``: best_model.ckpt → celery_models/ directory
+        tree of per-test-slice subdirs. Returns
+        (mode="per_reference", root_dir=<celery_models dir>,
+        top_manifest=<read top-level manifest.json from parent>).
 
-    Returns:
-        (model_dir, filename_stem)
-        — model_dir is the path CeLEry's Predict_cord wants for ``path=``.
-        — filename_stem is what it wants for ``filename=`` (no .obj suffix).
+    Mode detection is via the ``training_mode`` field in the top-level
+    manifest.json, OR by inspecting the resolved filesystem layout
+    (model.obj file → multi_slice; celery_models/ dir → per_reference).
     """
     p = Path(checkpoint).resolve()
-    if p.is_file() and p.name == "model.obj":
-        return p.parent, "model"
-    if p.is_dir() and (p / "model.obj").is_file():
-        return p, "model"
-    if p.name == "best_model.ckpt":
-        # Resolve the symlink (or read the .ckpt itself if it's a regular file).
-        target = Path(os.readlink(p)) if p.is_symlink() else p
+
+    # First, follow symlinks if checkpoint is one.
+    if p.name == "best_model.ckpt" and p.is_symlink():
+        target = Path(os.readlink(p))
         if not target.is_absolute():
             target = (p.parent / target).resolve()
-        if target.is_file() and target.name == "model.obj":
-            return target.parent, "model"
-        if target.is_dir() and (target / "model.obj").is_file():
-            return target, "model"
-    raise FileNotFoundError(
-        f"--checkpoint={checkpoint} does not resolve to a CeLEry model.obj. "
-        f"Expected: a path to model.obj, a directory containing model.obj, "
-        f"or the best_model.ckpt symlink pointing at one."
-    )
+        p_resolved = target
+        run_root = (p.parent).resolve()
+    elif p.name == "best_model.ckpt":
+        # Plain file at the symlink path (shouldn't happen but handle it).
+        p_resolved = p
+        run_root = p.parent
+    else:
+        p_resolved = p
+        run_root = p.parent if p.is_file() else p
 
-
-def _load_manifest(model_dir: Path) -> Dict:
-    """Read the training run's manifest.json (slice bboxes, hparams)."""
-    manifest_path = model_dir / "manifest.json"
-    if not manifest_path.exists():
+    # Identify mode by what p_resolved IS:
+    if p_resolved.is_file() and p_resolved.name == "model.obj":
+        # multi_slice: single global model.obj
+        mode = "multi_slice"
+        root_dir = p_resolved.parent  # dir containing model.obj
+    elif p_resolved.is_dir() and p_resolved.name == "celery_models":
+        # per_reference: directory of per-test-slice subdirs
+        mode = "per_reference"
+        root_dir = p_resolved
+        run_root = root_dir.parent
+    elif p_resolved.is_dir() and (p_resolved / "model.obj").is_file():
+        # User pointed at the run output dir directly (multi_slice).
+        mode = "multi_slice"
+        root_dir = p_resolved
+    elif p_resolved.is_dir() and (p_resolved / "celery_models").is_dir():
+        # User pointed at the run output dir directly (per_reference).
+        mode = "per_reference"
+        root_dir = p_resolved / "celery_models"
+        run_root = p_resolved
+    else:
         raise FileNotFoundError(
-            f"manifest.json missing at {manifest_path}. The training run "
-            f"either crashed before writing it or used an old per-test-slice "
-            f"protocol; re-run training with the current multi-slice script."
+            f"--checkpoint={checkpoint} (resolved={p_resolved}) doesn't "
+            f"look like a CeLEry checkpoint. Expected EITHER a model.obj "
+            f"file/dir (multi_slice) OR a celery_models/ directory tree "
+            f"(per_reference)."
         )
-    return json.loads(manifest_path.read_text())
+
+    # Read the top-level manifest (lives at run_root for both modes).
+    top_manifest_path = run_root / "manifest.json"
+    if not top_manifest_path.exists():
+        raise FileNotFoundError(
+            f"manifest.json missing at {top_manifest_path}. Training run "
+            f"may have crashed before writing it."
+        )
+    top_manifest = json.loads(top_manifest_path.read_text())
+    # Cross-check: prefer the manifest's declared mode over our
+    # filesystem-layout heuristic (in case of corruption / partial dirs).
+    if "training_mode" in top_manifest:
+        mode = top_manifest["training_mode"]
+        if mode not in ("multi_slice", "per_reference"):
+            raise ValueError(
+                f"manifest.json training_mode={mode!r} is unknown; "
+                f"expected 'multi_slice' or 'per_reference'."
+            )
+    return mode, root_dir, top_manifest
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +160,22 @@ def _infer_one_slice(
     train_var_names: List[str],
     out_slice_dir: Path,
     n_inference_samples: int,
+    inverse_bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> Dict[str, object]:
-    """Load test slice, predict with the global CeLEry model, score.
+    """Load test slice, predict with the supplied CeLEry model, score.
 
     Train-time gene order (from manifest.var_names) is the source of
     truth — we re-index the test AnnData to match before predicting,
     which is critical because CeLEry's MLP reads features positionally.
     A gene-order mismatch silently produces garbage predictions.
+
+    Args:
+        inverse_bbox: optional (x_min, x_max, y_min, y_max) to use for
+            inverse-transforming predictions back to original-scale
+            coordinates. If None, uses the TEST slice's own bbox
+            (the multi_slice convention). For per_reference, pass
+            the REF slice's bbox (since the model trained on the ref's
+            normalised frame).
     """
     import CeLEry as cel  # type: ignore
 
@@ -170,15 +212,21 @@ def _infer_one_slice(
         preds.append(np.asarray(pred_normed))
     pred_normed_mean = np.mean(np.stack(preds, axis=0), axis=0)
 
-    # ---- Inverse-transform to test slice's coord scale ----
-    # The model predicts in [0,1] (sigmoid output, training cells were
-    # per-slice normalised to [0,1] before concat). For RSSD on the
-    # ORIGINAL-scale truth, we need pred in original scale too. Use
-    # the TEST slice's own bounding box. Spearman / contact-F1 are
-    # rank- / percentile-based and unaffected by this transform; only
-    # RSSD needs scale parity.
+    # ---- Inverse-transform to a meaningful coord scale ----
+    # The model predicts in [0,1] (sigmoid output). For RSSD on the
+    # ORIGINAL-scale truth, we need pred in original scale too.
+    # - multi_slice: predictions are in the shared train-side
+    #   normalised frame; inverse with TEST slice's own bbox.
+    # - per_reference: predictions are in the REF slice's [0,1]
+    #   frame; inverse with REF slice's bbox.
+    # Spearman / contact-F1 are rank- / percentile-based and
+    # unaffected; only RSSD needs scale parity.
+    if inverse_bbox is not None:
+        ix_min, ix_max, iy_min, iy_max = inverse_bbox
+    else:
+        ix_min, ix_max, iy_min, iy_max = x_min, x_max, y_min, y_max
     pred_orig_scale = _invert_celery_normalisation(
-        pred_normed_mean, x_min, x_max, y_min, y_max,
+        pred_normed_mean, ix_min, ix_max, iy_min, iy_max,
     )
 
     # ---- Build metadata DataFrames (same schema scgg/luna write) ----
@@ -243,16 +291,25 @@ def run_inference(
     if not data_path.exists():
         raise FileNotFoundError(f"--data_dir not found: {data_path}")
 
-    model_dir, filename_stem = _resolve_celery_model_path(Path(checkpoint))
-    logger.info(f"model_dir: {model_dir}, filename: {filename_stem}.obj")
-    manifest = _load_manifest(model_dir)
-    train_var_names = manifest.get("var_names", [])
-    if not train_var_names:
-        raise ValueError(
-            f"manifest.json at {model_dir}/manifest.json has no 'var_names'. "
-            f"This means the training run used an older script; re-run "
-            f"training with the current multi-slice script."
-        )
+    training_mode, root_dir, top_manifest = _resolve_celery_checkpoint(Path(checkpoint))
+    logger.info(f"training_mode: {training_mode}, root_dir: {root_dir}")
+
+    # For multi_slice, var_names + filename_stem are at the top-level
+    # manifest. For per_reference, each per-test-slice subdir has
+    # its own manifest with the (potentially) slice-specific var_names.
+    if training_mode == "multi_slice":
+        train_var_names = top_manifest.get("var_names", [])
+        if not train_var_names:
+            raise ValueError(
+                f"manifest.json at {root_dir}/manifest.json has no "
+                f"'var_names'. Re-run training to regenerate."
+            )
+        filename_stem = "model"
+    else:  # per_reference
+        # var_names + per-slice bboxes come from each
+        # celery_models/<slice>/manifest.json lazily at inference time.
+        train_var_names = None  # signals "look up per-slice"
+        filename_stem = "model"
 
     # ---- TS resolution ----
     if run_timestamp is not None:
@@ -310,7 +367,7 @@ def run_inference(
                 config={
                     "method": "celery",
                     "phase": "inference",
-                    "training_mode": "multi_slice_global",
+                    "training_mode": training_mode,
                     "data_dir": str(data_path),
                     "model_dir": str(model_dir),
                     "seed": seed,
@@ -359,14 +416,54 @@ def run_inference(
             slice_label = _section_label_from_filename(test_h5ad)
             try:
                 logger.info(f"[{idx}/{len(test_files)}] {slice_label}")
+
+                # Per-mode dispatch:
+                # - multi_slice: ONE model_dir for all slices, var_names
+                #   + inverse_bbox come from each TEST slice's own
+                #   bbox (computed at load time).
+                # - per_reference: model_dir is celery_models/<slice>/,
+                #   var_names + inverse_bbox come from THAT slice's
+                #   own manifest.json (the ref's bbox, not the
+                #   test's — because the per-reference model trained
+                #   on the ref's normalised frame).
+                if training_mode == "multi_slice":
+                    slice_model_dir = root_dir
+                    slice_train_var_names = train_var_names
+                    slice_inverse_bbox = None  # → use test's own bbox
+                else:  # per_reference
+                    slice_model_dir = root_dir / slice_label
+                    per_slice_manifest_path = slice_model_dir / "manifest.json"
+                    if not per_slice_manifest_path.exists():
+                        raise FileNotFoundError(
+                            f"per_reference checkpoint for slice {slice_label} "
+                            f"is missing: {per_slice_manifest_path}. "
+                            f"Was --exclude_test_files different at train time?"
+                        )
+                    per_slice_manifest = json.loads(
+                        per_slice_manifest_path.read_text()
+                    )
+                    slice_train_var_names = per_slice_manifest.get("var_names", [])
+                    if not slice_train_var_names:
+                        raise ValueError(
+                            f"per-slice manifest at {per_slice_manifest_path} "
+                            f"has no 'var_names'."
+                        )
+                    slice_inverse_bbox = (
+                        float(per_slice_manifest["x_min"]),
+                        float(per_slice_manifest["x_max"]),
+                        float(per_slice_manifest["y_min"]),
+                        float(per_slice_manifest["y_max"]),
+                    )
+
                 row = _infer_one_slice(
                     slice_label=slice_label,
                     test_h5ad=test_h5ad,
-                    model_dir=model_dir,
+                    model_dir=slice_model_dir,
                     filename_stem=filename_stem,
-                    train_var_names=train_var_names,
+                    train_var_names=slice_train_var_names,
                     out_slice_dir=test_results_dir / slice_label,
                     n_inference_samples=n_inference_samples,
+                    inverse_bbox=slice_inverse_bbox,
                 )
                 per_slice_rows.append(row)
                 logger.info(
@@ -436,7 +533,7 @@ def run_inference(
 
     aggregate = {
         "method": "celery",
-        "training_mode": "multi_slice_global",
+        "training_mode": training_mode,
         "spearman_mean_of_medians": float(medians.mean()) if medians.size else float("nan"),
         "spearman_median_of_medians": float(np.median(medians)) if medians.size else float("nan"),
         "spearman_std_of_medians": float(medians.std()) if medians.size else float("nan"),
@@ -457,7 +554,7 @@ def run_inference(
     (out / "config.yaml").write_text(yaml.safe_dump({
         "method": "celery",
         "phase": "inference",
-        "training_mode": "multi_slice_global",
+        "training_mode": training_mode,
         "data_dir": str(data_path),
         "model_dir": str(model_dir),
         "output_dir": str(out),
@@ -476,7 +573,7 @@ def run_inference(
         run_timestamp=run_ts,
         extra={
             "phase": "inference",
-            "training_mode": "multi_slice_global",
+            "training_mode": training_mode,
             "n_test_slices": len(test_files),
             "n_inference_samples": n_inference_samples,
         },
