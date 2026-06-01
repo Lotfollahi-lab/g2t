@@ -253,17 +253,34 @@ def _common_genes_across_slices(adatas: List) -> List[str]:
 def _concat_normalized_slices(
     train_files: List[Path],
 ):
-    """Load every train slice, normalise coords to [0,1], concatenate.
+    """Load every train slice, normalise coords to [0,1], **per-slice
+    z-score gene expression**, then concatenate.
+
+    BUG FIX (2026-05-31): previously we concatenated raw counts and
+    z-scored GLOBALLY across the 165k+ cells of all training slices
+    pooled. That diverged from inference behaviour — where each test
+    slice is z-scored INDEPENDENTLY with its own ~5k cells' mean/std
+    via ``cel.get_zscore``. Different z-score scopes give train and
+    test inputs from different distributions, which is why
+    multi-slice CeLEry was producing WORSE results than the old
+    per-reference protocol.
+
+    Fix: z-score each train slice independently BEFORE concat. The
+    concatenated AnnData then has uniformly-z-scored features per
+    slice — same distributional shape every test slice will see at
+    inference. Batch effects across slices are partially absorbed
+    (each slice anchored to its own mean=0, std=1), matching how
+    each test slice is also anchored to its own mean=0, std=1.
 
     Returns:
         (adata_concat, slice_bboxes)
-        — adata_concat: AnnData with X stacked across slices, obs containing
-          only normalised coord_X / coord_Y as cols 0/1.
+        — adata_concat: AnnData with z-scored X stacked across slices,
+          obs containing only normalised coord_X / coord_Y as cols 0/1.
         — slice_bboxes: list of dicts {slice_name, path, x_min, x_max,
           y_min, y_max, n_cells} for the manifest.
     """
-    import scanpy as sc
     import anndata as ad
+    import CeLEry as cel  # type: ignore
 
     adatas = []
     bboxes = []
@@ -272,6 +289,9 @@ def _concat_normalized_slices(
         logger.info(f"  loading {slice_label}: {p.name}")
         a, x_min, x_max, y_min, y_max = _load_h5ad_for_celery(p)
         _normalize_coords_to_unit(a, x_min, x_max, y_min, y_max)
+        # PER-SLICE z-score — see the docstring above for why this is
+        # critical for train↔test distributional parity.
+        cel.get_zscore(a)
         adatas.append(a)
         bboxes.append({
             "slice_name": slice_label,
@@ -290,15 +310,13 @@ def _concat_normalized_slices(
     )
     adatas = [a[:, common].copy() for a in adatas]
 
-    # Concatenate. join="inner" is redundant after the common-genes
-    # restriction; pairwise=False because we don't have multi-sample
-    # uns-level structures to merge.
+    # Concatenate. The X matrices are already z-scored at this point,
+    # so the concat is just a vertical stack.
     adata_concat = ad.concat(adatas, axis=0, join="inner", merge="first")
-    # Restore var_names (concat collapses them sometimes).
     adata_concat = adata_concat[:, common].copy()
     logger.info(
         f"  concatenated: {adata_concat.n_obs} cells × "
-        f"{adata_concat.n_vars} genes"
+        f"{adata_concat.n_vars} genes (per-slice z-scored)"
     )
     return adata_concat, bboxes
 
@@ -327,14 +345,12 @@ def _train_global_model(
     import CeLEry as cel  # type: ignore
 
     # ---- 1. Build the concatenated training AnnData ----
+    # _concat_normalized_slices already runs cel.get_zscore PER SLICE
+    # before concatenating, so adata_concat.X is already z-scored.
+    # We deliberately DON'T call get_zscore again on the concat —
+    # see the comment in _concat_normalized_slices for why per-slice
+    # scoping matches inference behaviour.
     adata_concat, slice_bboxes = _concat_normalized_slices(train_files)
-
-    # ---- 2. Z-score gene expression (CeLEry's documented preprocessing) ----
-    # cel.get_zscore mutates in-place: per-gene mean-centering + unit-variance
-    # scaling using THIS AnnData's statistics. Computed across all
-    # 33 slices' cells pooled — which is the correct scope for a model
-    # that should generalise across the entire training mouse.
-    cel.get_zscore(adata_concat)
 
     # ---- 3. Save manifest BEFORE training so a fit-crash still leaves
     # the bbox metadata on disk for debugging.
