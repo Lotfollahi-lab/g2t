@@ -1,16 +1,23 @@
-"""run_celery_inference.py — score the global CeLEry model on the held-out mouse.
+"""run_celery_inference.py — score a CeLEry checkpoint on the held-out mouse.
 
-Companion to ``run_celery_train.py``. Loads the single ``model.obj``
-(trained on ALL training slices concatenated per LUNA Supp Note 2),
-predicts coordinates on each test slice, inverse-transforms back to
-that slice's original coord scale, and computes the LUNA-paper
-benchmark metrics.
+Companion to ``run_celery_train.py``. Auto-detects the training mode
+from the checkpoint's ``manifest.json/training_mode`` field and
+dispatches accordingly:
+
+  * ``multi_slice``: loads the single ``model.obj`` (trained on ALL
+    training slices concatenated, LUNA Supp Note 2 protocol).
+  * ``per_reference``: loads each test slice's own ``model.obj`` from
+    the ``celery_models/<slice>/`` subtree.
+
+Predicts coordinates on each test slice, inverse-transforms back to
+the appropriate coord scale, and computes the LUNA-paper benchmark
+metrics.
 
 Inputs (CLI):
     --data_dir          silver h5ad directory with *_test.h5ad
     --checkpoint        path to the training run's ``best_model.ckpt``
-                        symlink (which points at model.obj) OR
-                        directly at a model.obj file.
+                        symlink, model.obj (multi_slice), or
+                        celery_models/ directory (per_reference).
 """
 
 from __future__ import annotations
@@ -342,7 +349,7 @@ def run_inference(
     )
 
     logger.info("=" * 60)
-    logger.info("CeLEry inference-phase (multi-slice global, LUNA protocol)")
+    logger.info(f"CeLEry inference-phase  (training_mode={training_mode})")
     logger.info("=" * 60)
     logger.info(f"  data_dir            : {data_path}")
     logger.info(f"  training_mode       : {training_mode}")
@@ -351,7 +358,12 @@ def run_inference(
     logger.info(f"  run_ts              : {run_ts}")
     logger.info(f"  n_inference_samples : {n_inference_samples}")
     logger.info(f"  train n_slices      : {top_manifest.get('n_train_slices', '?')}")
-    logger.info(f"  train n_genes       : {len(train_var_names)}")
+    # train_var_names is None in per_reference mode (var_names live in
+    # each per-test-slice manifest, looked up lazily). Guard for that.
+    if train_var_names is not None:
+        logger.info(f"  train n_genes       : {len(train_var_names)}")
+    else:
+        logger.info(f"  train n_genes       : (per-slice, looked up lazily)")
     logger.info("=" * 60)
 
     tracker = _RuntimeTracker()
@@ -376,7 +388,7 @@ def run_inference(
                     "exclude_test_files": exclude_test_files or [],
                     "run_timestamp": run_ts,
                     "output_dir": str(out),
-                    "tags": ["celery", "inference", dataset_name, "multi_slice"],
+                    "tags": ["celery", "inference", dataset_name, training_mode],
                 },
             )
             logger.info("wandb initialised")
