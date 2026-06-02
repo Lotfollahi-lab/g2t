@@ -363,7 +363,7 @@ def run_inference(
     if train_var_names is not None:
         logger.info(f"  train n_genes       : {len(train_var_names)}")
     else:
-        logger.info(f"  train n_genes       : (per-slice, looked up lazily)")
+        logger.info("  train n_genes       : (per-slice, looked up lazily)")
     logger.info("=" * 60)
 
     tracker = _RuntimeTracker()
