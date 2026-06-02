@@ -345,7 +345,8 @@ def run_inference(
     logger.info("CeLEry inference-phase (multi-slice global, LUNA protocol)")
     logger.info("=" * 60)
     logger.info(f"  data_dir            : {data_path}")
-    logger.info(f"  model_dir           : {model_dir}")
+    logger.info(f"  training_mode       : {training_mode}")
+    logger.info(f"  checkpoint root     : {root_dir}")
     logger.info(f"  output_dir          : {out}")
     logger.info(f"  run_ts              : {run_ts}")
     logger.info(f"  n_inference_samples : {n_inference_samples}")
@@ -369,7 +370,7 @@ def run_inference(
                     "phase": "inference",
                     "training_mode": training_mode,
                     "data_dir": str(data_path),
-                    "model_dir": str(model_dir),
+                    "checkpoint_root": str(root_dir),
                     "seed": seed,
                     "n_inference_samples": n_inference_samples,
                     "exclude_test_files": exclude_test_files or [],
@@ -556,7 +557,7 @@ def run_inference(
         "phase": "inference",
         "training_mode": training_mode,
         "data_dir": str(data_path),
-        "model_dir": str(model_dir),
+        "checkpoint_root": str(root_dir),
         "output_dir": str(out),
         "run_timestamp": run_ts,
         "seed": seed,
