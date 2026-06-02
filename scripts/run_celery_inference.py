@@ -350,7 +350,7 @@ def run_inference(
     logger.info(f"  output_dir          : {out}")
     logger.info(f"  run_ts              : {run_ts}")
     logger.info(f"  n_inference_samples : {n_inference_samples}")
-    logger.info(f"  train n_slices      : {manifest.get('n_train_slices', '?')}")
+    logger.info(f"  train n_slices      : {top_manifest.get('n_train_slices', '?')}")
     logger.info(f"  train n_genes       : {len(train_var_names)}")
     logger.info("=" * 60)
 
