@@ -120,15 +120,100 @@ def test_loop_returns_real_pvalues():
     )
 
 
-def test_vectorized_default_is_on():
-    """Soft check: the new default for ``vectorized`` is True. If
-    someone flips it back to False this test fires so they know it's
-    a deliberate API change, not an accident."""
+def test_vectorized_default_is_off():
+    """The default for ``vectorized`` is False (opt-in). The vectorised
+    path is bit-faithful to within 1e-7, but we keep the loop as the
+    DEFAULT so that re-running compute_extended_metrics over
+    already-scored timestamps (e.g. the MMC sweep) cannot silently
+    shift their metric values. Any future flip of this default is a
+    deliberate API change that should require updating both this test
+    and the docstring."""
     import inspect
     sig = inspect.signature(compute_spearman_correlation)
-    assert sig.parameters["vectorized"].default is True, (
-        "compute_spearman_correlation should default to vectorized=True"
+    assert sig.parameters["vectorized"].default is False, (
+        "compute_spearman_correlation should default to vectorized=False "
+        "(opt-in) — flipping to True would silently change metric "
+        "values for any re-scored timestamp."
     )
+
+
+@pytest.mark.parametrize("chunk_size", [16, 64, 200, 5000])
+def test_chunked_matches_unchunked(chunk_size: int):
+    """The chunked vectorised path is memory-bounded — at most
+    ``chunk_size`` rows are ranked at a time. Chunking must NOT change
+    the per-cell rho values (the chunks are independent rows, no
+    cross-chunk coupling). This test sweeps the chunk_size across a
+    range that brackets typical use: tiny (16, exercises the boundary
+    when chunks don't divide n evenly) → larger-than-n (5000, falls
+    back to single-chunk behaviour, equivalent to the un-chunked
+    version)."""
+    from scgg.evaluation.luna_metrics import (
+        _compute_spearman_vectorized,
+        compute_distance,
+    )
+
+    n = 200  # not a multiple of any chunk_size above except 200 itself
+    coords_true, coords_pred = _random_coords(n, seed=1)
+    dt = compute_distance(coords_true.astype(np.float32))
+    dp = compute_distance(coords_pred.astype(np.float32))
+
+    # Reference: chunk that covers all rows in one pass.
+    out_ref = _compute_spearman_vectorized(dt, dp, n, chunk_size=n)
+    out_chunked = _compute_spearman_vectorized(dt, dp, n, chunk_size=chunk_size)
+
+    np.testing.assert_allclose(
+        out_chunked["per_cell"], out_ref["per_cell"],
+        atol=RHO_ATOL, rtol=0,
+        err_msg=f"chunked output diverged at chunk_size={chunk_size}",
+    )
+    assert out_chunked["mean"] == pytest.approx(out_ref["mean"], abs=AGG_ATOL)
+    assert out_chunked["median"] == pytest.approx(out_ref["median"], abs=AGG_ATOL)
+    assert out_chunked["n"] == out_ref["n"]
+
+
+def test_chunked_matches_loop():
+    """End-to-end: with chunked vectorisation, the public API still
+    matches the per-cell scipy.stats.spearmanr loop (the original
+    test_vectorized_matches_loop covers the un-chunked case; this
+    locks the chunked path on top)."""
+    from scgg.evaluation.luna_metrics import (
+        _compute_spearman_vectorized,
+        compute_distance,
+    )
+
+    n = 200
+    coords_true, coords_pred = _random_coords(n, seed=2)
+
+    out_loop = compute_spearman_correlation(
+        coords_true, coords_pred, vectorized=False,
+    )
+    dt = compute_distance(coords_true.astype(np.float32))
+    dp = compute_distance(coords_pred.astype(np.float32))
+    # Tight chunk size to actually exercise chunking
+    out_chunked = _compute_spearman_vectorized(dt, dp, n, chunk_size=37)
+
+    np.testing.assert_allclose(
+        out_chunked["per_cell"], out_loop["per_cell"],
+        atol=RHO_ATOL, rtol=0,
+    )
+
+
+def test_chunked_rejects_invalid_chunk_size():
+    """``chunk_size`` ≤ 0 makes no sense (empty slice or infinite loop).
+    Validate up front."""
+    from scgg.evaluation.luna_metrics import (
+        _compute_spearman_vectorized,
+        compute_distance,
+    )
+
+    n = 50
+    coords_true, coords_pred = _random_coords(n)
+    dt = compute_distance(coords_true.astype(np.float32))
+    dp = compute_distance(coords_pred.astype(np.float32))
+
+    for bad in (0, -1, -1024):
+        with pytest.raises(ValueError, match="chunk_size must be positive"):
+            _compute_spearman_vectorized(dt, dp, n, chunk_size=bad)
 
 
 def test_handles_degenerate_rows():

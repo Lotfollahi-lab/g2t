@@ -70,7 +70,7 @@ def compute_spearman_correlation(
     coords_true: np.ndarray,
     coords_pred: np.ndarray,
     progress: bool = False,
-    vectorized: bool = True,
+    vectorized: bool = False,
 ) -> Dict[str, np.ndarray | float]:
     """Per-cell Spearman correlation of pairwise-distance rows.
 
@@ -85,16 +85,19 @@ def compute_spearman_correlation(
         progress: emit a tqdm progress bar over cells if True (loop version
             only — ignored when ``vectorized=True`` since there's no inner
             Python loop to wrap).
-        vectorized: when True (default), dispatches to a numpy-vectorized
-            implementation that batches ``scipy.stats.rankdata`` over rows
-            and reduces to row-wise Pearson correlation. 10-50× faster than
-            the loop version on large N (CNS-sized slices), and
-            mathematically identical (regression tested — see
-            tests/test_per_cell_spearman_vectorized.py). Set to False to
-            recover the original per-cell ``scipy.stats.spearmanr`` loop;
-            useful as a debugging baseline or if you need real p-values
-            (the vectorized path returns NaN p-values to keep the dict
-            schema stable — they're not consumed by aggregate_slices()).
+        vectorized: OFF by default to preserve byte-identical metric values
+            for already-scored runs (anyone re-running compute_extended_metrics
+            without explicit opt-in keeps the original
+            scipy.stats.spearmanr semantics). Pass ``vectorized=True`` to
+            dispatch to a numpy-vectorized implementation that batches
+            ``scipy.stats.rankdata`` over rows and reduces to row-wise
+            Pearson correlation — 10-50× faster on large N (CNS-sized
+            slices) and mathematically identical to the loop within float
+            tolerance (regression tested — see
+            tests/test_per_cell_spearman_vectorized.py). The vectorised
+            path returns NaN p-values to keep the dict schema stable;
+            they're not consumed by aggregate_slices() so this is a
+            no-op for the downstream metric battery.
 
     Returns:
         Dict with:
@@ -158,59 +161,99 @@ def _compute_spearman_vectorized(
     dt: np.ndarray,
     dp: np.ndarray,
     n: int,
+    chunk_size: int = 1024,
 ) -> Dict[str, np.ndarray | float]:
     """Vectorized equivalent of _compute_spearman_loop.
 
     Spearman's rank correlation between two equal-length vectors equals
-    Pearson's correlation of their RANKS. We can compute all N per-row
-    rank-correlations in one batched ``scipy.stats.rankdata(axis=1)``
-    call followed by a pure-numpy reduction — no Python-level inner loop.
+    Pearson's correlation of their RANKS. We compute the per-row
+    rank-correlations by batching ``scipy.stats.rankdata(axis=1)``
+    over row CHUNKS — no Python-level per-cell loop, no full-matrix
+    rank materialisation.
 
-    Memory profile is the same as the loop version (both need ``dt``
-    and ``dp`` resident: 2 × N² × 4 bytes ≈ 180 GB for N=150k cells in
-    float32). The rank arrays themselves are computed in float64 by
-    scipy then cast back to float32 to stay within that budget.
+    Why chunked instead of "all at once":
+      Calling ``rankdata`` on the whole (N, N) matrix returns float64
+      ranks, which scipy allocates internally even before our explicit
+      ``.astype(np.float32)``. For N=150k cells that transient is
+      180 GB on top of the 90 GB ``dt``/``dp`` matrices — combined
+      peak ~540 GB OOMs a 512 GB worker. Processing in chunks of
+      ``chunk_size`` rows keeps the rank-array transient down to
+      ``chunk_size × N × 8 bytes`` (≈ 1.2 GB at chunk=1024, N=150k),
+      so the worker peak stays at ``dt + dp + small`` ≈ 184 GB.
 
-    Algorithm:
-      1. rank each row of dt and dp independently (rankdata axis=1)
+    Algorithm (per chunk):
+      1. rank each row in the chunk independently (rankdata axis=1)
       2. centre each rank row by its row mean
       3. per-row Pearson via einsum: num = sum(rt*rp), denom = ||rt|| * ||rp||
       4. handle degenerate rows (zero variance) by emitting NaN
 
     Tie handling: rankdata's default ``method='average'`` matches
-    scipy.stats.spearmanr's tie correction, so results agree
-    bit-for-bit (modulo float rounding) with the loop version.
+    scipy.stats.spearmanr's tie correction, so per-cell values agree
+    with the loop version bit-for-bit (modulo float rounding) — see
+    test_per_cell_spearman_vectorized.py.
+
+    Args:
+        dt, dp: (N, N) float32 pairwise-distance matrices.
+        n: cell count (== dt.shape[0]; passed in to avoid re-reading).
+        chunk_size: rows processed per inner pass. Default 1024 gives
+            a ~1.2 GB transient at N=150k. Lower it on extra-large
+            slices (chunk_size=256 → ~300 MB transient) at a small
+            speed cost; raise it on tiny slices for slightly less
+            Python-loop overhead. Has zero effect on the output
+            values — only on the memory/speed trade-off.
     """
     from scipy.stats import rankdata
 
-    # Step 1: rank each row. axis=1 vectorises the per-row argsort
-    # inside scipy's C code, which is what gives us the speedup over
-    # the Python-level loop.
-    # rankdata returns float64; downcast to float32 to keep memory at
-    # parity with dt/dp (both already float32 in the caller).
-    rt = rankdata(dt, axis=1, method="average").astype(np.float32, copy=False)
-    rp = rankdata(dp, axis=1, method="average").astype(np.float32, copy=False)
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
-    # Step 2: centre by row mean. ``keepdims`` broadcasts the (N,1)
-    # mean back across each row.
-    rt -= rt.mean(axis=1, keepdims=True)
-    rp -= rp.mean(axis=1, keepdims=True)
-
-    # Step 3: per-row Pearson via einsum. ``'ij,ij->i'`` reduces the
-    # per-row dot product without materialising the (N,N) outer product.
-    num = np.einsum("ij,ij->i", rt, rp)
-    norm_t = np.sqrt(np.einsum("ij,ij->i", rt, rt))
-    norm_p = np.sqrt(np.einsum("ij,ij->i", rp, rp))
-    denom = norm_t * norm_p
-
-    # Step 4: degenerate-row handling. spearmanr returns NaN when one
-    # of the inputs has zero variance (all-identical values). With
-    # pairwise distances this only happens if all true-distance or
-    # all pred-distance rows are constant — vanishingly rare in
-    # practice but match scipy's NaN semantics for safety.
+    # Output arrays, sized once. Per-chunk results are scattered back
+    # into these at the right row indices.
     rho = np.full(n, np.nan, dtype=np.float64)
-    valid = denom > 0
-    rho[valid] = num[valid] / denom[valid]
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+
+        # Step 1: rank just this row-chunk. rankdata returns float64
+        # internally; cast to float32 to halve the per-chunk working
+        # set (the einsum reductions in step 3 are float-precision-
+        # invariant at ranks-of-integers scale).
+        rt = rankdata(dt[start:end], axis=1, method="average").astype(
+            np.float32, copy=False,
+        )
+        rp = rankdata(dp[start:end], axis=1, method="average").astype(
+            np.float32, copy=False,
+        )
+
+        # Step 2: centre by row mean. Subtract in-place to avoid an
+        # extra (chunk, N) allocation.
+        rt -= rt.mean(axis=1, keepdims=True)
+        rp -= rp.mean(axis=1, keepdims=True)
+
+        # Step 3: per-row Pearson via einsum. ``'ij,ij->i'`` reduces
+        # the per-row dot product without materialising the (chunk, N)
+        # outer product.
+        num = np.einsum("ij,ij->i", rt, rp)
+        norm_t = np.sqrt(np.einsum("ij,ij->i", rt, rt))
+        norm_p = np.sqrt(np.einsum("ij,ij->i", rp, rp))
+        denom = norm_t * norm_p
+
+        # Step 4: degenerate-row handling. spearmanr returns NaN when
+        # one of the inputs has zero variance (all-identical values).
+        # With pairwise distances this only happens if all
+        # true-distance or all pred-distance rows are constant —
+        # vanishingly rare in practice but match scipy's NaN semantics
+        # for safety. ``rho`` was pre-filled with NaN so we only need
+        # to overwrite the valid rows.
+        valid = denom > 0
+        chunk_rho = np.where(valid, num / np.where(denom > 0, denom, 1.0), np.nan)
+        rho[start:end] = chunk_rho
+
+        # Free the chunk's working set before the next iteration —
+        # Python GC would do this eventually but the explicit del
+        # makes peak-memory analysis cleaner and gives the allocator
+        # an immediate chance to release the float32 chunk arrays.
+        del rt, rp, num, norm_t, norm_p, denom, chunk_rho
 
     # P-values are NOT computed in the vectorised path. Downstream
     # (aggregate_slices, compute_extended_metrics) doesn't consume
@@ -456,7 +499,7 @@ def evaluate_slice(
     contact_percentile: float = 0.01,
     compute_rssd: bool = True,
     rssd_projection: str = "pca",
-    spearman_vectorized: bool = True,
+    spearman_vectorized: bool = False,
 ) -> Dict[str, float]:
     """Compute all three LUNA metrics on one slice.
 
@@ -470,12 +513,11 @@ def evaluate_slice(
         contact_percentile: percentile threshold for `compute_contact`.
         compute_rssd: skip the RSSD computation if False (no projection).
         rssd_projection: 'pca' or 'mds' if the embedding is not 2-D.
-        spearman_vectorized: when True (default) the per-cell Spearman
-            uses the batched-rankdata implementation (10-50× faster on
-            CNS-sized slices); set False to fall back to the original
-            per-cell scipy.stats.spearmanr loop. The two paths produce
-            identical per-cell rho values — see
-            test_per_cell_spearman_vectorized.py.
+        spearman_vectorized: OFF by default so already-scored runs keep
+            the exact metric values they had before this knob existed.
+            Set True to use the batched-rankdata implementation (10-50×
+            faster on CNS-sized slices, bit-faithful within float
+            tolerance — see test_per_cell_spearman_vectorized.py).
 
     Returns:
         Flat dict of metrics for this slice.
