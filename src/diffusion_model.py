@@ -539,6 +539,23 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 output_dims=self.output_dims,
                 geomattn_cfg=getattr(cfg.model, "geomattn", None),
             )
+        elif backbone == "geomattn_nystrom":
+            # Geometry-Coupled Nyström Attention — scalable GCA.
+            # Injects the same learnable, time-gated, SE(2)-invariant
+            # geometric bias as `geomattn`, but at the LANDMARK level
+            # (cell↔landmark-centroid, centroid↔centroid distances), so
+            # both the attention AND the bias are O(N·M) instead of
+            # O(N²). Recovers dense geomattn at M ≥ N. Use this for
+            # large slices where dense geomattn OOMs.
+            from models.geometry_coupled_nystrom import GeometryCoupledNystromBackbone
+            self.model = GeometryCoupledNystromBackbone(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                geomattn_nystrom_cfg=getattr(cfg.model, "geomattn_nystrom", None),
+            )
         elif backbone == "egnn":
             # Local import so the LUNA-baseline path (which doesn't
             # need EGNN's torch-geometric kNN code) keeps loading
@@ -570,7 +587,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
             raise ValueError(
                 f"Unknown model.backbone={backbone!r}. Expected "
                 f"'luna_transformer', 'egnn', 'vn_transformer', "
-                f"'dit', 'perceiver', 'nystromformer', or 'geomattn'."
+                f"'dit', 'perceiver', 'nystromformer', 'geomattn', "
+                f"or 'geomattn_nystrom'."
             )
 
         # ------------------------------------------------------------------

@@ -66,6 +66,14 @@ framework: "flow_matching"
 #   factorisation that approaches exact softmax as M → N).
 #   Hybrid switch: at M = exact_until_n the layer falls through to
 #   exact SDPA, so small slices don't pay the Nyström overhead.
+# - "geomattn_nystrom" — Geometry-Coupled Nyström Attention. The
+#   scalable counterpart to "geomattn": injects the same learnable,
+#   time-gated, SE(2)-invariant geometric bias, but at the LANDMARK
+#   level (cell↔landmark-centroid + centroid↔centroid distances, where
+#   a landmark's centroid is the segment-mean of its cells' positions).
+#   Both the attention and the bias are O(N·M), not O(N²). Recovers
+#   dense "geomattn" at M ≥ N. Use for large slices where dense
+#   geomattn OOMs. See model.geomattn_nystrom below.
 # - "geomattn"         — Geometry-Coupled Attention. DiT-style backbone
 #   whose dense softmax attention carries an ADDITIONAL learnable,
 #   time-gated, SE(2)-invariant geometric bias derived from the
@@ -1496,6 +1504,44 @@ geomattn:
     # is fundamentally O(B·H·N²); use train.batch_size=1 for
     # cortex/CNS-scale slices.
     grad_checkpoint: true
+
+# ---------------------------------------------------------------------------
+# Geometry-Coupled Nyström Attention (geomattn_nystrom) — scalable GCA.
+#
+# Selected via ``backbone: "geomattn_nystrom"``. Same geometric bias as
+# geomattn, but injected at the LANDMARK level so it inherits
+# Nyströmformer's O(N·M) cost instead of geomattn's O(N²). Landmarks
+# are segment-mean pools of cells; each landmark's centroid position is
+# the segment-mean of its cells' coordinates, which gives the three
+# Nyström softmax blocks (F: cell↔landmark, B: landmark↔landmark,
+# G: landmark↔cell) well-defined distances to bias. Recovers dense
+# geomattn at M ≥ N (the layer falls through to exact dense GCA then).
+# ---------------------------------------------------------------------------
+geomattn_nystrom:
+    hidden_dim: 256
+    n_layers: 8
+    n_heads: 8
+    mlp_ratio: 4
+    time_embed_dim: 256
+    # Radial-kernel knobs (shared with geomattn semantics).
+    num_rbf: 16
+    init_max_dist: 3.0
+    detach_geometry: true
+    # Nyström knobs (shared with the nystromformer backbone semantics).
+    # M — number of landmarks. The geometric bias resolves spatial
+    # structure at this granularity, so larger M = finer spatial
+    # coupling (and tighter Nyström approx) at O(N·M) cost.
+    n_landmarks: 64
+    # Schulz iterations for the Moore-Penrose pseudo-inverse of B.
+    moore_penrose_iters: 6
+    # If N ≤ exact_until_n (or N ≤ n_landmarks), fall through to DENSE
+    # geometry-coupled softmax — the M → N exactness limit. 0 = always
+    # use the Nyström path when N > n_landmarks.
+    exact_until_n: 0
+    # Gradient checkpointing. Off by default — Nyström is already
+    # O(N·M) so the per-layer tensors are small. Turn on only for very
+    # deep stacks.
+    grad_checkpoint: false
 
 # ---------------------------------------------------------------------------
 # Architectural extension #3 — Perceiver-style backbone
