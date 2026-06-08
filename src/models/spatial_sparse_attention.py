@@ -68,6 +68,51 @@ def radial_bias_nd(dist, centers, widths, W, gamma):
     return gamma.view(*gshape) * out
 
 
+def rebalance_groups(group_id, real_mask, max_window):
+    """Split any group with more than ``max_window`` real cells into
+    contiguous fixed-size sub-windows, densely renumbered (no empty
+    groups), per batch element.
+
+    ``grouped_dense_attention`` pads every group to the MAX group size,
+    so a single crowded group (e.g. a dense cortex region inside one
+    Swin grid bucket, or a big k-means cluster) makes the (B,H,G,S,S)
+    tensor explode — O(G·S²) is only sub-quadratic for BALANCED groups.
+    Capping the window size bounds S to ``max_window`` (this is exactly
+    what Swin does — fixed window size, not "all cells in a grid cell"),
+    keeping memory O(N·max_window). All cells are kept (none dropped).
+
+    Returns (new_group_id (B,N) long, new_n_groups int). Padding cells
+    are assigned group 0 (they're masked out downstream regardless).
+    """
+    B, N = group_id.shape
+    dev = group_id.device
+    new_gid = torch.zeros(B, N, dtype=torch.long, device=dev)
+    G_new = 1
+    for b in range(B):
+        real_idx = real_mask[b].nonzero(as_tuple=False).view(-1)
+        R = real_idx.numel()
+        if R == 0:
+            continue
+        g = group_id[b, real_idx].to(torch.long)            # (R,)
+        order = torch.argsort(g, stable=True)
+        gs = g[order]
+        ar = torch.arange(R, device=dev)
+        is_new = torch.ones(R, dtype=torch.bool, device=dev)
+        if R > 1:
+            is_new[1:] = gs[1:] != gs[:-1]
+        # running start index of each group in the sorted order
+        start = torch.cummax(torch.where(is_new, ar, torch.zeros_like(ar)), 0).values
+        slot = ar - start                                   # slot within group
+        sub = slot // int(max_window)                       # sub-window index
+        key = gs * R + sub                                  # unique per (group, sub); sub < R
+        _, inv = torch.unique(key, sorted=True, return_inverse=True)  # dense 0..K-1
+        ng = torch.empty(R, dtype=torch.long, device=dev)
+        ng[order] = inv
+        new_gid[b, real_idx] = ng
+        G_new = max(G_new, int(inv.max().item()) + 1)
+    return new_gid, G_new
+
+
 # ---------------------------------------------------------------------------
 # Shared grouped dense attention (powers axial / swin / routing)
 # ---------------------------------------------------------------------------
@@ -364,10 +409,11 @@ class AxialSpatialAttention(_SparseAttnBase):
 
 
 class SwinSpatialAttention(_SparseAttnBase):
-    def __init__(self, embed_dim, num_heads, num_rbf, grid, layer_idx):
+    def __init__(self, embed_dim, num_heads, num_rbf, grid, layer_idx, max_window):
         super().__init__(embed_dim, num_heads, num_rbf)
         self.grid = int(grid)                  # grid × grid buckets
         self.layer_idx = int(layer_idx)        # odd layers shift by half a cell
+        self.max_window = int(max_window)      # cap cells/window (bounds memory)
 
     def _buckets(self, positions, real_mask):
         B, N, _ = positions.shape
@@ -395,7 +441,10 @@ class SwinSpatialAttention(_SparseAttnBase):
         widths = self._widths(radial)
         positions = geom["positions"]
         real_mask = geom["real_mask"]
-        gid, G = self._buckets(positions, real_mask)
+        gid, _ = self._buckets(positions, real_mask)
+        # Cap window size so an imbalanced (dense) bucket can't blow up
+        # the O(G·S²) grouped-attention tensor.
+        gid, G = rebalance_groups(gid, real_mask, self.max_window)
         out = grouped_dense_attention(
             q, k, v, positions, gid, real_mask, G,
             radial.centers, widths, self.kernel.weight, gamma,
@@ -438,10 +487,12 @@ def _kmeans_positions(pos, real_mask, C, iters=5, seed=0):
 
 
 class RoutingSpatialAttention(_SparseAttnBase):
-    def __init__(self, embed_dim, num_heads, num_rbf, n_clusters, kmeans_iters):
+    def __init__(self, embed_dim, num_heads, num_rbf, n_clusters, kmeans_iters,
+                 max_window):
         super().__init__(embed_dim, num_heads, num_rbf)
         self.n_clusters = int(n_clusters)
         self.kmeans_iters = int(kmeans_iters)
+        self.max_window = int(max_window)
 
     def forward(self, x, c, radial, geom, key_padding_mask=None):
         q, k, v = self._qkv(x)
@@ -450,8 +501,10 @@ class RoutingSpatialAttention(_SparseAttnBase):
         positions = geom["positions"]
         real_mask = geom["real_mask"]
         gid = geom["route_gid"]                                    # precomputed once
+        # Cap cluster size (k-means clusters can be very imbalanced).
+        gid, G = rebalance_groups(gid, real_mask, self.max_window)
         out = grouped_dense_attention(
-            q, k, v, positions, gid, real_mask, self.n_clusters,
+            q, k, v, positions, gid, real_mask, G,
             radial.centers, widths, self.kernel.weight, gamma,
         )
         return self._merge(out)
@@ -534,6 +587,11 @@ class SpatialSparseBackbone(nn.Module):
         self.grid = int(_g("grid", 8))
         self.n_clusters = int(_g("n_clusters", 32))
         self.kmeans_iters = int(_g("kmeans_iters", 5))
+        # Cap cells per window for the group-based patterns (swin/routing)
+        # so an imbalanced bucket/cluster can't blow up the O(G·S²)
+        # grouped-attention tensor. Oversized groups are split into
+        # fixed-size windows (Swin-style).
+        self.max_window = int(_g("max_window", 256))
         self.knn_chunk = int(_g("knn_chunk", 1024))
         # neighbour pool size needed by knn (dilated needs n_local*dilation)
         if pattern == "dilated":
@@ -569,9 +627,9 @@ class SpatialSparseBackbone(nn.Module):
         elif self.pattern == "axial":
             attn = AxialSpatialAttention(hd, nh, nr, self.band_size)
         elif self.pattern == "swin":
-            attn = SwinSpatialAttention(hd, nh, nr, self.grid, layer_idx)
+            attn = SwinSpatialAttention(hd, nh, nr, self.grid, layer_idx, self.max_window)
         else:  # routing
-            attn = RoutingSpatialAttention(hd, nh, nr, self.n_clusters, self.kmeans_iters)
+            attn = RoutingSpatialAttention(hd, nh, nr, self.n_clusters, self.kmeans_iters, self.max_window)
         return _SparseBlock(hd, attn, self.mlp_ratio)
 
     def _precompute_geometry(self, pos, node_mask):

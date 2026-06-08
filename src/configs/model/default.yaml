@@ -1657,6 +1657,11 @@ geomattn_swin:           # Swin: shifted spatial grid windows
     # grid × grid spatial buckets; the grid is shifted half a cell on
     # odd layers for cross-window flow.
     grid: 8
+    # Max cells per window. Dense buckets are split into fixed-size
+    # windows (Swin-style) so the O(G·S²) grouped-attention tensor stays
+    # bounded — lower this (e.g. 128) if a slice OOMs, raise for more
+    # context per window.
+    max_window: 256
 
 geomattn_routing:        # Routing Transformer: k-means spatial clusters
     hidden_dim: 256
@@ -1671,6 +1676,10 @@ geomattn_routing:        # Routing Transformer: k-means spatial clusters
     # their cluster. kmeans_iters Lloyd steps per forward.
     n_clusters: 32
     kmeans_iters: 5
+    # Max cells per cluster-window. k-means clusters can be very
+    # imbalanced, so oversized clusters are split into fixed-size
+    # windows to bound the O(G·S²) grouped-attention tensor.
+    max_window: 256
 
 # ---------------------------------------------------------------------------
 # Architectural extension #3 — Perceiver-style backbone
