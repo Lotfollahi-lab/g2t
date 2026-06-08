@@ -556,6 +556,20 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 output_dims=self.output_dims,
                 geomattn_nystrom_cfg=getattr(cfg.model, "geomattn_nystrom", None),
             )
+        elif backbone == "geomattn_localglobal":
+            # Geometry Local-Global Attention — sub-quadratic GCA via
+            # exact local (top-K spatial neighbours) + landmark global.
+            # combine ∈ {gated, unified} (config). O(N·(K+M)) memory and
+            # compute; the kNN is computed once per forward (chunked).
+            from models.geometry_local_global_attention import LocalGlobalBackbone
+            self.model = LocalGlobalBackbone(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                geomattn_localglobal_cfg=getattr(cfg.model, "geomattn_localglobal", None),
+            )
         elif backbone == "egnn":
             # Local import so the LUNA-baseline path (which doesn't
             # need EGNN's torch-geometric kNN code) keeps loading
@@ -588,7 +602,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"Unknown model.backbone={backbone!r}. Expected "
                 f"'luna_transformer', 'egnn', 'vn_transformer', "
                 f"'dit', 'perceiver', 'nystromformer', 'geomattn', "
-                f"or 'geomattn_nystrom'."
+                f"'geomattn_nystrom', or 'geomattn_localglobal'."
             )
 
         # ------------------------------------------------------------------

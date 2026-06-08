@@ -66,6 +66,18 @@ framework: "flow_matching"
 #   factorisation that approaches exact softmax as M → N).
 #   Hybrid switch: at M = exact_until_n the layer falls through to
 #   exact SDPA, so small slices don't pay the Nyström overhead.
+# - "geomattn_localglobal" — Geometry Local-Global Attention. Exact
+#   full softmax over each cell's top-K nearest cells (kNN under the
+#   current coordinate estimate) PLUS a landmark-global far field.
+#   Two combine schemes (model.geomattn_localglobal.combine):
+#     "gated"   — out = g·local + (1-g)·global (Nyström far field),
+#                 learned per-head blend. No double-counting.
+#     "unified" — ONE softmax over {K nearest cells} ∪ {M landmarks},
+#                 each landmark weighted by its per-query effective
+#                 cell count (with local-neighbour exclusion → EXACT
+#                 dense softmax in the K→N limit).
+#   O(N·(K+M)); kNN computed once per forward. See
+#   model.geomattn_localglobal below.
 # - "geomattn_nystrom" — Geometry-Coupled Nyström Attention. The
 #   scalable counterpart to "geomattn": injects the same learnable,
 #   time-gated, SE(2)-invariant geometric bias, but at the LANDMARK
@@ -1542,6 +1554,45 @@ geomattn_nystrom:
     # O(N·M) so the per-layer tensors are small. Turn on only for very
     # deep stacks.
     grad_checkpoint: false
+
+# ---------------------------------------------------------------------------
+# Geometry Local-Global Attention (geomattn_localglobal) — sub-quadratic
+# geometry-aware attention via exact-local + landmark-global.
+#
+# Selected via ``backbone: "geomattn_localglobal"``. Each cell attends
+# with FULL geometry-biased softmax to its top-`n_local` spatial
+# neighbours (kNN under x_t, computed once per forward), and to a coarse
+# `n_landmarks`-landmark summary of the far field. O(N·(n_local +
+# n_landmarks)) — sub-quadratic.
+# ---------------------------------------------------------------------------
+geomattn_localglobal:
+    hidden_dim: 256
+    n_layers: 8
+    n_heads: 8
+    mlp_ratio: 4
+    time_embed_dim: 256
+    num_rbf: 16
+    init_max_dist: 3.0
+    detach_geometry: true
+    # K — exact local neighbourhood size (top-K nearest cells). Bigger =
+    # more exact attention, O(N·K) cost. 32 is a good cortex default.
+    n_local: 32
+    # M — landmark count for the global far field.
+    n_landmarks: 64
+    # Combination scheme: "gated" (out = g·local + (1-g)·Nyström-global,
+    # learned per-head blend) or "unified" (single softmax over
+    # {K cells} ∪ {M landmarks} with per-query landmark count-exclusion;
+    # exact dense softmax in the K→N limit).
+    combine: "gated"
+    # Schulz iterations for the Nyström pseudo-inverse (gated mode only).
+    moore_penrose_iters: 6
+    # Query-chunk size for the once-per-forward kNN (bounds its peak
+    # memory to O(chunk·N)). Lower if the kNN step itself OOMs on huge N.
+    knn_chunk: 1024
+    # Gradient checkpointing. ON by default (the local gather's
+    # (B,H,N,K,D) tensor is the main activation; checkpointing keeps a
+    # deep stack within memory at cortex scale).
+    grad_checkpoint: true
 
 # ---------------------------------------------------------------------------
 # Architectural extension #3 — Perceiver-style backbone
