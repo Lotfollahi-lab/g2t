@@ -66,6 +66,20 @@ framework: "flow_matching"
 #   factorisation that approaches exact softmax as M → N).
 #   Hybrid switch: at M = exact_until_n the layer falls through to
 #   exact SDPA, so small slices don't pay the Nyström overhead.
+# - "geomattn"         — Geometry-Coupled Attention. DiT-style backbone
+#   whose dense softmax attention carries an ADDITIONAL learnable,
+#   time-gated, SE(2)-invariant geometric bias derived from the
+#   CURRENT coordinate estimate x_t:
+#       score_ij += gamma_h(t) · K_h(||x_t,i - x_t,j||)
+#   so attention attends preferentially to cells that are spatially
+#   near under the current prediction. The attention pattern and the
+#   geometry co-evolve along the FM sampling trajectory (content-driven
+#   at high noise, spatially-local at low noise). The per-head time
+#   gate gamma_h(t) is zero-init ⇒ identical to DiT at init, learns the
+#   coarse-to-fine schedule. O(N²) memory like DiT (see model.geomattn
+#   block below). This is the primary methodological contribution under
+#   evaluation — distinct from linear/Nyström/Perceiver, which change
+#   how cheaply attention is computed, not what it attends to.
 backbone: "luna_transformer"
 
 n_layers: 8 # Number of transformer/EGNN layers
@@ -1425,6 +1439,53 @@ dit:
     # Time embedding width (sinusoidal embedding dim, projected to
     # hidden_dim for adaLN-Zero conditioning).
     time_embed_dim: 256
+
+# ---------------------------------------------------------------------------
+# Geometry-Coupled Attention (GCA) backbone — methodological extension.
+#
+# Selected via ``backbone: "geomattn"``. Architecturally a DiT
+# (adaLN-Zero, same final layer) whose self-attention carries an extra
+# additive, learnable, SE(2)-invariant geometric bias over the current
+# coordinate estimate x_t:
+#       score_ij^h += gamma_h(t) · ( W_h · phi(||x_t,i - x_t,j||) )
+# where phi is a shared Gaussian RBF expansion of the pairwise distance,
+# W_h a per-head linear kernel, and gamma_h(t) a per-head time-gate
+# (zero-init → identical to DiT at start of training).
+#
+# Why it might win on top of EDM-FM: the "right" attention pattern for
+# spatial reconstruction is the spatial neighbourhood graph, but that
+# graph is the unknown we're solving for. GCA bootstraps it from the
+# current estimate and lets attention + geometry co-evolve along the
+# sampling trajectory. The bias is exactly SE(2)-invariant (depends only
+# on distances), matching the EDM head's symmetry at the output side.
+# ---------------------------------------------------------------------------
+geomattn:
+    # Per-token hidden width (matches dit / LUNA hidden_dims.dx).
+    hidden_dim: 256
+    # Number of GCA blocks. 8 matches model.n_layers above.
+    n_layers: 8
+    # Attention heads. Each head learns its own radial kernel + gate.
+    n_heads: 8
+    # FFN expansion factor.
+    mlp_ratio: 4
+    # Time embedding width (sinusoidal → hidden_dim for adaLN + gate).
+    time_embed_dim: 256
+    # Number of Gaussian radial-basis functions in the shared distance
+    # expansion. Larger = more expressive distance kernels, but the RBF
+    # tensor is (B, N, N, num_rbf) so memory scales linearly in it.
+    # 16 is a good default for MMC-scale slices; drop to 8 for very
+    # large slices.
+    num_rbf: 16
+    # Upper end of the initial RBF centre range (centres start as
+    # linspace(0, init_max_dist, num_rbf)). Should bracket the typical
+    # pairwise distance scale of the (normalised) coordinates. Centres
+    # and widths are learnable so this is only an initialisation.
+    init_max_dist: 3.0
+    # Detach the positions used to build the geometric bias (treat the
+    # current geometry as a conditioning signal, not something the
+    # coordinate loss backprops through — self-conditioning semantics).
+    # Set False to ablate: let gradient flow through the bias too.
+    detach_geometry: true
 
 # ---------------------------------------------------------------------------
 # Architectural extension #3 — Perceiver-style backbone

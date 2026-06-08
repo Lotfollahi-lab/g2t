@@ -520,6 +520,25 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 output_dims=self.output_dims,
                 nystromformer_cfg=getattr(cfg.model, "nystromformer", None),
             )
+        elif backbone == "geomattn":
+            # Geometry-Coupled Attention — methodological extension.
+            # DiT-style backbone whose self-attention carries a
+            # learnable, time-gated, SE(2)-invariant geometric bias
+            # over the CURRENT coordinate estimate (x_t). The attention
+            # pattern and the geometry co-evolve along the FM sampling
+            # trajectory: content-driven at high noise, spatially-local
+            # at low noise. Zero-init time-gate ⇒ starts identical to
+            # DiT, learns the coarse-to-fine schedule. Composes with the
+            # EDM / c2f / gene_recon wrappers identically to DiT.
+            from models.geometry_coupled_attention import GeometryCoupledBackbone
+            self.model = GeometryCoupledBackbone(
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                geomattn_cfg=getattr(cfg.model, "geomattn", None),
+            )
         elif backbone == "egnn":
             # Local import so the LUNA-baseline path (which doesn't
             # need EGNN's torch-geometric kNN code) keeps loading
@@ -551,7 +570,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
             raise ValueError(
                 f"Unknown model.backbone={backbone!r}. Expected "
                 f"'luna_transformer', 'egnn', 'vn_transformer', "
-                f"'dit', or 'perceiver'."
+                f"'dit', 'perceiver', 'nystromformer', or 'geomattn'."
             )
 
         # ------------------------------------------------------------------
