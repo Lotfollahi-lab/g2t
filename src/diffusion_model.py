@@ -570,6 +570,28 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 output_dims=self.output_dims,
                 geomattn_localglobal_cfg=getattr(cfg.model, "geomattn_localglobal", None),
             )
+        elif backbone in (
+            "geomattn_dilated", "geomattn_bigbird", "geomattn_axial",
+            "geomattn_swin", "geomattn_routing",
+        ):
+            # Spatial sparse geometry-aware attention zoo — each maps a
+            # famous index-based efficient-attention method to 2-D
+            # spatial proximity (Sparse Transformer / BigBird / Axial /
+            # Swin / Routing Transformer). All sub-quadratic, all carry
+            # the SE(2)-invariant radial geometry bias, all DataHolder
+            # in / out (EDM / c2f / gene_recon compose unchanged).
+            from models.spatial_sparse_attention import SpatialSparseBackbone
+            _pattern = backbone[len("geomattn_"):]                # e.g. "swin"
+            _cfg = getattr(cfg.model, backbone, None)
+            self.model = SpatialSparseBackbone(
+                pattern=_pattern,
+                input_dims=self.input_dims,
+                n_layers=cfg.model.n_layers,
+                hidden_mlp_dims=cfg.model.hidden_mlp_dims,
+                hidden_dims=cfg.model.hidden_dims,
+                output_dims=self.output_dims,
+                cfg=_cfg,
+            )
         elif backbone == "egnn":
             # Local import so the LUNA-baseline path (which doesn't
             # need EGNN's torch-geometric kNN code) keeps loading
@@ -602,7 +624,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"Unknown model.backbone={backbone!r}. Expected "
                 f"'luna_transformer', 'egnn', 'vn_transformer', "
                 f"'dit', 'perceiver', 'nystromformer', 'geomattn', "
-                f"'geomattn_nystrom', or 'geomattn_localglobal'."
+                f"'geomattn_nystrom', 'geomattn_localglobal', or one of "
+                f"'geomattn_{{dilated,bigbird,axial,swin,routing}}'."
             )
 
         # ------------------------------------------------------------------

@@ -1595,6 +1595,84 @@ geomattn_localglobal:
     grad_checkpoint: true
 
 # ---------------------------------------------------------------------------
+# Spatial sparse geometry-attention zoo — five backbones, each mapping a
+# famous index-based efficient-attention method to 2-D spatial proximity.
+# Selected via backbone: "geomattn_{dilated,bigbird,axial,swin,routing}".
+# All share the radial geometry bias + DiT scaffolding; the keys below
+# are read from the matching config block. Common knobs (hidden_dim,
+# n_heads, mlp_ratio, time_embed_dim, num_rbf, init_max_dist,
+# detach_geometry, grad_checkpoint) mirror geomattn defaults.
+# ---------------------------------------------------------------------------
+geomattn_dilated:        # Sparse Transformer / dilated Longformer
+    hidden_dim: 256
+    n_heads: 8
+    mlp_ratio: 4
+    time_embed_dim: 256
+    num_rbf: 16
+    init_max_dist: 3.0
+    detach_geometry: true
+    grad_checkpoint: true
+    # K exact neighbours, sampled every `dilation`-th from the top
+    # (n_local*dilation) nearest → spans near→far at O(N·K). dilation=1
+    # reduces to plain local kNN attention.
+    n_local: 32
+    dilation: 3
+    knn_chunk: 1024
+
+geomattn_bigbird:        # BigBird: window + random + global
+    hidden_dim: 256
+    n_heads: 8
+    mlp_ratio: 4
+    time_embed_dim: 256
+    num_rbf: 16
+    init_max_dist: 3.0
+    detach_geometry: true
+    grad_checkpoint: true
+    n_local: 24            # local kNN window
+    n_random: 8            # random distant cells per query (resampled / forward)
+    n_landmarks: 64        # landmark global far field (count-excluded)
+    knn_chunk: 1024
+
+geomattn_axial:          # Axial: x-bands then y-bands
+    hidden_dim: 256
+    n_heads: 8
+    mlp_ratio: 4
+    time_embed_dim: 256
+    num_rbf: 16
+    init_max_dist: 3.0
+    detach_geometry: true
+    grad_checkpoint: true
+    # Cells per band (≈√N is the cost-optimal choice → O(N·√N)).
+    band_size: 128
+
+geomattn_swin:           # Swin: shifted spatial grid windows
+    hidden_dim: 256
+    n_heads: 8
+    mlp_ratio: 4
+    time_embed_dim: 256
+    num_rbf: 16
+    init_max_dist: 3.0
+    detach_geometry: true
+    grad_checkpoint: true
+    # grid × grid spatial buckets; the grid is shifted half a cell on
+    # odd layers for cross-window flow.
+    grid: 8
+
+geomattn_routing:        # Routing Transformer: k-means spatial clusters
+    hidden_dim: 256
+    n_heads: 8
+    mlp_ratio: 4
+    time_embed_dim: 256
+    num_rbf: 16
+    init_max_dist: 3.0
+    detach_geometry: true
+    grad_checkpoint: true
+    # Number of position-space k-means clusters; cells attend within
+    # their cluster. kmeans_iters Lloyd steps per forward.
+    n_clusters: 32
+    kmeans_iters: 5
+
+# ---------------------------------------------------------------------------
 # Architectural extension #3 — Perceiver-style backbone
 # (Jaegle et al. 2021, "Perceiver IO: A General Architecture for
 # Structured Inputs & Outputs")
