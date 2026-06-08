@@ -80,6 +80,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from utils.data.dataholder import DataHolder
 from models.sdpa_attention import SDPAMultiheadAttention
@@ -203,26 +204,49 @@ class GeometryCoupledBlock(nn.Module):
 
     def _geometry_bias(
         self,
-        rbf_feats: torch.Tensor,
+        dist: torch.Tensor,
+        radial: "RadialBasis",
         c: torch.Tensor,
     ) -> torch.Tensor:
         """Build the additive attention bias.
 
+        Memory-efficient formulation: we accumulate the per-head bias
+        directly over the RBF index ``k`` WITHOUT ever materialising the
+        full (B, N, N, K) RBF tensor — that tensor was the dominant
+        memory term (B·N²·K floats) and OOM'd on cortex-scale slices
+        with the default batch size. The K-loop holds only one
+        (B, N, N) Gaussian at a time plus the (B, H, N, N) accumulator.
+
+        Note: the (B, H, N, N) accumulator itself is irreducible for a
+        *dense, per-head* additive attention bias — SDPA must add it to
+        the N×N scores, so it cannot ride FlashAttention's O(N)-memory
+        path. This term is O(B·H·N²); use ``train.batch_size=1`` for
+        ``geomattn`` on cortex/CNS-scale slices (see the backbone
+        docstring).
+
         Args:
-            rbf_feats: (B, N, N, K) shared RBF expansion of distances.
-            c:         (B, D) time/conditioning embedding.
+            dist:   (B, N, N) pairwise Euclidean distances (detached).
+            radial: the shared RadialBasis (centres + log-widths).
+            c:      (B, D) time/conditioning embedding.
         Returns:
             (B*H, N, N) float bias for SDPA's attn_mask.
         """
-        B, N, _, _ = rbf_feats.shape
+        B, N, _ = dist.shape
         H = self.n_heads
-        # Per-head kernel response: (B, N, N, K) → (B, N, N, H).
-        kij = self.kernel(rbf_feats)
-        # → (B, H, N, N)
-        kij = kij.permute(0, 3, 1, 2)
+        centers = radial.centers                                    # (K,)
+        widths = torch.exp(radial.log_widths) + 1e-6                # (K,)
+        W = self.kernel.weight                                      # (H, K)
+
+        bias = dist.new_zeros(B, H, N, N)
+        for k in range(self.num_rbf):
+            # phi_k(d) = exp(-0.5 ((d - mu_k)/sigma_k)^2)  — (B, N, N)
+            phi_k = torch.exp(-0.5 * ((dist - centers[k]) / widths[k]) ** 2)
+            # Add W[h,k] * phi_k to every head h.
+            bias = bias + W[:, k].view(1, H, 1, 1) * phi_k.unsqueeze(1)
+
         # Time-conditioned per-head gate: (B, D) → (B, H) → (B, H, 1, 1).
         gamma = self.gate(c).view(B, H, 1, 1)
-        bias = gamma * kij                                          # (B, H, N, N)
+        bias = gamma * bias                                         # (B, H, N, N)
         # SDPA wants (B*H, N, N) for the rank-3 attn_mask form.
         return bias.reshape(B * H, N, N)
 
@@ -230,7 +254,8 @@ class GeometryCoupledBlock(nn.Module):
         self,
         x: torch.Tensor,
         c: torch.Tensor,
-        rbf_feats: torch.Tensor,
+        dist: torch.Tensor,
+        radial: "RadialBasis",
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -238,7 +263,7 @@ class GeometryCoupledBlock(nn.Module):
         )
         # MSA sub-layer with geometric bias.
         h = _modulate(self.norm1(x), shift_msa, scale_msa)
-        geo_bias = self._geometry_bias(rbf_feats, c)               # (B*H, N, N)
+        geo_bias = self._geometry_bias(dist, radial, c)            # (B*H, N, N)
         attn_out, _ = self.attn(
             h, h, h,
             key_padding_mask=key_padding_mask,
@@ -303,6 +328,17 @@ class GeometryCoupledBackbone(nn.Module):
         # not a parameter (self-conditioning semantics). Exposed as a
         # knob for ablation.
         self.detach_geometry = bool(_g("detach_geometry", True))
+        # Gradient checkpointing: recompute each GCA block in the
+        # backward pass instead of storing its attention scores +
+        # geometric bias. GCA's dense per-head bias is O(B·H·N²) and
+        # the SDPA-with-float-mask path stores the N×N attention per
+        # layer for backward, so a deep stack on cortex-scale slices
+        # (N ~ 10k) otherwise needs tens of GB × n_layers. Checkpointing
+        # trades ~30% extra compute for a large memory cut and is ON by
+        # default for geomattn (unlike DiT, which gets FlashAttention's
+        # O(N) memory for free and doesn't need it). Only active in
+        # training (no-op at inference / under no_grad).
+        self.grad_checkpoint = bool(_g("grad_checkpoint", True))
 
         gene_in = int(input_dims["node_features_dimensions"])
 
@@ -346,20 +382,38 @@ class GeometryCoupledBackbone(nn.Module):
         # --- Geometric bias basis (computed ONCE, shared by all blocks).
         # Distances under the CURRENT coordinate estimate x_t. Detached
         # by default so the bias is a pure conditioning signal.
+        # We pass the (B, N, N) DISTANCE matrix (not the (B, N, N, K)
+        # RBF expansion) to each block: the block accumulates its
+        # per-head bias over the K basis functions on the fly, which
+        # avoids ever materialising the B·N²·K RBF tensor (the dominant
+        # memory term that OOM'd on cortex-scale slices).
         pos = data.positions
         if self.detach_geometry:
             pos = pos.detach()
         pos = pos.float()
-        # Pairwise Euclidean distances. cdist is O(N²) but exact and
-        # numerically clean. Padded cells produce finite garbage rows
-        # that the key_padding_mask (-inf) kills downstream.
+        # cdist is O(N²) but exact and numerically clean. Padded cells
+        # produce finite garbage rows that the key_padding_mask (-inf)
+        # kills downstream.
         dist = torch.cdist(pos, pos)                               # (B, N, N)
-        rbf_feats = self.radial(dist)                              # (B, N, N, K)
 
         key_padding_mask = ~node_mask                              # (B, N) bool, True at PAD
 
+        use_ckpt = self.grad_checkpoint and self.training and torch.is_grad_enabled()
         for block in self.blocks:
-            tok = block(tok, c, rbf_feats, key_padding_mask=key_padding_mask)
+            if use_ckpt:
+                # use_reentrant=False is the modern checkpoint API: it
+                # handles non-tensor args (the shared ``radial`` module,
+                # the bool key_padding_mask) cleanly and supports the
+                # autograd graph correctly. Recomputes the block's
+                # attention + geometric bias in backward.
+                tok = checkpoint(
+                    block, tok, c, dist, self.radial, key_padding_mask,
+                    use_reentrant=False,
+                )
+            else:
+                tok = block(
+                    tok, c, dist, self.radial, key_padding_mask=key_padding_mask,
+                )
 
         out = self.final(tok, c)                                   # (B, N, F+2)
         features = out[..., :-2]

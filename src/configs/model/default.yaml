@@ -1486,6 +1486,16 @@ geomattn:
     # coordinate loss backprops through — self-conditioning semantics).
     # Set False to ablate: let gradient flow through the bias too.
     detach_geometry: true
+    # Gradient checkpointing: recompute each block in the backward pass
+    # instead of storing its (B,H,N,N) attention + geometric bias. ON by
+    # default because GCA's dense per-head bias is O(B·H·N²) and the
+    # SDPA-with-float-mask path stores the N×N attention per layer for
+    # backward — a deep stack on cortex-scale slices (N~10k) otherwise
+    # OOMs an 80 GB GPU at the default batch size. ~30% extra compute,
+    # large memory cut. NOTE: even with checkpointing, geomattn's bias
+    # is fundamentally O(B·H·N²); use train.batch_size=1 for
+    # cortex/CNS-scale slices.
+    grad_checkpoint: true
 
 # ---------------------------------------------------------------------------
 # Architectural extension #3 — Perceiver-style backbone

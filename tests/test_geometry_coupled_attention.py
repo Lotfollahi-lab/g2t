@@ -142,9 +142,9 @@ def test_zero_gate_means_zero_bias_at_init():
     g = torch.Generator().manual_seed(2)
     X = torch.randn(B, N, 2, generator=g)
     c = torch.randn(B, hidden, generator=g)
-    rbf_feats = rb(torch.cdist(X, X))
+    dist = torch.cdist(X, X)
 
-    bias = block._geometry_bias(rbf_feats, c)              # (B*H, N, N)
+    bias = block._geometry_bias(dist, rb, c)               # (B*H, N, N)
     assert torch.count_nonzero(bias) == 0, \
         "geometry bias must be exactly zero at init (zero-init gate)"
 
@@ -165,8 +165,8 @@ def test_nonzero_gate_produces_nonzero_bias():
     g = torch.Generator().manual_seed(4)
     X = torch.randn(B, N, 2, generator=g)
     c = torch.randn(B, hidden, generator=g)
-    rbf_feats = rb(torch.cdist(X, X))
-    bias = block._geometry_bias(rbf_feats, c)
+    dist = torch.cdist(X, X)
+    bias = block._geometry_bias(dist, rb, c)
     assert torch.count_nonzero(bias) > 0
     assert torch.isfinite(bias).all()
 
