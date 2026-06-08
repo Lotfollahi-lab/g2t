@@ -260,7 +260,7 @@ class LocalGlobalGeometryAttention(nn.Module):
         else:  # unified
             out = self._unified(
                 q, k, v, v_nbr, s_local, positions, centroids, seg_id,
-                base_count, nbr_idx, nbr_valid, radial, gamma,
+                base_count, nbr_idx, nbr_valid, real_mask, radial, gamma,
                 key_padding_mask, scale, neg_inf,
             )
 
@@ -311,7 +311,7 @@ class LocalGlobalGeometryAttention(nn.Module):
     # ------------------------------------------------------------------
     def _unified(
         self, q, k, v, v_nbr, s_local, positions, centroids, seg_id,
-        base_count, nbr_idx, nbr_valid, radial, gamma,
+        base_count, nbr_idx, nbr_valid, real_mask, radial, gamma,
         key_padding_mask, scale, neg_inf,
     ) -> torch.Tensor:
         """One softmax over {K local cells} ∪ {M landmarks}, landmark l
