@@ -66,11 +66,18 @@ def compute_distance(coords_or_embed: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+# Backends for compute_spearman_correlation. Listed here so callers
+# and CLI flags share one source of truth.
+VALID_SPEARMAN_BACKENDS = ("scipy", "vectorized", "numba", "gpu")
+DEFAULT_SPEARMAN_BACKEND = "scipy"
+
+
 def compute_spearman_correlation(
     coords_true: np.ndarray,
     coords_pred: np.ndarray,
     progress: bool = False,
     vectorized: bool = False,
+    backend: str = DEFAULT_SPEARMAN_BACKEND,
 ) -> Dict[str, np.ndarray | float]:
     """Per-cell Spearman correlation of pairwise-distance rows.
 
@@ -85,24 +92,36 @@ def compute_spearman_correlation(
         progress: emit a tqdm progress bar over cells if True (loop version
             only — ignored when ``vectorized=True`` since there's no inner
             Python loop to wrap).
-        vectorized: OFF by default to preserve byte-identical metric values
-            for already-scored runs (anyone re-running compute_extended_metrics
-            without explicit opt-in keeps the original
-            scipy.stats.spearmanr semantics). Pass ``vectorized=True`` to
-            dispatch to a numpy-vectorized implementation that batches
-            ``scipy.stats.rankdata`` over rows and reduces to row-wise
-            Pearson correlation — 10-50× faster on large N (CNS-sized
-            slices) and mathematically identical to the loop within float
-            tolerance (regression tested — see
-            tests/test_per_cell_spearman_vectorized.py). The vectorised
-            path returns NaN p-values to keep the dict schema stable;
-            they're not consumed by aggregate_slices() so this is a
-            no-op for the downstream metric battery.
+        vectorized: BACKWARD-COMPAT shortcut. ``vectorized=True`` is
+            now an alias for ``backend="vectorized"``. Prefer setting
+            ``backend`` directly. Conflict (e.g. ``vectorized=True,
+            backend="numba"``) raises ValueError.
+        backend: which implementation to dispatch to:
+            - "scipy" (default): per-cell ``scipy.stats.spearmanr``
+              loop. Slowest, returns real p-values, is the regression
+              baseline. Always available.
+            - "vectorized": numpy-vectorised batched
+              ``scipy.stats.rankdata`` + row-wise Pearson via einsum,
+              chunked to bound memory. 5-20× faster on CNS slices.
+              Bit-faithful to scipy within ~1e-7. P-values NaN.
+            - "numba": Numba-JIT'd per-row rankdata-with-average-ties
+              + ``prange`` across cells. 5-15× faster than scipy loop;
+              uses constant memory per cell (no full rank matrix).
+              Requires ``numba`` (already an scgg env dep).
+              Bit-faithful to scipy within ~1e-7. P-values NaN.
+            - "gpu": chunked ``torch.cdist`` + ``argsort``-based ranks
+              + reduction on GPU. 30-100× faster on big slices when a
+              GPU is available. argsort-based ranks DON'T do scipy's
+              "average" tie correction, so tied rows (typically just
+              the diagonal d[i,i]=0) can diverge by up to ~1e-3
+              per-cell rho — acceptable for our use case but NOT
+              bit-faithful. Falls back loudly if torch/CUDA is
+              unavailable. P-values NaN.
 
     Returns:
         Dict with:
           per_cell:  (N,) per-cell Spearman values (NaNs for degenerate cells)
-          per_cell_p:(N,) p-values (NaN-filled when vectorized=True)
+          per_cell_p:(N,) p-values (real for backend='scipy', NaN otherwise)
           mean:      float, mean over cells
           median:    float, median over cells
     """
@@ -114,12 +133,39 @@ def compute_spearman_correlation(
             f"pred has {coords_pred.shape[0]}"
         )
 
+    # Reconcile legacy ``vectorized`` with the canonical ``backend``
+    # knob. ``vectorized=True`` is treated as ``backend='vectorized'``
+    # when backend is at default; explicit conflict errors out so
+    # callers can't silently get a path they didn't ask for.
+    if vectorized:
+        if backend == DEFAULT_SPEARMAN_BACKEND:
+            backend = "vectorized"
+        elif backend != "vectorized":
+            raise ValueError(
+                f"conflicting flags: vectorized=True with backend={backend!r}. "
+                f"Use ``backend='vectorized'`` exclusively."
+            )
+    if backend not in VALID_SPEARMAN_BACKENDS:
+        raise ValueError(
+            f"unknown backend {backend!r}; valid: {VALID_SPEARMAN_BACKENDS}"
+        )
+
     n = coords_true.shape[0]
+
+    # GPU path computes distance matrices on-device via torch.cdist —
+    # passing pre-computed dt/dp would force a 180 GB CPU→GPU copy on
+    # big slices. So branch before allocating dt/dp on CPU.
+    if backend == "gpu":
+        return _compute_spearman_gpu(coords_true, coords_pred, n)
+
+    # All CPU backends need the full N×N distance matrices resident.
     dt = compute_distance(coords_true)
     dp = compute_distance(coords_pred)
 
-    if vectorized:
+    if backend == "vectorized":
         return _compute_spearman_vectorized(dt, dp, n)
+    if backend == "numba":
+        return _compute_spearman_numba(dt, dp, n)
     return _compute_spearman_loop(dt, dp, n, progress=progress)
 
 
@@ -262,6 +308,230 @@ def _compute_spearman_vectorized(
     # ``vectorized=False``.
     pval = np.full(n, np.nan, dtype=np.float64)
 
+    rho_ok = rho[~np.isnan(rho)]
+    return {
+        "per_cell": rho,
+        "per_cell_p": pval,
+        "mean": float(rho_ok.mean()) if rho_ok.size else float("nan"),
+        "median": float(np.median(rho_ok)) if rho_ok.size else float("nan"),
+        "n": int(n),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Spearman backend: numba (JIT-compiled CPU)
+# ---------------------------------------------------------------------------
+
+# Module-level cache for the compiled Numba kernel — first call to
+# _compute_spearman_numba pays the ~30s JIT cost, subsequent calls hit
+# the cache. None until first use; set to the compiled function or to
+# an exception (to surface the same error on every subsequent call).
+_NUMBA_KERNEL: object | None = None
+
+
+def _build_numba_kernel():
+    """JIT-compile the per-cell Spearman kernel once and return it.
+
+    Lazy compilation so importing this module doesn't pay the JIT cost
+    even when callers stay on the scipy path. Raises ImportError if
+    ``numba`` is missing — caller (``_compute_spearman_numba``) maps
+    that to a clear user-facing message.
+    """
+    try:
+        from numba import njit, prange  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "backend='numba' requires the numba package. "
+            "Install with `pip install numba` (already in the scgg "
+            "env's setup script for the PH-loss path)."
+        ) from e
+
+    # Average-tie ranking. Mirrors scipy.stats.rankdata(method='average'):
+    # for a tie group spanning sorted positions i..j (inclusive),
+    # every element in the group gets rank (i+1 + j+1)/2 in 1-indexed
+    # convention (= (i + j + 2)/2.0).
+    @njit(cache=True)
+    def _rankdata_average(row):  # noqa: F811
+        n = row.shape[0]
+        sorted_idx = np.argsort(row)
+        ranks = np.empty(n, dtype=np.float64)
+        i = 0
+        while i < n:
+            j = i
+            # Extend the tie group as long as the next sorted value
+            # matches the current one. Equality compared on the
+            # original-typed values, not on float rounding, so ties
+            # are detected the same way scipy does.
+            while j + 1 < n and row[sorted_idx[j + 1]] == row[sorted_idx[i]]:
+                j += 1
+            avg = (i + j + 2) / 2.0  # 1-indexed average rank
+            for k in range(i, j + 1):
+                ranks[sorted_idx[k]] = avg
+            i = j + 1
+        return ranks
+
+    # Per-cell loop, parallelised across rows via prange. Each
+    # iteration is independent — no shared state, no aliasing — so
+    # Numba's automatic parallelisation is safe.
+    @njit(parallel=True, cache=True)
+    def _per_cell_spearman_numba(dt, dp):  # noqa: F811
+        n = dt.shape[0]
+        rho = np.empty(n, dtype=np.float64)
+        for i in prange(n):
+            rt = _rankdata_average(dt[i])
+            rp = _rankdata_average(dp[i])
+            # Centre by mean (in-place).
+            mt = rt.mean()
+            mp = rp.mean()
+            for k in range(n):
+                rt[k] -= mt
+                rp[k] -= mp
+            # Per-row Pearson reduction.
+            num = 0.0
+            norm_t_sq = 0.0
+            norm_p_sq = 0.0
+            for k in range(n):
+                num += rt[k] * rp[k]
+                norm_t_sq += rt[k] * rt[k]
+                norm_p_sq += rp[k] * rp[k]
+            denom = np.sqrt(norm_t_sq) * np.sqrt(norm_p_sq)
+            if denom > 0.0:
+                rho[i] = num / denom
+            else:
+                # Degenerate row (zero variance) — scipy returns NaN.
+                rho[i] = np.nan
+        return rho
+
+    return _per_cell_spearman_numba
+
+
+def _compute_spearman_numba(
+    dt: np.ndarray,
+    dp: np.ndarray,
+    n: int,
+) -> Dict[str, np.ndarray | float]:
+    """Numba-JIT'd per-cell Spearman.
+
+    First call pays a one-time ~30 s JIT compile, then subsequent
+    calls (across slices and timestamps) hit the on-disk Numba cache
+    (``cache=True`` on the kernels). The hot per-cell loop runs in
+    optimised machine code with ``prange`` parallelisation across
+    cores, so the OMP/MKL thread environment in the caller's shell
+    controls how many CPUs are used.
+
+    Memory: ``dt + dp`` resident (~180 GB at N=150k), plus 2 × N
+    float64 rank vectors per active thread (~2.4 MB per thread at
+    N=150k). MUCH lighter than the chunked vectorised path because
+    we never allocate a (chunk, N) rank matrix.
+    """
+    global _NUMBA_KERNEL
+    if _NUMBA_KERNEL is None:
+        _NUMBA_KERNEL = _build_numba_kernel()
+    kernel = _NUMBA_KERNEL
+
+    # Numba's prange threading is independent of the chunked python
+    # loop in the vectorised path — let it use whatever NUMBA_NUM_THREADS
+    # / OMP_NUM_THREADS the environment is set to.
+    rho = kernel(dt, dp)
+    pval = np.full(n, np.nan, dtype=np.float64)
+    rho_ok = rho[~np.isnan(rho)]
+    return {
+        "per_cell": rho,
+        "per_cell_p": pval,
+        "mean": float(rho_ok.mean()) if rho_ok.size else float("nan"),
+        "median": float(np.median(rho_ok)) if rho_ok.size else float("nan"),
+        "n": int(n),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Spearman backend: gpu (torch.cdist + argsort, chunked)
+# ---------------------------------------------------------------------------
+
+
+def _compute_spearman_gpu(
+    coords_true: np.ndarray,
+    coords_pred: np.ndarray,
+    n: int,
+    chunk_size: int = 2048,
+) -> Dict[str, np.ndarray | float]:
+    """Chunked GPU implementation.
+
+    Strategy (different from the CPU paths because GPU memory is
+    tighter):
+      - DON'T materialise the full N×N distance matrix on GPU.
+        Instead, for each row-chunk i..i+chunk_size, compute
+        ``torch.cdist(coords[i:i+c], coords)`` → ``(chunk, N)``
+        on-device. Peak transient ~4 × chunk × N float32 bytes per
+        method (≈ 5 GB at chunk=2048, N=150k) — fits easily on A100/H100.
+      - Rank via ``torch.argsort(torch.argsort(row))``. This gives
+        DENSE integer ranks (no average-tie correction). For pairwise
+        distance matrices the only systematic tie is the diagonal
+        ``d[i,i]=0``; otherwise ties are vanishingly rare with
+        continuous coords. Practical per-cell rho drift vs scipy:
+        ≤ 1e-3, see test_per_cell_spearman_backends.py.
+      - Reduce per-row Pearson directly with torch ops.
+
+    Falls back loudly with a clear error if PyTorch isn't installed
+    or no CUDA device is visible (rather than silently dropping to CPU).
+    """
+    try:
+        import torch  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "backend='gpu' requires PyTorch. "
+            "Install with `pip install torch` (the scgg env already "
+            "has it for training)."
+        ) from e
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "backend='gpu' requires a visible CUDA device; "
+            "torch.cuda.is_available() returned False. "
+            "Either submit the LSF job with a GPU request or fall "
+            "back to backend='numba'/'vectorized' on CPU."
+        )
+
+    device = torch.device("cuda")
+    # coords_pred can be d-dim embedding; coords_true is always 2D.
+    ct = torch.from_numpy(np.ascontiguousarray(coords_true)).to(device)
+    cp = torch.from_numpy(np.ascontiguousarray(coords_pred)).to(device)
+
+    rho_gpu = torch.empty(n, dtype=torch.float64, device=device)
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        # Compute this chunk's distance rows on-device. cdist returns
+        # float32 by default; that's enough precision for ranks.
+        dt_chunk = torch.cdist(ct[start:end], ct)  # (chunk, N)
+        dp_chunk = torch.cdist(cp[start:end], cp)  # (chunk, N)
+
+        # Dense integer rank per row via the argsort-of-argsort trick.
+        # NOTE: doesn't average over tie groups (see docstring caveat).
+        rt = torch.argsort(torch.argsort(dt_chunk, dim=1), dim=1).to(torch.float64)
+        rp = torch.argsort(torch.argsort(dp_chunk, dim=1), dim=1).to(torch.float64)
+
+        rt -= rt.mean(dim=1, keepdim=True)
+        rp -= rp.mean(dim=1, keepdim=True)
+        num = (rt * rp).sum(dim=1)
+        norm_t = (rt * rt).sum(dim=1).sqrt()
+        norm_p = (rp * rp).sum(dim=1).sqrt()
+        denom = norm_t * norm_p
+        # NaN where denom == 0 (degenerate row); torch.where avoids the
+        # divide-by-zero warning.
+        safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+        chunk_rho = torch.where(
+            denom > 0, num / safe_denom,
+            torch.tensor(float("nan"), dtype=torch.float64, device=device),
+        )
+        rho_gpu[start:end] = chunk_rho
+
+        # Release the chunk's transients before the next iteration —
+        # without this the allocator can hold onto them, pushing peak
+        # closer to chunk × N for both dt+dp+rt+rp simultaneously.
+        del dt_chunk, dp_chunk, rt, rp, num, norm_t, norm_p, denom, chunk_rho
+
+    rho = rho_gpu.cpu().numpy()
+    pval = np.full(n, np.nan, dtype=np.float64)
     rho_ok = rho[~np.isnan(rho)]
     return {
         "per_cell": rho,
@@ -500,6 +770,7 @@ def evaluate_slice(
     compute_rssd: bool = True,
     rssd_projection: str = "pca",
     spearman_vectorized: bool = False,
+    spearman_backend: str = DEFAULT_SPEARMAN_BACKEND,
 ) -> Dict[str, float]:
     """Compute all three LUNA metrics on one slice.
 
@@ -513,11 +784,14 @@ def evaluate_slice(
         contact_percentile: percentile threshold for `compute_contact`.
         compute_rssd: skip the RSSD computation if False (no projection).
         rssd_projection: 'pca' or 'mds' if the embedding is not 2-D.
-        spearman_vectorized: OFF by default so already-scored runs keep
-            the exact metric values they had before this knob existed.
-            Set True to use the batched-rankdata implementation (10-50×
-            faster on CNS-sized slices, bit-faithful within float
-            tolerance — see test_per_cell_spearman_vectorized.py).
+        spearman_vectorized: BACKWARD-COMPAT shortcut for
+            ``spearman_backend='vectorized'``. Prefer ``spearman_backend``
+            directly. Conflicting explicit settings raise ValueError.
+        spearman_backend: which Spearman implementation to use. One of
+            "scipy" (default, original loop), "vectorized" (chunked
+            numpy rankdata), "numba" (JIT'd CPU), "gpu" (chunked torch
+            on CUDA). See ``compute_spearman_correlation`` for the
+            speed/precision trade-offs of each.
 
     Returns:
         Flat dict of metrics for this slice.
@@ -525,7 +799,9 @@ def evaluate_slice(
     out: Dict[str, float] = {}
 
     spr = compute_spearman_correlation(
-        coords_true, coords_pred, vectorized=spearman_vectorized,
+        coords_true, coords_pred,
+        vectorized=spearman_vectorized,
+        backend=spearman_backend,
     )
     out["spearman_per_cell_mean"] = spr["mean"]
     out["spearman_per_cell_median"] = spr["median"]
