@@ -439,6 +439,57 @@ class LossFunction(nn.Module):
                                              "knn_neighborhood", "n_sample",
                                              default=256))
 
+        # 5. Sparse local-neighbourhood distance loss. The O(N·k)
+        # sibling of locality_weighted_distance: instead of building the
+        # full (N,N) distance matrix and DOWN-weighting far pairs, it
+        # only ever computes distances on each cell's true k-NN (+ a few
+        # random pairs for a global skeleton). Reads ``masked_pred.edm_h``
+        # (the (N,k) embedding) directly, so when paired with the EDM
+        # head's ``skip_edm_D_train=true`` it removes the last O(N²) term
+        # from the training step. ``local_k`` defaults to 32 to align
+        # with geomattn_localglobal's ``n_local`` (the model attends to
+        # the same local neighbourhood it is now supervised on).
+        self._sld_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                          "sparse_local_distance", "enabled",
+                                          default=False))
+        self._sld_weight = float(_cfg_get(cfg, "model", "loss",
+                                          "sparse_local_distance", "weight",
+                                          default=1.0))
+        self._sld_local_k = int(_cfg_get(cfg, "model", "loss",
+                                         "sparse_local_distance", "local_k",
+                                         default=32))
+        self._sld_n_random = int(_cfg_get(cfg, "model", "loss",
+                                          "sparse_local_distance", "n_random",
+                                          default=8))
+        self._sld_global_weight = float(_cfg_get(
+            cfg, "model", "loss", "sparse_local_distance", "global_weight",
+            default=0.1))
+        self._sld_fn = str(_cfg_get(cfg, "model", "loss",
+                                    "sparse_local_distance", "weight_fn",
+                                    default="none")).lower()
+        if self._sld_fn not in ("none", "exp", "inverse"):
+            raise ValueError(
+                f"model.loss.sparse_local_distance.weight_fn must be "
+                f"'none', 'exp' or 'inverse'; got {self._sld_fn!r}."
+            )
+        self._sld_sigma = float(_cfg_get(cfg, "model", "loss",
+                                         "sparse_local_distance", "sigma",
+                                         default=1.0))
+        self._sld_knn_chunk = int(_cfg_get(cfg, "model", "loss",
+                                           "sparse_local_distance",
+                                           "knn_chunk", default=1024))
+        self._sld_cache_true = bool(_cfg_get(cfg, "model", "loss",
+                                             "sparse_local_distance",
+                                             "cache_true", default=True))
+        # True-kNN cache: {fingerprint -> (nbr_idx_cpu, nbr_dist_cpu)}.
+        # True positions never change across epochs, so the (expensive,
+        # O(N²)-compute / O(N·chunk)-memory) chunked top-k is paid once
+        # per slice and reused. Bounded by slice count (small). Random
+        # global pairs are NOT cached (re-sampled each step on purpose,
+        # so they sweep different long-range pairs over training — a
+        # stochastic estimator of the global distance term).
+        self._sld_true_cache: dict = {}
+
         # k-NN graph loss — scGG fundamental method #4. Reads
         # ``masked_pred.knn_logits`` (B, N, N edge logits) stashed by
         # KNNGraphOutputWrapper; supervises with contrastive BCE on
@@ -539,6 +590,7 @@ class LossFunction(nn.Module):
                 "pairwise_distance_mse", "edm_distance_mse",
                 "locality_weighted_distance", "log_distance_mse",
                 "rank_spearman", "knn_neighborhood",
+                "sparse_local_distance",
                 "knn_graph_loss", "coarse_centroid_mse",
                 "latent_fm_mse", "latent_kl",
             )
@@ -588,6 +640,10 @@ class LossFunction(nn.Module):
              self._compute_rank_spearman),
             ("knn_neighborhood", self._knn_nb_enabled, self._knn_nb_weight,
              self._compute_knn_neighborhood),
+            # Sparse local-neighbourhood distance — reads edm_h (NOT
+            # edm_D), so it is O(N·k) and survives skip_edm_D_train.
+            ("sparse_local_distance", self._sld_enabled, self._sld_weight,
+             self._compute_sparse_local_distance),
             # scGG fundamental method #4 (k-NN graph): contrastive BCE
             # on positive/negative edges drawn from true positions.
             ("knn_graph_loss", self._knn_graph_enabled, self._knn_graph_weight,
@@ -1896,6 +1952,136 @@ class LossFunction(nn.Module):
                 w = torch.exp(-dt / sigma)
             sq_err = (dp - dt) ** 2
             losses.append((w * sq_err).sum() / (w.sum() + 1e-8))
+        if not losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(losses))
+
+    def _sld_true_knn(self, true_pos_v, keff, knn_chunked):
+        """True k-NN (idx, dist) for one slice's valid cells, cached by
+        content fingerprint. True positions never change across epochs,
+        so the chunked top-k (O(N²) compute, O(N·chunk) memory, no grad)
+        is paid once per slice and reused. Returns
+        ``(idx (n,keff) long, dist (n,keff) float)`` on ``true_pos_v``'s
+        device/dtype. ``knn_chunked`` is passed in to keep the import
+        local (avoids any models<->metrics load-order coupling)."""
+        n = int(true_pos_v.shape[0])
+        cache_key = None
+        if self._sld_cache_true:
+            with torch.no_grad():
+                cache_key = (
+                    n, int(keff),
+                    float(true_pos_v[0, 0].item()),
+                    float(true_pos_v[-1, -1].item()),
+                    float(true_pos_v.sum().item()),
+                )
+            cached = self._sld_true_cache.get(cache_key)
+            if cached is not None:
+                idx_c, dist_c = cached
+                return (
+                    idx_c.to(true_pos_v.device),
+                    dist_c.to(true_pos_v.device, dtype=true_pos_v.dtype),
+                )
+        with torch.no_grad():
+            real_mask = torch.ones(
+                1, n, dtype=torch.bool, device=true_pos_v.device,
+            )
+            idx, dist, _ = knn_chunked(
+                true_pos_v.unsqueeze(0), real_mask, int(keff),
+                chunk_size=int(self._sld_knn_chunk),
+            )
+            idx = idx[0]            # (n, keff)
+            dist = dist[0]          # (n, keff)
+        if cache_key is not None:
+            self._sld_true_cache[cache_key] = (
+                idx.detach().cpu(), dist.detach().cpu(),
+            )
+        return idx, dist
+
+    def _compute_sparse_local_distance(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """O(N·k) local-neighbourhood distance loss — the sparse sibling
+        of ``_compute_locality_weighted_distance``.
+
+        Instead of building the full (N,N) distance matrix and
+        DOWN-weighting far pairs, it reads the per-cell embedding
+        ``masked_pred.edm_h`` (B,N,k) and matches predicted vs true
+        Euclidean distances ONLY on:
+          * each cell's true k-NN (``local_k`` neighbours) — local
+            fidelity, exactly what the per-cell Spearman metric rewards;
+          * ``n_random`` random far pairs per cell — a cheap global
+            skeleton so the embedding can't fold distant regions onto
+            each other (the crowding problem). Re-sampled every step
+            (stochastic estimator of the global distance term), weighted
+            by ``global_weight``. Set ``n_random=0`` for pure-local.
+
+        Never materialises an (N,N) tensor: peak memory is
+        O(N·(k+r)·embed_dim) for the gradient path + O(N·chunk) for the
+        cached, no-grad true k-NN. Paired with the EDM head's
+        ``skip_edm_D_train=true`` (so the head also skips its (N,N)
+        D_sq), the whole training step becomes sub-quadratic — the
+        scalable counterpart to the dense locality loss.
+
+        ``local_k`` defaults to 32 to ALIGN with
+        geomattn_localglobal's ``n_local``: the model is supervised on
+        the same local neighbourhood it attends to.
+        """
+        from models.geometry_local_global_attention import knn_chunked
+
+        h = getattr(masked_pred, "edm_h", None)
+        if h is None:
+            return _graph_zero(masked_pred)
+        eps = 1e-8
+        K = int(self._sld_local_k)
+        R = int(self._sld_n_random)
+        gw = float(self._sld_global_weight)
+        losses = []
+        for b in range(h.shape[0]):
+            mask = masked_true.node_mask[b]
+            valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            n = int(valid_idx.numel())
+            if n < 2:
+                continue
+            h_v = h[b].index_select(0, valid_idx)                 # (n, kd)
+            true_pos_v = masked_true.positions[b].index_select(
+                0, valid_idx,
+            )                                                     # (n, 2)
+
+            # ---- local term: true k-NN (self excluded) ----
+            keff = min(K + 1, n)   # +1: knn_chunked includes self at col 0
+            nbr_idx, nbr_dist = self._sld_true_knn(
+                true_pos_v, keff, knn_chunked,
+            )
+            nbr_idx = nbr_idx[:, 1:]          # drop self column → (n, Kloc)
+            d_true_loc = nbr_dist[:, 1:]
+            if nbr_idx.shape[1] == 0:
+                continue
+            h_nbr = h_v[nbr_idx]                              # (n, Kloc, kd)
+            diff = h_v.unsqueeze(1) - h_nbr
+            d_pred_loc = (diff * diff).sum(-1).clamp_min(0.0).add(eps).sqrt()
+            sq_err = (d_pred_loc - d_true_loc) ** 2           # (n, Kloc)
+            if self._sld_fn == "exp":
+                w = torch.exp(-d_true_loc / self._sld_sigma)
+            elif self._sld_fn == "inverse":
+                w = 1.0 / (1.0 + d_true_loc)
+            else:  # "none" — plain MSE over local pairs
+                w = torch.ones_like(d_true_loc)
+            loss_b = (w * sq_err).sum() / (w.sum() + eps)
+
+            # ---- global term: random far pairs (re-sampled, no cache) ----
+            if R > 0 and gw > 0.0:
+                with torch.no_grad():
+                    rand_idx = torch.randint(
+                        0, n, (n, R), device=h.device,
+                    )
+                d_true_rnd = (
+                    true_pos_v.unsqueeze(1) - true_pos_v[rand_idx]
+                ).pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()    # (n, R)
+                diff_r = h_v.unsqueeze(1) - h_v[rand_idx]
+                d_pred_rnd = diff_r.pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
+                loss_b = loss_b + gw * ((d_pred_rnd - d_true_rnd) ** 2).mean()
+
+            losses.append(loss_b)
         if not losses:
             return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))

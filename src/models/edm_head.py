@@ -263,12 +263,32 @@ class EDMOutputWrapper(nn.Module):
         mds_align_train: bool = True,
         mds_dtype: str = "fp64",
         mds_solver: str = "eigh",
+        skip_edm_D_train: bool = False,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
         self.embed_dim = int(embed_dim)
         self.mds_align = bool(mds_align)
         self.anisotropic_gating = bool(anisotropic_gating)
+        # Sparse-training fast path. When True, the forward pass does NOT
+        # materialise the (B, N, N) squared-distance matrix ``D_sq``
+        # during TRAINING — it only sets ``pred.edm_h`` (the small
+        # (B, N, k) embedding). This is the enabler for the
+        # O(N·k) ``sparse_local_distance`` loss, which reads ``edm_h``
+        # and computes distances on each cell's k-NN only, never on the
+        # full pairwise matrix. The EDM head's ``D_sq`` is otherwise the
+        # last remaining O(N²) term in the training step (the backbone
+        # can already be sub-quadratic, e.g. geomattn_localglobal), so
+        # skipping it is what actually buys end-to-end scalability.
+        # The FM Euler step reads ``pred.edm_h`` (not ``edm_D``), so the
+        # generative path is unaffected; at INFERENCE (eval mode) the
+        # full ``D_sq`` + MDS always run so ``pred.positions`` stays the
+        # canonical layout. SAFETY: only meaningful when no loss reads
+        # ``pred.edm_D`` at train time — i.e. ``edm_distance_mse`` is off
+        # (``model.edm.loss_weight=0``) and ``sparse_local_distance`` is
+        # the active distance loss. The diffusion_model auto-config
+        # raises a loud error otherwise.
+        self.skip_edm_D_train = bool(skip_edm_D_train)
         # MDS solver knobs.
         # ``mds_dtype``:
         #   "fp64" (default) — promote D_v to float64 before eigh.
@@ -420,6 +440,17 @@ class EDMOutputWrapper(nn.Module):
         # Zero out padding cells so they don't contaminate distances.
         mask = data.node_mask.to(h.dtype).unsqueeze(-1)
         h = h * mask                                # (B, N, k)
+
+        # Sparse-training fast path — skip the full (B, N, N) matrix.
+        # See the ``skip_edm_D_train`` comment in __init__. ``edm_D`` is
+        # set to None so any loss that still reads it (via the
+        # ``getattr(masked_pred, "edm_D", None)`` guard) degrades to its
+        # gradient-zero fallback rather than crashing. The active
+        # distance loss (sparse_local_distance) reads ``edm_h`` instead.
+        if self.training and self.skip_edm_D_train:
+            pred.edm_h = h
+            pred.edm_D = None
+            return pred
 
         # Pairwise squared distances:
         #   isotropic case   (default): D_ij = ‖h_i − h_j‖²

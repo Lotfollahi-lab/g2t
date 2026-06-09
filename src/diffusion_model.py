@@ -203,6 +203,52 @@ class FullDenoisingDiffusion(pl.LightningModule):
                         "weight": edm_loss_weight,
                     })
 
+            # Sparse-training guard. When edm.skip_edm_D_train is set,
+            # the head emits pred.edm_D = None during training, so EVERY
+            # loss that reads edm_D (edm_distance_mse + the dense spatial
+            # variants) degrades to its gradient-zero fallback. That is
+            # the silent-silencing pattern the codebase rejects — fail
+            # LOUD: those terms must be off and the O(N·k)
+            # sparse_local_distance must be the active distance loss.
+            if bool(getattr(_edm_cfg_early, "skip_edm_D_train", False)):
+                _ld = cfg.model.loss
+                _edm_block = getattr(_ld, "edm_distance_mse", None)
+                _offenders = []
+                if (
+                    _edm_block is not None
+                    and bool(getattr(_edm_block, "enabled", False))
+                    and float(getattr(_edm_block, "weight", 0.0)) > 0.0
+                ):
+                    _offenders.append(
+                        "edm_distance_mse (set model.edm.loss_weight=0)"
+                    )
+                for _nm in (
+                    "locality_weighted_distance", "log_distance_mse",
+                    "rank_spearman", "knn_neighborhood",
+                ):
+                    _blk = getattr(_ld, _nm, None)
+                    if _blk is not None and bool(getattr(_blk, "enabled", False)):
+                        _offenders.append(_nm)
+                if _offenders:
+                    raise ValueError(
+                        "model.edm.skip_edm_D_train=true emits no pred.edm_D "
+                        "at train time, but these loss terms read edm_D and "
+                        f"would silently become no-ops: {_offenders}. Turn "
+                        "them off (set model.edm.loss_weight=0 for the EDM "
+                        "MSE) and use model.loss.sparse_local_distance "
+                        "instead, which reads edm_h and is O(N*k)."
+                    )
+                _sld_block = getattr(_ld, "sparse_local_distance", None)
+                if _sld_block is None or not bool(
+                    getattr(_sld_block, "enabled", False)
+                ):
+                    raise ValueError(
+                        "model.edm.skip_edm_D_train=true removes the full "
+                        "(N,N) distance matrix at train time, so the only "
+                        "sensible distance loss is the O(N*k) sparse one. "
+                        "Set model.loss.sparse_local_distance.enabled=true."
+                    )
+
         if _knn_graph_enabled_early:
             if bool(getattr(_knn_graph_cfg_early, "replace_position_loss", True)):
                 if hasattr(cfg.model.loss, "pairwise_distance_mse"):
@@ -693,6 +739,12 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 # historic behaviour (fp64 + eigh).
                 mds_dtype=str(getattr(edm_cfg, "mds_dtype", "fp64")),
                 mds_solver=str(getattr(edm_cfg, "mds_solver", "eigh")),
+                # Sparse-training: skip the (B,N,N) D_sq at train time so
+                # the O(N·k) sparse_local_distance loss is the only
+                # distance term. Default False (historic full-matrix).
+                skip_edm_D_train=bool(
+                    getattr(edm_cfg, "skip_edm_D_train", False)
+                ),
             )
 
         if knn_graph_enabled:

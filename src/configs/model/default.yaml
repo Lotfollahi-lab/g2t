@@ -669,6 +669,32 @@ loss:
         n_sample: 256         # anchor cells subsampled per slice
         warmup_steps: 0
 
+    # Sparse local-neighbourhood distance loss — the O(N*k) sibling of
+    # locality_weighted_distance. Reads pred.edm_h (the (N,k) embedding),
+    # NOT pred.edm_D, so it never builds the full (N,N) matrix: for each
+    # cell it matches predicted vs true Euclidean distance on its true
+    # k-NN (local fidelity) plus n_random random pairs (a cheap global
+    # skeleton against the crowding problem). Pair with
+    # ``model.edm.skip_edm_D_train=true`` (which makes the head ALSO skip
+    # its (N,N) D_sq at train time) to get a fully sub-quadratic training
+    # step — the scalable counterpart of the dense locality loss.
+    #
+    # ``local_k`` defaults to 32 to ALIGN with geomattn_localglobal's
+    # ``n_local``: the model is supervised on the same local
+    # neighbourhood it attends to. The true k-NN never changes across
+    # epochs, so it is cached per slice (``cache_true``).
+    sparse_local_distance:
+        enabled: false
+        weight: 1.0
+        local_k: 32           # true-kNN neighbours supervised per cell
+        n_random: 8           # random far pairs per cell (0 = pure local)
+        global_weight: 0.1    # weight of the random-pair (global) term
+        weight_fn: none       # none | exp | inverse (local-pair reweighting)
+        sigma: 1.0            # exp(-d_true/sigma) when weight_fn=exp
+        knn_chunk: 1024       # query-axis chunk for the true-kNN top-k
+        cache_true: true      # cache true k-NN per slice (constant target)
+        warmup_steps: 0
+
     # Anisotropic shape-matching loss. Supervises the COVARIANCE
     # eigenvalues of the predicted point cloud against the true
     # cloud's, per slice. Captures the "wide-x narrow-y" shape signal
@@ -1231,6 +1257,22 @@ edm:
     # ``mds_align_gradient=false``. The wrapper fail-loud-raises
     # otherwise.
     mds_solver: "eigh"
+    # ---- Sparse-training: skip the full (N,N) D_sq at train time ----
+    # When true, the EDM head does NOT materialise the (B,N,N) squared
+    # distance matrix during TRAINING — it only emits pred.edm_h (the
+    # small (N,k) embedding). This is the enabler for the O(N*k)
+    # ``model.loss.sparse_local_distance`` loss (which reads edm_h, not
+    # edm_D). The head's D_sq is otherwise the last remaining O(N²) term
+    # in a training step once the backbone is sub-quadratic, so skipping
+    # it is what makes training end-to-end sub-quadratic. The FM Euler
+    # step reads edm_h (not edm_D) so the generative path is unaffected;
+    # at INFERENCE (eval mode) the full D_sq + MDS always run so
+    # pred.positions stays the canonical layout for metrics/plots.
+    # GUARD (enforced in diffusion_model.py): requires
+    # ``model.edm.loss_weight=0`` (edm_distance_mse off), the dense
+    # edm_D-reading losses off, and sparse_local_distance.enabled=true —
+    # otherwise those terms would silently become no-ops.
+    skip_edm_D_train: false
     # ---- MDS Tikhonov regularization strength ----
     # Per-eigenvalue diagonal perturbation in ``_classical_mds_2d``.
     # The Tikhonov diagonal is ``arange(n) * mds_tikhonov_eps * scale``
