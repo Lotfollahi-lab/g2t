@@ -141,6 +141,50 @@ def test_missing_edm_h_returns_graph_zero():
 
 
 # ----------------------------------------------------------------------
+# structured global anchor (FPS landmarks)
+# ----------------------------------------------------------------------
+
+def test_fps_landmarks_spread_cache_and_shapes():
+    loss = LossFunction(_cfg(n_landmarks=32, landmark_mode="fps"))
+    g = torch.Generator().manual_seed(0)
+    pos = torch.randn(500, 2, generator=g) * torch.tensor([5.0, 1.0])
+    idx, d_true = loss._sld_landmarks(pos, 32)
+    assert idx.shape == (32,) and d_true.shape == (500, 32)
+    assert torch.isfinite(d_true).all() and (d_true >= 0).all()
+    # cache hit returns identical
+    idx2, d2 = loss._sld_landmarks(pos, 32)
+    assert torch.equal(idx, idx2) and torch.allclose(d_true, d2)
+    # FPS landmarks are far more spread than a random subset (coverage)
+    def spread(ii):
+        c = pos[ii]
+        return torch.pdist(c).mean()
+    rand = torch.randperm(500, generator=torch.Generator().manual_seed(1))[:32]
+    assert spread(idx) > spread(rand), "FPS landmarks should out-spread random"
+
+
+def test_landmark_term_runs_and_grad():
+    pred, true, h = _holders(B=2, N=120, kd=8, seed=5)
+    loss = LossFunction(_cfg(local_k=16, n_random=0, n_landmarks=32,
+                             landmark_weight=0.1))
+    val = loss._compute_sparse_local_distance(pred, true)
+    assert torch.isfinite(val) and val.item() >= 0.0
+    val.backward()
+    assert h.grad is not None and torch.isfinite(h.grad).all()
+    assert h.grad.abs().sum() > 0, "no gradient reached edm_h via landmark term"
+
+
+def test_landmark_term_adds_signal():
+    """Enabling landmarks changes the loss (the global term is active)."""
+    pred, true, _ = _holders(B=1, N=100, kd=8, seed=6)
+    base = LossFunction(_cfg(local_k=16, n_random=0, n_landmarks=0))
+    withlm = LossFunction(_cfg(local_k=16, n_random=0, n_landmarks=32,
+                               landmark_weight=0.5))
+    v0 = base._compute_sparse_local_distance(pred, true).item()
+    v1 = withlm._compute_sparse_local_distance(pred, true).item()
+    assert v1 > v0, "landmark term should add a positive global penalty"
+
+
+# ----------------------------------------------------------------------
 # true-kNN cache consistency
 # ----------------------------------------------------------------------
 

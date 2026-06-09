@@ -726,6 +726,13 @@ loss:
         sigma: 1.0            # exp(-d_true/sigma) when weight_fn=exp
         knn_chunk: 1024       # query-axis chunk for the true-kNN top-k
         cache_true: true      # cache true k-NN per slice (constant target)
+        # Structured global anchor (same idea as geomattn_localglobal's M
+        # landmarks). Supervises each cell's distance to M SHARED,
+        # spatially-spread landmark cells -> a consistent global frame,
+        # the less-noisy counterpart of n_random. O(N*M). 0 = off.
+        n_landmarks: 0        # number of global landmark cells (0 = off)
+        landmark_weight: 0.1  # weight of the landmark (global frame) term
+        landmark_mode: fps    # fps (farthest-point, spread) | random (shared subset)
         warmup_steps: 0
 
     # Anisotropic shape-matching loss. Supervises the COVARIANCE

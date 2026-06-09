@@ -489,6 +489,33 @@ class LossFunction(nn.Module):
         # so they sweep different long-range pairs over training — a
         # stochastic estimator of the global distance term).
         self._sld_true_cache: dict = {}
+        # Structured global anchor (landmarks). Same idea as
+        # geomattn_localglobal's M landmarks, but selected as
+        # spatially-SPREAD cells via farthest-point sampling (FPS) rather
+        # than index-based segment means (which collapse to ~the global
+        # centroid when cells aren't spatially sorted, and so can't pin a
+        # 2D frame). Supervising each cell's distance to M shared,
+        # spread-out landmark cells gives every cell a CONSISTENT global
+        # coordinate frame — the structured counterpart of the noisy
+        # per-cell random pairs (n_random). O(N·M). n_landmarks=0 = off.
+        self._sld_n_landmarks = int(_cfg_get(cfg, "model", "loss",
+                                             "sparse_local_distance",
+                                             "n_landmarks", default=0))
+        self._sld_landmark_weight = float(_cfg_get(
+            cfg, "model", "loss", "sparse_local_distance",
+            "landmark_weight", default=0.1))
+        self._sld_landmark_mode = str(_cfg_get(
+            cfg, "model", "loss", "sparse_local_distance",
+            "landmark_mode", default="fps")).lower()
+        if self._sld_landmark_mode not in ("fps", "random"):
+            raise ValueError(
+                "model.loss.sparse_local_distance.landmark_mode must be "
+                f"'fps' or 'random'; got {self._sld_landmark_mode!r}."
+            )
+        # {fingerprint -> (landmark_idx_cpu, d_true_landmark_cpu)}. True
+        # positions are fixed, so the landmark set + their true distances
+        # are constant across epochs — built once per slice, cached.
+        self._sld_landmark_cache: dict = {}
 
         # k-NN graph loss — scGG fundamental method #4. Reads
         # ``masked_pred.knn_logits`` (B, N, N edge logits) stashed by
@@ -1997,6 +2024,63 @@ class LossFunction(nn.Module):
             )
         return idx, dist
 
+    def _sld_landmarks(self, true_pos_v, M):
+        """Pick M structured global-anchor cells + their true distances,
+        cached per slice. Returns ``(land_idx (M,) long, d_true (n, M))``.
+
+        ``landmark_mode='fps'`` (default): farthest-point sampling on the
+        TRUE positions — start at the cell farthest from the centroid,
+        then greedily add the cell maximising the min-distance to the
+        chosen set. Gives M maximally-SPREAD anchors so each cell's
+        distance vector triangulates its 2D global position. Deterministic
+        (no RNG) → identical across epochs. O(N·M), no grad.
+
+        ``landmark_mode='random'``: a fixed (seeded) random subset —
+        cheaper, still a SHARED anchor set (unlike per-cell random pairs),
+        but worse coverage. Cached either way (true positions are fixed)."""
+        n = int(true_pos_v.shape[0])
+        Meff = min(int(M), n)
+        cache_key = None
+        with torch.no_grad():
+            cache_key = (
+                n, int(Meff), self._sld_landmark_mode,
+                float(true_pos_v[0, 0].item()),
+                float(true_pos_v[-1, -1].item()),
+                float(true_pos_v.sum().item()),
+            )
+        cached = self._sld_landmark_cache.get(cache_key)
+        if cached is not None:
+            idx_c, d_c = cached
+            return (
+                idx_c.to(true_pos_v.device),
+                d_c.to(true_pos_v.device, dtype=true_pos_v.dtype),
+            )
+        with torch.no_grad():
+            if self._sld_landmark_mode == "random":
+                gen = torch.Generator(device="cpu").manual_seed(0)
+                perm = torch.randperm(n, generator=gen)[:Meff]
+                land_idx = perm.to(true_pos_v.device)
+            else:  # "fps" — farthest-point sampling
+                land_idx = torch.empty(
+                    Meff, dtype=torch.long, device=true_pos_v.device,
+                )
+                centroid = true_pos_v.mean(dim=0, keepdim=True)
+                d0 = ((true_pos_v - centroid) ** 2).sum(-1)        # (n,)
+                land_idx[0] = int(torch.argmax(d0))
+                min_d = ((true_pos_v - true_pos_v[land_idx[0]]) ** 2).sum(-1)
+                for i in range(1, Meff):
+                    nxt = int(torch.argmax(min_d))
+                    land_idx[i] = nxt
+                    new_d = ((true_pos_v - true_pos_v[nxt]) ** 2).sum(-1)
+                    min_d = torch.minimum(min_d, new_d)
+            d_true = torch.cdist(
+                true_pos_v, true_pos_v.index_select(0, land_idx),
+            )                                                      # (n, Meff)
+        self._sld_landmark_cache[cache_key] = (
+            land_idx.detach().cpu(), d_true.detach().cpu(),
+        )
+        return land_idx, d_true
+
     def _compute_sparse_local_distance(
         self, masked_pred: DataHolder, masked_true: DataHolder,
     ) -> torch.Tensor:
@@ -2009,11 +2093,15 @@ class LossFunction(nn.Module):
         Euclidean distances ONLY on:
           * each cell's true k-NN (``local_k`` neighbours) — local
             fidelity, exactly what the per-cell Spearman metric rewards;
-          * ``n_random`` random far pairs per cell — a cheap global
-            skeleton so the embedding can't fold distant regions onto
-            each other (the crowding problem). Re-sampled every step
+          * ``n_random`` random far pairs per cell — a cheap (noisy)
+            global skeleton so the embedding can't fold distant regions
+            onto each other (the crowding problem). Re-sampled every step
             (stochastic estimator of the global distance term), weighted
             by ``global_weight``. Set ``n_random=0`` for pure-local.
+          * ``n_landmarks`` STRUCTURED global anchors — each cell's
+            distance to M shared, spatially-spread landmark cells (FPS),
+            giving a consistent global frame. Less noisy than random
+            pairs; weighted by ``landmark_weight``. O(N·M). =0 = off.
 
         Never materialises an (N,N) tensor: peak memory is
         O(N·(k+r)·embed_dim) for the gradient path + O(N·chunk) for the
@@ -2080,6 +2168,23 @@ class LossFunction(nn.Module):
                 diff_r = h_v.unsqueeze(1) - h_v[rand_idx]
                 d_pred_rnd = diff_r.pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
                 loss_b = loss_b + gw * ((d_pred_rnd - d_true_rnd) ** 2).mean()
+
+            # ---- structured global term: distance to M shared landmarks ----
+            # Each cell's distances to the SAME M spread-out landmark cells
+            # pin a consistent global frame (vs the noisy per-cell random
+            # pairs). O(N·M). Landmark set + true distances are cached.
+            if self._sld_n_landmarks > 0 and self._sld_landmark_weight > 0.0:
+                land_idx, d_true_lm = self._sld_landmarks(
+                    true_pos_v, self._sld_n_landmarks,
+                )                                                  # (M,), (n, M)
+                h_lm = h_v.index_select(0, land_idx)               # (M, kd)
+                diff_lm = h_v.unsqueeze(1) - h_lm.unsqueeze(0)     # (n, M, kd)
+                d_pred_lm = (
+                    diff_lm.pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
+                )                                                  # (n, M)
+                loss_b = loss_b + self._sld_landmark_weight * (
+                    (d_pred_lm - d_true_lm) ** 2
+                ).mean()
 
             losses.append(loss_b)
         if not losses:
