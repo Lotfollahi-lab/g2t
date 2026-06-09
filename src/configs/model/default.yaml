@@ -733,6 +733,14 @@ loss:
         n_landmarks: 0        # number of global landmark cells (0 = off)
         landmark_weight: 0.1  # weight of the landmark (global frame) term
         landmark_mode: fps    # fps (farthest-point, spread) | random (shared subset)
+        # Local-vs-global balancing.
+        #   none  : local + global at the manual weights above (default).
+        #   equal : auto-rescale the global group each step so local and
+        #           global contribute EQUALLY in value (removes the
+        #           near-vs-far magnitude mismatch; global_weight /
+        #           landmark_weight then only set the random-vs-landmark
+        #           split within the global group).
+        balance: none
         warmup_steps: 0
 
     # Anisotropic shape-matching loss. Supervises the COVARIANCE

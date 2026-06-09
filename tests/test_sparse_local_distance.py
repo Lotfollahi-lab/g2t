@@ -185,6 +185,40 @@ def test_landmark_term_adds_signal():
 
 
 # ----------------------------------------------------------------------
+# local-vs-global balancing (balance="equal")
+# ----------------------------------------------------------------------
+
+def test_balance_equal_gives_equal_contribution():
+    """With balance='equal' the global term contributes exactly as much
+    as local, so total ≈ 2·(local-only)."""
+    pred, true, _ = _holders(B=1, N=100, kd=8, seed=7)
+    loc_only = LossFunction(_cfg(local_k=16, n_random=0, n_landmarks=0))
+    v_loc = loc_only._compute_sparse_local_distance(pred, true).item()
+    bal = LossFunction(_cfg(local_k=16, n_random=0, n_landmarks=32,
+                            landmark_weight=0.1, balance="equal"))
+    v_bal = bal._compute_sparse_local_distance(pred, true).item()
+    assert abs(v_bal - 2.0 * v_loc) < 1e-4 * max(1.0, abs(v_loc)), (
+        f"equal balance should give total ≈ 2*local; got {v_bal} vs {2*v_loc}"
+    )
+
+
+def test_balance_equal_normalises_away_the_global_weight():
+    """In equal mode the absolute global weight is normalised away — only
+    the random-vs-landmark split survives. So two very different
+    landmark_weights give the same total."""
+    pred, true, _ = _holders(B=1, N=100, kd=8, seed=8)
+    a = LossFunction(_cfg(local_k=16, n_random=0, n_landmarks=32,
+                          landmark_weight=0.1, balance="equal"))
+    b = LossFunction(_cfg(local_k=16, n_random=0, n_landmarks=32,
+                          landmark_weight=5.0, balance="equal"))
+    va = a._compute_sparse_local_distance(pred, true).item()
+    vb = b._compute_sparse_local_distance(pred, true).item()
+    assert abs(va - vb) < 1e-4 * max(1.0, abs(va)), (
+        "equal balance must be invariant to the global weight magnitude"
+    )
+
+
+# ----------------------------------------------------------------------
 # true-kNN cache consistency
 # ----------------------------------------------------------------------
 

@@ -516,6 +516,23 @@ class LossFunction(nn.Module):
         # positions are fixed, so the landmark set + their true distances
         # are constant across epochs — built once per slice, cached.
         self._sld_landmark_cache: dict = {}
+        # Local-vs-global balancing.
+        #   "none"  (default): local + global with the manual weights
+        #           (global_weight / landmark_weight) — byte-identical to
+        #           the original behaviour.
+        #   "equal": rescale the global group each step (by the detached
+        #           local/global magnitude ratio) so local and global
+        #           contribute EQUALLY, independent of the near-vs-far
+        #           distance-magnitude gap. Removes the need to hand-tune
+        #           the global weight.
+        self._sld_balance = str(_cfg_get(cfg, "model", "loss",
+                                         "sparse_local_distance",
+                                         "balance", default="none")).lower()
+        if self._sld_balance not in ("none", "equal"):
+            raise ValueError(
+                "model.loss.sparse_local_distance.balance must be "
+                f"'none' or 'equal'; got {self._sld_balance!r}."
+            )
 
         # k-NN graph loss — scGG fundamental method #4. Reads
         # ``masked_pred.knn_logits`` (B, N, N edge logits) stashed by
@@ -2154,9 +2171,12 @@ class LossFunction(nn.Module):
                 w = 1.0 / (1.0 + d_true_loc)
             else:  # "none" — plain MSE over local pairs
                 w = torch.ones_like(d_true_loc)
-            loss_b = (w * sq_err).sum() / (w.sum() + eps)
+            loss_local = (w * sq_err).sum() / (w.sum() + eps)
 
-            # ---- global term: random far pairs (re-sampled, no cache) ----
+            # ---- global terms accumulate into loss_global ----
+            loss_global = None
+
+            # random far pairs (re-sampled each step, no cache)
             if R > 0 and gw > 0.0:
                 with torch.no_grad():
                     rand_idx = torch.randint(
@@ -2167,12 +2187,12 @@ class LossFunction(nn.Module):
                 ).pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()    # (n, R)
                 diff_r = h_v.unsqueeze(1) - h_v[rand_idx]
                 d_pred_rnd = diff_r.pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
-                loss_b = loss_b + gw * ((d_pred_rnd - d_true_rnd) ** 2).mean()
+                g_rnd = gw * ((d_pred_rnd - d_true_rnd) ** 2).mean()
+                loss_global = g_rnd if loss_global is None else loss_global + g_rnd
 
-            # ---- structured global term: distance to M shared landmarks ----
-            # Each cell's distances to the SAME M spread-out landmark cells
-            # pin a consistent global frame (vs the noisy per-cell random
-            # pairs). O(N·M). Landmark set + true distances are cached.
+            # structured global term: distance to M shared landmark cells —
+            # a consistent global frame (vs the noisy per-cell random pairs).
+            # O(N·M). Landmark set + true distances are cached.
             if self._sld_n_landmarks > 0 and self._sld_landmark_weight > 0.0:
                 land_idx, d_true_lm = self._sld_landmarks(
                     true_pos_v, self._sld_n_landmarks,
@@ -2182,9 +2202,30 @@ class LossFunction(nn.Module):
                 d_pred_lm = (
                     diff_lm.pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
                 )                                                  # (n, M)
-                loss_b = loss_b + self._sld_landmark_weight * (
+                g_lm = self._sld_landmark_weight * (
                     (d_pred_lm - d_true_lm) ** 2
                 ).mean()
+                loss_global = g_lm if loss_global is None else loss_global + g_lm
+
+            # ---- combine local + global ----
+            if loss_global is None:
+                loss_b = loss_local
+            elif self._sld_balance == "equal":
+                # Auto-balance: rescale the global term so its VALUE
+                # contribution equals the local term's, regardless of the
+                # near-vs-far magnitude gap (far pairs have large squared
+                # errors that otherwise dominate or vanish under fixed
+                # weights). ``scale`` is the detached loc/glob ratio — a
+                # per-step constant — so it reweights the global GRADIENT
+                # to match local without changing its direction. With this
+                # on, global_weight/landmark_weight only set the relative
+                # random-vs-landmark split inside the global group (their
+                # overall magnitude is normalised away). Loss value ≈
+                # 2·local, which still tracks fit progress.
+                scale = loss_local.detach() / (loss_global.detach() + eps)
+                loss_b = loss_local + scale * loss_global
+            else:  # "none" — fixed manual weights (legacy, byte-identical)
+                loss_b = loss_local + loss_global
 
             losses.append(loss_b)
         if not losses:
