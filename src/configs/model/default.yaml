@@ -206,6 +206,39 @@ flow_matching:
     # Required when ``prior_mode == "empirical_gmm"``; ignored
     # otherwise. Cluster-default convention: alongside the silver h5ads.
     prior_pool_path: null
+
+    # -----------------------------------------------------------------
+    # Gauge-fixed flow matching (canonical-frame target).
+    # -----------------------------------------------------------------
+    # A cell cloud's absolute coordinates are defined only up to a rigid
+    # motion + reflection (SE(2)/O(2)); the EDM distance loss and the
+    # per-cell Spearman metric are both invariant to it. Standard
+    # coordinate FM regresses toward ONE arbitrary rotated/reflected
+    # copy of the target, so the model burns capacity being equivariant
+    # (hence train.augment_rotation/reflection — stochastic frame
+    # averaging — plus Procrustes alignment).
+    #
+    # When true, the FM TARGET is mapped to its unique canonical frame
+    # (mean-centred, PCA-rotated so the principal axis is x, skew-sign-
+    # fixed) before the interpolant is built — DETERMINISTIC frame fixing
+    # in place of stochastic augmentation. The transform is an isometry,
+    # so it does NOT change any pairwise distance (the loss is
+    # unaffected); it only makes the frame the backbone sees consistent
+    # across slices and epochs. See utils/data/canonicalize.py.
+    #
+    # This single flag drives BOTH variants:
+    #   * Option 1 (coordinate flow): framework=flow_matching, edm on,
+    #     edm.diffuse_in_embed_space=false — canonicalises x_0.
+    #   * Option 2 (relational / h-space flow):
+    #     edm.diffuse_in_embed_space=true — canonicalises the 2D
+    #     positions before they are lifted to the k-D h_0 target, which
+    #     removes the O(2) gauge h-space FM otherwise inherits.
+    #
+    # Default false keeps every existing run byte-identical. Best paired
+    # with train.augment_rotation=false / augment_reflection=false
+    # (canonicalisation makes them redundant — canonicalize∘augment =
+    # canonicalize).
+    canonicalize_target: false
 nu:
     p: 2
 

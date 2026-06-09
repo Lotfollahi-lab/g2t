@@ -67,6 +67,7 @@ from typing import Optional
 import torch
 
 from utils.data.dataholder import DataHolder
+from utils.data.canonicalize import canonicalize_cloud
 
 
 def _remove_mean_with_mask(x: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
@@ -134,6 +135,19 @@ class EDMFlowMatchingModel:
         self.sampler = "euler"
         self.noise_schedule = "linear"   # informational, not used
         self.max_diffusion_steps = self.n_sampling_steps
+        # Option 2: gauge-fixed relational (h-space) flow. When True the
+        # ground-truth 2D positions are mapped to their canonical frame
+        # BEFORE being lifted to h_0, so the h-space interpolant the
+        # backbone sees is in a single consistent frame. Removes the
+        # O(2) gauge that h-space FM otherwise inherits (the distance
+        # loss is invariant to rotations of h, so without this the h_0
+        # target is an arbitrary orbit representative). Default False
+        # keeps the existing h-space path byte-identical. Shares the
+        # ``flow_matching.canonicalize_target`` flag with the
+        # coordinate-FM Option 1.
+        self.canonicalize_target = bool(
+            getattr(fm_cfg, "canonicalize_target", False)
+        ) if fm_cfg is not None else False
 
     # ------------------------------------------------------------------
     # Helper: lift true positions to k-D h_0 by zero-padding.
@@ -184,8 +198,19 @@ class EDMFlowMatchingModel:
         device = data.node_features.device
         dtype = data.positions.dtype
 
+        # Option 2: optionally canonicalise the 2D positions before the
+        # lift. canonicalize_cloud is an isometry of the real cells, so
+        # ‖h_0_i − h_0_j‖ (and hence the EDM distance loss) is unchanged
+        # — it only fixes the frame of the h-space interpolant the
+        # backbone consumes via x_t = h_t[..., :2]. The loss still reads
+        # the original data upstream, which is fine (distance-invariant).
+        pos_2d = (
+            canonicalize_cloud(data.positions, data.node_mask)
+            if self.canonicalize_target
+            else data.positions
+        )
         # h_0 = lift true positions to k-D.
-        h_0 = self._lift_to_embed_space(data.positions)               # (B, N, k)
+        h_0 = self._lift_to_embed_space(pos_2d)                        # (B, N, k)
 
         # Sample t in [eps_t, 1] uniformly per slice.
         t = torch.rand(B, 1, device=device, dtype=dtype)

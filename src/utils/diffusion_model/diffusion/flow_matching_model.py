@@ -77,6 +77,7 @@ import wandb
 
 from utils.data.dataholder import DataHolder
 from utils.data.load import remove_mean_with_mask
+from utils.data.canonicalize import canonicalize_cloud
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +224,22 @@ class FlowMatchingModel:
             self.eps_t = 1.0e-3
             self.sampler = "euler"
             self.prediction = "x0"
+            self.canonicalize_target = False
         else:
             self.n_sampling_steps = int(getattr(fm_cfg, "n_sampling_steps", 50))
             self.eps_t = float(getattr(fm_cfg, "eps_t", 1.0e-3))
             self.sampler = str(getattr(fm_cfg, "sampler", "euler")).lower()
             self.prediction = str(getattr(fm_cfg, "prediction", "x0")).lower()
+            # Option 1: gauge-fixed coordinate flow. When True, the FM
+            # interpolant is built from the CANONICAL frame of x_0
+            # (mean-centred, PCA-rotated, skew-sign-fixed) instead of the
+            # raw data frame — deterministic frame-fixing in place of
+            # stochastic rotation/reflection augmentation. Default False
+            # keeps existing runs byte-identical. See
+            # utils/data/canonicalize.py for the why.
+            self.canonicalize_target = bool(
+                getattr(fm_cfg, "canonicalize_target", False)
+            )
         if self.sampler not in ("euler", "heun"):
             raise ValueError(
                 f"Unknown model.flow_matching.sampler={self.sampler!r}. "
@@ -360,11 +372,24 @@ class FlowMatchingModel:
             x=noise_positions_masked, node_mask=data.node_mask
         )
 
+        # Option 1: optionally canonicalise x_0 before building the
+        # interpolant. The transform is an isometry, so pairwise
+        # distances (hence the EDM loss) are unchanged — only the frame
+        # the backbone sees at every t becomes consistent across slices
+        # and epochs. We feed the loss the ORIGINAL data (masked_true is
+        # batched_data upstream), which is fine precisely because the
+        # loss is distance-based and frame-invariant.
+        x_0 = (
+            canonicalize_cloud(data.positions, data.node_mask)
+            if self.canonicalize_target
+            else data.positions
+        )
+
         # Linear interpolation. t_float is (B, 1); broadcast to
         # (B, 1, 1) for per-slice scalar multiplication against
         # positions of shape (B, N, 2).
         t_b = t_float.unsqueeze(-1)                                     # (B, 1, 1)
-        pos_t = (1.0 - t_b) * data.positions + t_b * x_1
+        pos_t = (1.0 - t_b) * x_0 + t_b * x_1
 
         z_t = DataHolder(
             node_features=data.node_features,
