@@ -622,6 +622,53 @@ loss:
         enabled: false
         weight: 1.0
 
+    # ----------------------------------------------------------------
+    # Spatially-aware EDM loss variants. All read pred.edm_D (the EDM
+    # head's predicted pairwise distances) and the true positions, like
+    # edm_distance_mse, but reweight/transform the supervision toward
+    # LOCAL structure — the thing the per-cell Spearman metric rewards.
+    # Plain edm_distance_mse weights every pair equally, so it's
+    # dominated by large, uninformative far-pair distances. Enable one
+    # (or combine) to test whether local-emphasis closes the
+    # objective↔metric gap. All require the EDM head (no-op otherwise).
+    # ----------------------------------------------------------------
+    # 1. Locality-weighted distance MSE (Sammon-stress style). Weights
+    #    each pair's error by a decreasing function of TRUE distance, so
+    #    near pairs dominate. weight_fn=exp → w=exp(-d/sigma);
+    #    weight_fn=inverse → w=1/(1+d). sigma→∞ reduces to edm_distance_mse.
+    locality_weighted_distance:
+        enabled: false
+        weight: 1.0
+        weight_fn: exp        # exp | inverse
+        sigma: 1.0            # length scale for the exp weighting
+        warmup_steps: 0
+    # 2. log-distance MSE — MSE on log(1+d), equalising near/far scale.
+    log_distance_mse:
+        enabled: false
+        weight: 1.0
+        warmup_steps: 0
+    # 3. Differentiable per-cell Spearman surrogate — directly optimises
+    #    the eval metric. Soft-ranks each cell's distance row (pairwise
+    #    sigmoid, temperature `temperature`) and maximises predicted↔true
+    #    rank correlation. O(S³); subsamples n_sample cells per slice.
+    rank_spearman:
+        enabled: false
+        weight: 1.0
+        temperature: 0.3      # soft-rank sharpness (smaller = harder ranks)
+        n_sample: 256         # cells subsampled per slice (cost control)
+        warmup_steps: 0
+    # 4. kNN neighbourhood-preservation (SNE/InfoNCE). Each cell's TRUE
+    #    k-NN should be its PREDICTED near neighbours; maximises the
+    #    log-prob mass a t-SNE-style predicted-neighbour distribution
+    #    puts on the true k-NN. Lifts local fidelity / contact-F1.
+    knn_neighborhood:
+        enabled: false
+        weight: 1.0
+        k: 10                 # true neighbours treated as positives
+        temperature: 1.0      # t-SNE kernel temperature on predicted dist²
+        n_sample: 256         # anchor cells subsampled per slice
+        warmup_steps: 0
+
     # Anisotropic shape-matching loss. Supervises the COVARIANCE
     # eigenvalues of the predicted point cloud against the true
     # cloud's, per slice. Captures the "wide-x narrow-y" shape signal

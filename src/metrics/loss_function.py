@@ -384,6 +384,61 @@ class LossFunction(nn.Module):
                                           "edm_distance_mse", "weight",
                                           default=1.0))
 
+        # --- Spatially-aware EDM loss variants (operate on edm_D) ---
+        # 1. Locality-weighted distance MSE (Sammon-stress local emphasis).
+        self._locw_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                           "locality_weighted_distance",
+                                           "enabled", default=False))
+        self._locw_weight = float(_cfg_get(cfg, "model", "loss",
+                                           "locality_weighted_distance",
+                                           "weight", default=1.0))
+        self._locw_sigma = float(_cfg_get(cfg, "model", "loss",
+                                          "locality_weighted_distance",
+                                          "sigma", default=1.0))
+        self._locw_fn = str(_cfg_get(cfg, "model", "loss",
+                                     "locality_weighted_distance",
+                                     "weight_fn", default="exp")).lower()
+        if self._locw_fn not in ("exp", "inverse"):
+            raise ValueError(
+                f"model.loss.locality_weighted_distance.weight_fn must be "
+                f"'exp' or 'inverse'; got {self._locw_fn!r}."
+            )
+        # 2. log-distance MSE.
+        self._logd_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                           "log_distance_mse", "enabled",
+                                           default=False))
+        self._logd_weight = float(_cfg_get(cfg, "model", "loss",
+                                           "log_distance_mse", "weight",
+                                           default=1.0))
+        # 3. Differentiable per-cell Spearman surrogate.
+        self._rank_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                           "rank_spearman", "enabled",
+                                           default=False))
+        self._rank_weight = float(_cfg_get(cfg, "model", "loss",
+                                           "rank_spearman", "weight",
+                                           default=1.0))
+        self._rank_tau = float(_cfg_get(cfg, "model", "loss",
+                                        "rank_spearman", "temperature",
+                                        default=0.3))
+        self._rank_n_sample = int(_cfg_get(cfg, "model", "loss",
+                                           "rank_spearman", "n_sample",
+                                           default=256))
+        # 4. kNN neighbourhood-preservation (SNE/InfoNCE).
+        self._knn_nb_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                             "knn_neighborhood", "enabled",
+                                             default=False))
+        self._knn_nb_weight = float(_cfg_get(cfg, "model", "loss",
+                                             "knn_neighborhood", "weight",
+                                             default=1.0))
+        self._knn_nb_k = int(_cfg_get(cfg, "model", "loss",
+                                      "knn_neighborhood", "k", default=10))
+        self._knn_nb_tau = float(_cfg_get(cfg, "model", "loss",
+                                          "knn_neighborhood", "temperature",
+                                          default=1.0))
+        self._knn_nb_n_sample = int(_cfg_get(cfg, "model", "loss",
+                                             "knn_neighborhood", "n_sample",
+                                             default=256))
+
         # k-NN graph loss — scGG fundamental method #4. Reads
         # ``masked_pred.knn_logits`` (B, N, N edge logits) stashed by
         # KNNGraphOutputWrapper; supervises with contrastive BCE on
@@ -482,6 +537,8 @@ class LossFunction(nn.Module):
                 "sinkhorn", "chamfer", "shape_matching",
                 "persistent_homology", "knn_rank",
                 "pairwise_distance_mse", "edm_distance_mse",
+                "locality_weighted_distance", "log_distance_mse",
+                "rank_spearman", "knn_neighborhood",
                 "knn_graph_loss", "coarse_centroid_mse",
                 "latent_fm_mse", "latent_kl",
             )
@@ -521,6 +578,16 @@ class LossFunction(nn.Module):
             # predicted pairwise-squared-distance matrix.
             ("edm_distance_mse", self._edm_enabled, self._edm_weight,
              self._compute_edm_distance_mse),
+            # Spatially-aware EDM variants (all read edm_D): local-emphasis,
+            # log-scale, rank surrogate, neighbourhood preservation.
+            ("locality_weighted_distance", self._locw_enabled, self._locw_weight,
+             self._compute_locality_weighted_distance),
+            ("log_distance_mse", self._logd_enabled, self._logd_weight,
+             self._compute_log_distance_mse),
+            ("rank_spearman", self._rank_enabled, self._rank_weight,
+             self._compute_rank_spearman),
+            ("knn_neighborhood", self._knn_nb_enabled, self._knn_nb_weight,
+             self._compute_knn_neighborhood),
             # scGG fundamental method #4 (k-NN graph): contrastive BCE
             # on positive/negative edges drawn from true positions.
             ("knn_graph_loss", self._knn_graph_enabled, self._knn_graph_weight,
@@ -1757,6 +1824,216 @@ class LossFunction(nn.Module):
             losses.append(
                 self.mse(d_pred_v[triu_mask], d_true_v[triu_mask])
             )
+        if not losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(losses))
+
+    # ------------------------------------------------------------------
+    # Spatially-aware EDM losses — operate on the SAME predicted vs true
+    # pairwise distances as edm_distance_mse, but reweight/transform them
+    # to emphasise LOCAL structure (the thing the per-cell Spearman
+    # metric rewards), rather than the uniform all-pairs L2 that is
+    # dominated by large, uninformative far-pair distances.
+    #
+    # All four read ``masked_pred.edm_D`` (B,N,N squared distances) and
+    # ``masked_true.positions`` exactly like _compute_edm_distance_mse,
+    # so they require the EDM head (return graph-zero otherwise) and
+    # share its per-slice / valid-mask handling.
+    # ------------------------------------------------------------------
+    def _edm_pred_true_dists(self, masked_pred, masked_true, b, eps=1e-8):
+        """Helper: per-slice valid Euclidean (d_pred, d_true) sub-matrices.
+
+        Returns (d_pred_v, d_true_v, valid_idx, n) or (None,)*4 if the
+        slice has < 2 real cells. d_pred_v is sqrt of the stashed
+        squared distances (same convention as edm_distance_mse).
+        """
+        D_pred = masked_pred.edm_D
+        mask = masked_true.node_mask[b]
+        valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        n = int(valid_idx.numel())
+        if n < 2:
+            return None, None, None, 0
+        true_pos_v = masked_true.positions[b].index_select(0, valid_idx)
+        d_true_v = torch.cdist(true_pos_v, true_pos_v, p=2)            # (n,n)
+        D_pred_v = D_pred[b].index_select(0, valid_idx).index_select(1, valid_idx)
+        d_pred_v = (D_pred_v + eps).sqrt()                            # (n,n)
+        return d_pred_v, d_true_v, valid_idx, n
+
+    def _compute_locality_weighted_distance(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Distance MSE with each pair weighted by a DECREASING function
+        of its true distance — Sammon-stress-style local emphasis.
+
+        Plain edm_distance_mse weights every pair equally, so the loss
+        is dominated by large far-pair distances (squared error grows
+        with magnitude). Spatial reconstruction + the per-cell Spearman
+        metric care about LOCAL neighbourhood fidelity. Weighting by
+        ``w_ij = exp(-d_true/sigma)`` (or ``1/(1+d_true)``) reallocates
+        the loss to near pairs. As sigma -> inf this reduces to plain
+        edm_distance_mse (uniform weights) — a clean limiting check.
+        """
+        D_pred = getattr(masked_pred, "edm_D", None)
+        if D_pred is None:
+            return _graph_zero(masked_pred)
+        sigma = self._locw_sigma
+        losses = []
+        for b in range(D_pred.shape[0]):
+            d_pred_v, d_true_v, _, n = self._edm_pred_true_dists(
+                masked_pred, masked_true, b,
+            )
+            if d_pred_v is None:
+                continue
+            triu = torch.triu(
+                torch.ones(n, n, device=D_pred.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            dt = d_true_v[triu]
+            dp = d_pred_v[triu]
+            if self._locw_fn == "inverse":
+                w = 1.0 / (1.0 + dt)
+            else:  # "exp"
+                w = torch.exp(-dt / sigma)
+            sq_err = (dp - dt) ** 2
+            losses.append((w * sq_err).sum() / (w.sum() + 1e-8))
+        if not losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(losses))
+
+    def _compute_log_distance_mse(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """MSE on ``log(1+d)`` instead of ``d`` — compresses the far
+        range so near and far pairs contribute comparably (equalises
+        the scale domination of the linear-distance MSE)."""
+        D_pred = getattr(masked_pred, "edm_D", None)
+        if D_pred is None:
+            return _graph_zero(masked_pred)
+        losses = []
+        for b in range(D_pred.shape[0]):
+            d_pred_v, d_true_v, _, n = self._edm_pred_true_dists(
+                masked_pred, masked_true, b,
+            )
+            if d_pred_v is None:
+                continue
+            triu = torch.triu(
+                torch.ones(n, n, device=D_pred.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            lp = torch.log1p(d_pred_v[triu])
+            lt = torch.log1p(d_true_v[triu])
+            losses.append(self.mse(lp, lt))
+        if not losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(losses))
+
+    def _compute_rank_spearman(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Differentiable per-cell Spearman SURROGATE — directly targets
+        the evaluation metric.
+
+        The eval metric is the per-cell Spearman rank correlation between
+        a cell's predicted and true distance rows. We optimise a smooth
+        version: standardise each row, soft-rank it via pairwise sigmoids
+        ``R[i,j] = sum_k sigmoid((m[i,j]-m[i,k])/tau)`` (NeuralSort-style),
+        and maximise the per-row Pearson correlation of predicted vs true
+        soft-ranks. Loss = 1 - mean_row corr.
+
+        O(S^3) in the number of sampled cells S, so we subsample S cells
+        per slice (``n_sample``) to keep it cheap and CNS-safe.
+        """
+        D_pred = getattr(masked_pred, "edm_D", None)
+        if D_pred is None:
+            return _graph_zero(masked_pred)
+        tau = self._rank_tau
+        S = self._rank_n_sample
+        eps = 1e-6
+        losses = []
+        for b in range(D_pred.shape[0]):
+            d_pred_v, d_true_v, _, n = self._edm_pred_true_dists(
+                masked_pred, masked_true, b,
+            )
+            if d_pred_v is None:
+                continue
+            # Subsample S cells (rows AND columns — a square submatrix so
+            # the ranks are over a consistent cell set).
+            if n > S:
+                sel = torch.randperm(n, device=D_pred.device)[:S]
+                dp = d_pred_v.index_select(0, sel).index_select(1, sel)
+                dt = d_true_v.index_select(0, sel).index_select(1, sel)
+            else:
+                dp, dt = d_pred_v, d_true_v
+
+            def soft_rank(m):
+                # standardise each row (scale-free tau), then soft-rank.
+                m = (m - m.mean(dim=1, keepdim=True)) / (m.std(dim=1, keepdim=True) + eps)
+                diff = m.unsqueeze(2) - m.unsqueeze(1)        # (s,s,s)
+                return torch.sigmoid(diff / tau).sum(dim=2)   # (s,s)
+
+            Rp = soft_rank(dp)
+            Rt = soft_rank(dt)
+            Rp = Rp - Rp.mean(dim=1, keepdim=True)
+            Rt = Rt - Rt.mean(dim=1, keepdim=True)
+            num = (Rp * Rt).sum(dim=1)
+            den = Rp.norm(dim=1) * Rt.norm(dim=1) + eps
+            corr = num / den                                 # (s,)
+            losses.append(1.0 - corr.mean())
+        if not losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(losses))
+
+    def _compute_knn_neighborhood(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Neighbourhood-preservation (SNE/InfoNCE-style) loss: each
+        cell's TRUE k nearest neighbours should be its PREDICTED near
+        neighbours.
+
+        For sampled anchor cells, build a t-SNE-style predicted-neighbour
+        distribution ``p_ij = softmax_j(-d_pred_ij^2 / tau)`` over all
+        valid cells (self excluded), and maximise the log-probability
+        mass on the anchor's true k-NN. Directly supervises local graph
+        fidelity (and tends to lift contact-F1). Anchors subsampled to
+        ``n_sample``; candidates are all valid cells, so cost is
+        O(n_sample * n) — CNS-safe.
+        """
+        D_pred = getattr(masked_pred, "edm_D", None)
+        if D_pred is None:
+            return _graph_zero(masked_pred)
+        k = self._knn_nb_k
+        S = self._knn_nb_n_sample
+        tau = self._knn_nb_tau
+        neg_inf = torch.finfo(D_pred.dtype).min
+        losses = []
+        for b in range(D_pred.shape[0]):
+            mask = masked_true.node_mask[b]
+            valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            n = int(valid_idx.numel())
+            if n < k + 2:
+                continue
+            true_pos_v = masked_true.positions[b].index_select(0, valid_idx)  # (n,2)
+            D_pred_v = D_pred[b].index_select(0, valid_idx).index_select(1, valid_idx)  # (n,n)
+            d_pred_v = (D_pred_v + 1e-8).sqrt()
+
+            # Subsample anchors (rows); candidates = all n valid cells.
+            n_anchor = min(S, n)
+            anchors = torch.randperm(n, device=D_pred.device)[:n_anchor]    # (a,)
+            ar = torch.arange(n_anchor, device=D_pred.device)
+
+            # True k-NN of each anchor (exclude self).
+            d_true_an = torch.cdist(
+                true_pos_v.index_select(0, anchors), true_pos_v,
+            )                                                              # (a,n)
+            d_true_an[ar, anchors] = float("inf")                          # mask self
+            knn_idx = torch.topk(d_true_an, k, dim=1, largest=False).indices  # (a,k)
+
+            # Predicted neighbour log-probabilities (self masked out).
+            logits = -(d_pred_v.index_select(0, anchors) ** 2) / tau       # (a,n)
+            logits[ar, anchors] = neg_inf
+            logp = torch.log_softmax(logits, dim=1)                        # (a,n)
+            pos_logp = torch.gather(logp, 1, knn_idx)                      # (a,k)
+            losses.append(-pos_logp.mean())
         if not losses:
             return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))
