@@ -489,6 +489,32 @@ class LossFunction(nn.Module):
         # so they sweep different long-range pairs over training — a
         # stochastic estimator of the global distance term).
         self._sld_true_cache: dict = {}
+        # Neighbour-search backend for the true k-NN build.
+        #   "brute"  (default): chunked cdist+topk — O(N²) compute,
+        #            O(N·chunk) memory, exact. Fine up to ~CNS scale.
+        #   "kdtree": scipy.spatial.cKDTree — O(N log N) build+query,
+        #            EXACT same neighbours, the de-quadratified path for
+        #            very large N (≫10⁵). Falls back to brute (with a
+        #            one-time warning) if scipy is unavailable.
+        self._sld_knn_backend = str(_cfg_get(cfg, "model", "loss",
+                                             "sparse_local_distance",
+                                             "knn_backend", default="brute")).lower()
+        if self._sld_knn_backend not in ("brute", "kdtree"):
+            raise ValueError(
+                "model.loss.sparse_local_distance.knn_backend must be "
+                f"'brute' or 'kdtree'; got {self._sld_knn_backend!r}."
+            )
+        self._sld_kdtree_warned = False
+        # Anchor subsampling. 0 = use ALL cells as anchors each step
+        # (exact, default). >0 = compute the loss over a random subset of
+        # ``n_sample`` anchor cells per step — a stochastic estimator that
+        # decouples per-step memory/compute from N (the neighbours and
+        # random partners are still drawn from the FULL slice). Needed at
+        # N≈10⁶ where the O(N·(k+r)·d) gather tensors would otherwise be
+        # tens of GB; unnecessary at CNS scale where they fit.
+        self._sld_n_sample = int(_cfg_get(cfg, "model", "loss",
+                                          "sparse_local_distance",
+                                          "n_sample", default=0))
         # Structured global anchor (landmarks). Same idea as
         # geomattn_localglobal's M landmarks, but selected as
         # spatially-SPREAD cells via farthest-point sampling (FPS) rather
@@ -2025,16 +2051,41 @@ class LossFunction(nn.Module):
                     idx_c.to(true_pos_v.device),
                     dist_c.to(true_pos_v.device, dtype=true_pos_v.dtype),
                 )
-        with torch.no_grad():
-            real_mask = torch.ones(
-                1, n, dtype=torch.bool, device=true_pos_v.device,
-            )
-            idx, dist, _ = knn_chunked(
-                true_pos_v.unsqueeze(0), real_mask, int(keff),
-                chunk_size=int(self._sld_knn_chunk),
-            )
-            idx = idx[0]            # (n, keff)
-            dist = dist[0]          # (n, keff)
+        idx = dist = None
+        if self._sld_knn_backend == "kdtree":
+            # O(N log N) exact k-NN via a KD-tree (no grad; true positions).
+            # Same neighbours as brute force — just a faster build at large
+            # N. Falls back to brute if scipy isn't importable.
+            try:
+                from scipy.spatial import cKDTree
+                with torch.no_grad():
+                    pos_np = true_pos_v.detach().cpu().numpy()
+                    tree = cKDTree(pos_np)
+                    d_np, i_np = tree.query(pos_np, k=int(keff), workers=-1)
+                    if i_np.ndim == 1:          # k==1 → scipy returns 1-D
+                        i_np = i_np[:, None]
+                        d_np = d_np[:, None]
+                    idx = torch.from_numpy(i_np).long()
+                    dist = torch.from_numpy(d_np).to(true_pos_v.dtype)
+                    idx = idx.to(true_pos_v.device)
+                    dist = dist.to(true_pos_v.device)
+            except ImportError:
+                if not self._sld_kdtree_warned:
+                    print("[sparse_local_distance] knn_backend='kdtree' but "
+                          "scipy is unavailable — falling back to brute "
+                          "(chunked cdist). Install scipy for O(N log N).")
+                    self._sld_kdtree_warned = True
+        if idx is None:           # brute (default or kdtree fallback)
+            with torch.no_grad():
+                real_mask = torch.ones(
+                    1, n, dtype=torch.bool, device=true_pos_v.device,
+                )
+                idx, dist, _ = knn_chunked(
+                    true_pos_v.unsqueeze(0), real_mask, int(keff),
+                    chunk_size=int(self._sld_knn_chunk),
+                )
+                idx = idx[0]            # (n, keff)
+                dist = dist[0]          # (n, keff)
         if cache_key is not None:
             self._sld_true_cache[cache_key] = (
                 idx.detach().cpu(), dist.detach().cpu(),
@@ -2152,19 +2203,37 @@ class LossFunction(nn.Module):
                 0, valid_idx,
             )                                                     # (n, 2)
 
-            # ---- local term: true k-NN (self excluded) ----
-            keff = min(K + 1, n)   # +1: knn_chunked includes self at col 0
-            nbr_idx, nbr_dist = self._sld_true_knn(
+            # ---- true k-NN for ALL cells (self excluded), cached ----
+            keff = min(K + 1, n)   # +1: the search includes self at col 0
+            nbr_idx_full, nbr_dist_full = self._sld_true_knn(
                 true_pos_v, keff, knn_chunked,
             )
-            nbr_idx = nbr_idx[:, 1:]          # drop self column → (n, Kloc)
-            d_true_loc = nbr_dist[:, 1:]
-            if nbr_idx.shape[1] == 0:
+            nbr_idx_full = nbr_idx_full[:, 1:]   # drop self col → (n, Kloc)
+            nbr_dist_full = nbr_dist_full[:, 1:]
+            if nbr_idx_full.shape[1] == 0:
                 continue
-            h_nbr = h_v[nbr_idx]                              # (n, Kloc, kd)
-            diff = h_v.unsqueeze(1) - h_nbr
+
+            # ---- anchor subset: decouple per-step cost from N ----
+            # ``anc`` indexes the cells used as loss ANCHORS this step.
+            # Neighbours / random partners / landmarks are still drawn
+            # from the FULL slice, so the anchors are supervised against
+            # the true structure; over epochs every cell is sampled.
+            # anc = all cells when n_sample<=0 or >=n (exact, default).
+            S = int(self._sld_n_sample)
+            if 0 < S < n:
+                anc = torch.randperm(n, device=h.device)[:S]
+            else:
+                anc = torch.arange(n, device=h.device)
+            h_anc = h_v.index_select(0, anc)                 # (S, kd)
+            pos_anc = true_pos_v.index_select(0, anc)        # (S, 2)
+
+            # ---- local term: anchors vs their true k-NN ----
+            nbr_idx = nbr_idx_full.index_select(0, anc)      # (S, Kloc)
+            d_true_loc = nbr_dist_full.index_select(0, anc)  # (S, Kloc)
+            h_nbr = h_v[nbr_idx]                             # (S, Kloc, kd)
+            diff = h_anc.unsqueeze(1) - h_nbr
             d_pred_loc = (diff * diff).sum(-1).clamp_min(0.0).add(eps).sqrt()
-            sq_err = (d_pred_loc - d_true_loc) ** 2           # (n, Kloc)
+            sq_err = (d_pred_loc - d_true_loc) ** 2          # (S, Kloc)
             if self._sld_fn == "exp":
                 w = torch.exp(-d_true_loc / self._sld_sigma)
             elif self._sld_fn == "inverse":
@@ -2180,12 +2249,12 @@ class LossFunction(nn.Module):
             if R > 0 and gw > 0.0:
                 with torch.no_grad():
                     rand_idx = torch.randint(
-                        0, n, (n, R), device=h.device,
+                        0, n, (anc.shape[0], R), device=h.device,
                     )
                 d_true_rnd = (
-                    true_pos_v.unsqueeze(1) - true_pos_v[rand_idx]
-                ).pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()    # (n, R)
-                diff_r = h_v.unsqueeze(1) - h_v[rand_idx]
+                    pos_anc.unsqueeze(1) - true_pos_v[rand_idx]
+                ).pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()    # (S, R)
+                diff_r = h_anc.unsqueeze(1) - h_v[rand_idx]
                 d_pred_rnd = diff_r.pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
                 g_rnd = gw * ((d_pred_rnd - d_true_rnd) ** 2).mean()
                 loss_global = g_rnd if loss_global is None else loss_global + g_rnd
@@ -2194,14 +2263,15 @@ class LossFunction(nn.Module):
             # a consistent global frame (vs the noisy per-cell random pairs).
             # O(N·M). Landmark set + true distances are cached.
             if self._sld_n_landmarks > 0 and self._sld_landmark_weight > 0.0:
-                land_idx, d_true_lm = self._sld_landmarks(
+                land_idx, d_true_lm_full = self._sld_landmarks(
                     true_pos_v, self._sld_n_landmarks,
                 )                                                  # (M,), (n, M)
+                d_true_lm = d_true_lm_full.index_select(0, anc)    # (S, M)
                 h_lm = h_v.index_select(0, land_idx)               # (M, kd)
-                diff_lm = h_v.unsqueeze(1) - h_lm.unsqueeze(0)     # (n, M, kd)
+                diff_lm = h_anc.unsqueeze(1) - h_lm.unsqueeze(0)   # (S, M, kd)
                 d_pred_lm = (
                     diff_lm.pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
-                )                                                  # (n, M)
+                )                                                  # (S, M)
                 g_lm = self._sld_landmark_weight * (
                     (d_pred_lm - d_true_lm) ** 2
                 ).mean()

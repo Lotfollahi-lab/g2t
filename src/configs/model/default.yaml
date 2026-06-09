@@ -724,8 +724,19 @@ loss:
         global_weight: 0.1    # weight of the random-pair (global) term
         weight_fn: none       # none | exp | inverse (local-pair reweighting)
         sigma: 1.0            # exp(-d_true/sigma) when weight_fn=exp
-        knn_chunk: 1024       # query-axis chunk for the true-kNN top-k
+        knn_chunk: 1024       # query-axis chunk for the true-kNN top-k (brute)
         cache_true: true      # cache true k-NN per slice (constant target)
+        # Neighbour-search backend for the true k-NN build.
+        #   brute  : chunked cdist+topk, O(N^2) compute (default; fine to ~CNS).
+        #   kdtree : scipy cKDTree, O(N log N), EXACT same neighbours — the
+        #            de-quadratified path for N >> 1e5 (falls back to brute
+        #            with a warning if scipy is missing).
+        knn_backend: brute
+        # Anchor subsampling: 0 = all cells are loss anchors each step
+        # (exact, default). >0 = random subset of this many anchors per
+        # step (neighbours/partners still from the full slice) — bounds
+        # per-step memory/compute at N ~ 1e6. Unnecessary at CNS scale.
+        n_sample: 0
         # Structured global anchor (same idea as geomattn_localglobal's M
         # landmarks). Supervises each cell's distance to M SHARED,
         # spatially-spread landmark cells -> a consistent global frame,

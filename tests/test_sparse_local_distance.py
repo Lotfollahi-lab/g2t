@@ -219,6 +219,46 @@ def test_balance_equal_normalises_away_the_global_weight():
 
 
 # ----------------------------------------------------------------------
+# de-quadratification: KD-tree neighbour search + anchor subsampling
+# ----------------------------------------------------------------------
+
+def test_kdtree_matches_brute_neighbours():
+    """KD-tree backend must return the SAME k-NN distances as brute."""
+    pytest.importorskip("scipy")
+    g = torch.Generator().manual_seed(0)
+    pos = torch.randn(400, 2, generator=g) * torch.tensor([4.0, 1.0])
+    from models.geometry_local_global_attention import knn_chunked
+    brute = LossFunction(_cfg(local_k=20))
+    brute._sld_knn_backend = "brute"
+    kdt = LossFunction(_cfg(local_k=20, knn_backend="kdtree"))
+    ib, db = brute._sld_true_knn(pos, 21, knn_chunked)
+    ik, dk = kdt._sld_true_knn(pos, 21, knn_chunked)
+    # distances are exact (indices may differ only on exact ties)
+    assert torch.allclose(db.sort(dim=1).values, dk.sort(dim=1).values, atol=1e-5)
+
+
+def test_subsample_ge_n_equals_exact():
+    """n_sample >= n must reduce to the exact (all-anchor) loss. Use
+    pure-local (n_random=0) so the result is deterministic."""
+    pred, true, _ = _holders(B=1, N=80, kd=8, seed=9)
+    exact = LossFunction(_cfg(local_k=16, n_random=0, n_sample=0))
+    big = LossFunction(_cfg(local_k=16, n_random=0, n_sample=10000))
+    v0 = exact._compute_sparse_local_distance(pred, true).item()
+    v1 = big._compute_sparse_local_distance(pred, true).item()
+    assert abs(v0 - v1) < 1e-6, "n_sample>=n should equal exact all-anchor loss"
+
+
+def test_subsample_runs_and_grad():
+    pred, true, h = _holders(B=2, N=200, kd=8, seed=10)
+    loss = LossFunction(_cfg(local_k=16, n_random=8, n_sample=32))
+    val = loss._compute_sparse_local_distance(pred, true)
+    assert torch.isfinite(val) and val.item() >= 0.0
+    val.backward()
+    assert h.grad is not None and torch.isfinite(h.grad).all()
+    assert h.grad.abs().sum() > 0
+
+
+# ----------------------------------------------------------------------
 # true-kNN cache consistency
 # ----------------------------------------------------------------------
 
