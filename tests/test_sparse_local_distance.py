@@ -319,5 +319,35 @@ def test_head_skip_edm_D_train_emits_none_in_train_full_in_eval():
     )
 
 
+def test_fp32_geometry_island_under_bf16_autocast():
+    """Under a bf16 autocast, the geometry head must emit fp32 edm_h/edm_D
+    when fp32_geometry=True, and follow the ambient bf16 when False."""
+    from models.edm_head import EDMOutputWrapper
+    N, fin = 24, 4
+    mask = torch.ones(1, N, dtype=torch.bool)
+
+    def _run(fp32_geometry):
+        head = EDMOutputWrapper(
+            inner_model=_tiny_inner(), inner_out_dim=fin, embed_dim=8,
+            mds_align=True, fp32_geometry=fp32_geometry,
+        ).eval()
+        data = DataHolder(
+            positions=torch.randn(1, N, 2),
+            node_features=torch.randn(1, N, fin),
+            diffusion_time=0, node_mask=mask,
+        )
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            return head(data)
+
+    on = _run(True)
+    assert on.edm_h.dtype == torch.float32 and on.edm_D.dtype == torch.float32, (
+        "fp32_geometry island must keep edm_h/edm_D in fp32 under bf16 autocast"
+    )
+    off = _run(False)
+    assert off.edm_h.dtype == torch.bfloat16, (
+        "with the island off, the head should follow the ambient bf16 autocast"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

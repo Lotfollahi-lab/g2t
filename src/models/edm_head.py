@@ -42,6 +42,7 @@ Trade-offs
 
 from __future__ import annotations
 
+import contextlib
 from typing import Optional
 
 import torch
@@ -264,6 +265,7 @@ class EDMOutputWrapper(nn.Module):
         mds_dtype: str = "fp64",
         mds_solver: str = "eigh",
         skip_edm_D_train: bool = False,
+        fp32_geometry: bool = True,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
@@ -289,6 +291,15 @@ class EDMOutputWrapper(nn.Module):
         # the active distance loss. The diffusion_model auto-config
         # raises a loud error otherwise.
         self.skip_edm_D_train = bool(skip_edm_D_train)
+        # Surgical fp32 island for the geometry-sensitive head. When True
+        # (default), the projector → pairwise-distance → MDS path runs in
+        # fp32 even under a bf16-mixed autocast, while the backbone stays
+        # bf16. Rationale: bf16's ~3 significant digits coarsen predicted
+        # distances and scramble the fine neighbour orderings the per-cell
+        # Spearman metric measures — a global-bf16 run regressed badly, so
+        # we keep the distance math fp32. No-op under pure-fp32 training
+        # (autocast is off, so the disabled-autocast context does nothing).
+        self.fp32_geometry = bool(fp32_geometry)
         # MDS solver knobs.
         # ``mds_dtype``:
         #   "fp64" (default) — promote D_v to float64 before eigh.
@@ -431,12 +442,32 @@ class EDMOutputWrapper(nn.Module):
 
     # Some wrappers (CoarseToFineWrapper) take ``true_positions`` as a
     # kwarg during training. We pass kwargs through transparently.
+    def _fp32_ctx(self, ref: torch.Tensor):
+        """Autocast-disabled (fp32) context for the geometry-sensitive
+        ops, active when ``fp32_geometry`` is on. Under a bf16-mixed
+        autocast this keeps the projector → pairwise-distance → MDS path
+        in fp32 (autocast otherwise downcasts Linear/bmm to bf16
+        regardless of input dtype, coarsening the distances the per-cell
+        rank metric depends on). A no-op in pure-fp32 training."""
+        if self.fp32_geometry:
+            return torch.autocast(device_type=ref.device.type, enabled=False)
+        return contextlib.nullcontext()
+
     def forward(self, data: DataHolder, **kwargs) -> DataHolder:
         pred = self.inner_model(data, **kwargs)
 
         # Project per-cell features+positions to k-D embedding.
-        feat_in = torch.cat([pred.node_features, pred.positions], dim=-1)
-        h = self.projector(feat_in)                # (B, N, k)
+        # fp32 ISLAND (see _fp32_ctx + fp32_geometry): cast inputs to fp32
+        # and disable autocast so the projector runs fp32 even under
+        # bf16-mixed; the backbone above keeps its bf16 speed.
+        with self._fp32_ctx(pred.node_features):
+            feat = pred.node_features
+            pos = pred.positions
+            if self.fp32_geometry:
+                feat = feat.float()
+                pos = pos.float()
+            feat_in = torch.cat([feat, pos], dim=-1)
+            h = self.projector(feat_in)            # (B, N, k)
         # Zero out padding cells so they don't contaminate distances.
         mask = data.node_mask.to(h.dtype).unsqueeze(-1)
         h = h * mask                                # (B, N, k)
@@ -477,18 +508,21 @@ class EDMOutputWrapper(nn.Module):
         # Anisotropic case: apply W to h first, then use the same
         # identity on hW. Mathematically equivalent to the
         # (h_i − h_j)ᵀ Wᵀ W (h_i − h_j) formulation.
-        if self.gating_W is not None:
-            # h @ W^T per cell: (B, N, k) @ (k, k) → (B, N, k_out)
-            hW = torch.einsum("bnk,jk->bnj", h, self.gating_W)   # (B, N, k)
-        else:
-            hW = h
-        norms = (hW * hW).sum(dim=-1)                            # (B, N)
-        # outer sum + −2·dot. clamp_min(0) guards against fp32
-        # round-off producing tiny negatives when h_i ≈ h_j.
-        D_sq = (
-            norms.unsqueeze(2) + norms.unsqueeze(1)
-            - 2.0 * torch.bmm(hW, hW.transpose(1, 2))
-        ).clamp_min(0.0)                                          # (B, N, N)
+        # fp32 ISLAND — the distance matmul (bmm) is autocast-downcast to
+        # bf16 otherwise; h is already fp32 from the projector island.
+        with self._fp32_ctx(h):
+            if self.gating_W is not None:
+                # h @ W^T per cell: (B, N, k) @ (k, k) → (B, N, k_out)
+                hW = torch.einsum("bnk,jk->bnj", h, self.gating_W)   # (B, N, k)
+            else:
+                hW = h
+            norms = (hW * hW).sum(dim=-1)                            # (B, N)
+            # outer sum + −2·dot. clamp_min(0) guards against fp32
+            # round-off producing tiny negatives when h_i ≈ h_j.
+            D_sq = (
+                norms.unsqueeze(2) + norms.unsqueeze(1)
+                - 2.0 * torch.bmm(hW, hW.transpose(1, 2))
+            ).clamp_min(0.0)                                          # (B, N, N)
 
         # Mask padding rows/cols to zero (so they don't enter the loss).
         m1 = data.node_mask                        # (B, N)
@@ -543,9 +577,11 @@ class EDMOutputWrapper(nn.Module):
                 # an unstable backward), the
                 # LightningModule.on_after_backward detector raises
                 # a loud RuntimeError naming the offending parameter.
-                new_pos = self._mds_align_positions(
-                    D_sq, pred.positions, data.node_mask,
-                )
+                # fp32 ISLAND — MDS double-centering bmm + eigh on fp32.
+                with self._fp32_ctx(D_sq):
+                    new_pos = self._mds_align_positions(
+                        D_sq, pred.positions, data.node_mask,
+                    )
                 new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
             else:
                 # Legacy detached path. The MDS step uses
@@ -562,7 +598,8 @@ class EDMOutputWrapper(nn.Module):
                 # train the model — their gradient through pred.positions
                 # is identically zero. Set mds_align_gradient=True to
                 # restore that gradient signal.
-                with torch.no_grad():
+                # fp32 ISLAND — MDS double-centering bmm + eigh on fp32.
+                with torch.no_grad(), self._fp32_ctx(D_sq):
                     new_pos = self._mds_align_positions(
                         D_sq.detach(), pred.positions.detach(), data.node_mask,
                     )

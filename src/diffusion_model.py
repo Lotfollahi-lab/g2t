@@ -745,6 +745,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 skip_edm_D_train=bool(
                     getattr(edm_cfg, "skip_edm_D_train", False)
                 ),
+                # Keep the geometry head (projector→distances→MDS) in fp32
+                # even under bf16-mixed; default True (no-op in fp32).
+                fp32_geometry=bool(
+                    getattr(edm_cfg, "fp32_geometry", True)
+                ),
             )
 
         if knn_graph_enabled:

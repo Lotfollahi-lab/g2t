@@ -1332,6 +1332,17 @@ edm:
     # edm_D-reading losses off, and sparse_local_distance.enabled=true —
     # otherwise those terms would silently become no-ops.
     skip_edm_D_train: false
+    # ---- Surgical fp32 island for the geometry head ----
+    # When true (default), the projector -> pairwise-distance -> MDS path
+    # runs in fp32 even under train.precision=bf16-mixed, while the
+    # backbone keeps its bf16 speed. bf16's ~3 significant digits coarsen
+    # predicted distances and scramble the fine neighbour orderings the
+    # per-cell Spearman metric measures (a global-bf16 run regressed
+    # badly), so the distance math stays fp32. No-op under pure fp32
+    # (the disabled-autocast context does nothing when autocast is off),
+    # so existing runs are unaffected. Set false to let the head follow
+    # the ambient precision (i.e. full bf16) — only for A/B diagnosis.
+    fp32_geometry: true
     # ---- MDS Tikhonov regularization strength ----
     # Per-eigenvalue diagonal perturbation in ``_classical_mds_2d``.
     # The Tikhonov diagonal is ``arange(n) * mds_tikhonov_eps * scale``
