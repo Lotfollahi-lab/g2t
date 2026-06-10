@@ -478,6 +478,106 @@ def _section_label_from_filename(path: Path) -> str:
     return stem
 
 
+def _section_label_for_file(path: Path) -> str:
+    """Section label as it will appear in the per-slice metrics — prefer a
+    uniform ``obs['cell_section']`` (matching _build_luna_csv), else the
+    filename stem. Reads the h5ad in BACKED mode so X is never loaded
+    (cheap even for large slices).
+    """
+    try:
+        import anndata as ad
+        a = ad.read_h5ad(path, backed="r")
+        if "cell_section" in a.obs.columns:
+            uniq = a.obs["cell_section"].astype(str).unique()
+            if len(uniq) == 1:
+                return str(uniq[0])
+    except Exception:
+        pass
+    return _section_label_from_filename(path)
+
+
+def _partition_loso_files(
+    train_files: List[Path],
+    test_files: List[Path],
+    holdout_set: set,
+    eval_train_set: set,
+) -> Tuple[List[Path], List[Tuple[Path, str]], List[str]]:
+    """Leave-one-slice-out partition (pure; numpy/anndata-free).
+
+    ``holdout_set`` / ``eval_train_set`` are *_train.h5ad basenames.
+
+    Returns ``(train_kept, eval_extra, unmatched)`` where:
+      * ``train_kept`` = training files MINUS the held-out ones (eval-train
+        files stay — they remain in training, in-distribution);
+      * ``eval_extra`` = ``[(path, split)]`` train-derived files to ALSO
+        evaluate: held-out → ``"holdout"`` (unseen, generalization), eval-
+        train → ``"train"`` (in-distribution, the overfitting reference);
+      * ``unmatched`` = requested basenames that matched no train file.
+
+    A file may not be in both sets (that's contradictory) — raises.
+    """
+    overlap = holdout_set & eval_train_set
+    if overlap:
+        raise ValueError(
+            "prep.holdout_train_files and prep.eval_train_files overlap "
+            f"(a file can't be both held-out and kept-in): {sorted(overlap)}"
+        )
+    train_names = {f.name for f in train_files}
+    unmatched = sorted((holdout_set | eval_train_set) - train_names)
+    train_kept = [f for f in train_files if f.name not in holdout_set]
+    eval_extra: List[Tuple[Path, str]] = []
+    for f in train_files:
+        if f.name in holdout_set:
+            eval_extra.append((f, "holdout"))
+        elif f.name in eval_train_set:
+            eval_extra.append((f, "train"))
+    return train_kept, eval_extra, unmatched
+
+
+def _generalization_gap(
+    per_slice: List[Dict[str, object]],
+    metric_keys: Tuple[str, ...] = (
+        "spearman_per_cell_median", "global_distance_spearman",
+    ),
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float]]:
+    """Mean metrics per split + train→{holdout,test} gaps (pure/numpy).
+
+    Returns ``(summary, gaps)`` where ``summary[split]`` has ``n_slices``
+    and ``<metric>_mean``, and ``gaps`` has ``gap_train_minus_<other>__<metric>``
+    (in-distribution minus unseen — a positive value = overfitting).
+    """
+    from collections import defaultdict
+    groups: Dict[str, list] = defaultdict(list)
+    for r in per_slice:
+        groups[str(r.get("split", "test"))].append(r)
+
+    def _finite(v: object) -> bool:
+        return (
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            and not (isinstance(v, float) and (np.isnan(v) or np.isinf(v)))
+        )
+
+    summary: Dict[str, Dict[str, float]] = {}
+    for split, rows in groups.items():
+        d: Dict[str, float] = {"n_slices": float(len(rows))}
+        for mk in metric_keys:
+            vals = [float(r[mk]) for r in rows if mk in r and _finite(r[mk])]
+            if vals:
+                d[f"{mk}_mean"] = float(np.mean(vals))
+        summary[split] = d
+
+    gaps: Dict[str, float] = {}
+    if "train" in summary:
+        for other in ("holdout", "test"):
+            if other in summary:
+                for mk in metric_keys:
+                    a = summary["train"].get(f"{mk}_mean")
+                    b = summary[other].get(f"{mk}_mean")
+                    if a is not None and b is not None:
+                        gaps[f"gap_train_minus_{other}__{mk}"] = a - b
+    return summary, gaps
+
+
 # ---------------------------------------------------------------------------
 # Pred-vs-truth plotting (self-contained — no scgg.evaluation dep so
 # this script runs in the LUNA env where the scgg package isn't
@@ -1340,6 +1440,7 @@ def _global_structure_metrics(
 def _evaluate_predictions(
     sections: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]],
     plots_dir: Optional[Path] = None,
+    split_map: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, float]]:
     """Compute per-section Spearman; return one row per section.
 
@@ -1347,6 +1448,10 @@ def _evaluate_predictions(
     by-side scatter to ``plots_dir/<label>.svg`` for each evaluated
     section. Plotting failures are logged but never crash the eval
     loop — metrics always get computed.
+
+    When ``split_map`` is given (LOSO runs), each row is tagged with its
+    ``split`` (train | holdout | test) so the train→holdout generalization
+    gap can be computed downstream.
     """
     if plots_dir is not None:
         plots_dir.mkdir(parents=True, exist_ok=True)
@@ -1368,6 +1473,10 @@ def _evaluate_predictions(
         # Global-structure / anti-collapse metrics — numeric, so they
         # auto-aggregate into aggregate_metrics.json + per_slice_metrics.csv.
         row.update(_global_structure_metrics(coords_true, coords_pred))
+        if split_map is not None:
+            # LOSO tag (non-numeric -> ignored by the numeric aggregator,
+            # surfaced as a column in per_slice_metrics.csv).
+            row["split"] = split_map.get(label, "test")
         rows.append(row)
         logger.info(
             f"  {label:32s}  n={coords_true.shape[0]:>5d}  "
@@ -1452,6 +1561,13 @@ def run_benchmark(
     prep_normalize: Optional[str] = None
     prep_covariates = False
     prep_conditioning: Optional[str] = None
+    prep_holdout: set = set()      # *_train.h5ad held OUT of training, evaluated
+    prep_eval_train: set = set()   # *_train.h5ad kept IN training, also evaluated
+    loso_split_map: Dict[str, str] = {}  # {section_label -> train|holdout|test}
+
+    def _csv_set(v: str) -> set:
+        return {s.strip() for s in v.split(",") if s.strip()}
+
     if extra_overrides:
         _kept: List[str] = []
         for _tok in extra_overrides:
@@ -1469,11 +1585,16 @@ def run_benchmark(
                 prep_covariates = _val.lower() in ("1", "true", "yes", "on")
             elif _key == "conditioning_field":
                 prep_conditioning = _val or None
+            elif _key == "holdout_train_files":
+                prep_holdout = _csv_set(_val)
+            elif _key == "eval_train_files":
+                prep_eval_train = _csv_set(_val)
             else:
                 raise ValueError(
                     f"unknown prep override key 'prep.{_key}'. Valid keys: "
                     "prep.normalize, prep.batch_covariates, "
-                    "prep.conditioning_field."
+                    "prep.conditioning_field, prep.holdout_train_files, "
+                    "prep.eval_train_files."
                 )
         extra_overrides = _kept
     # prep.normalize takes precedence over the legacy --log2_normalize flag.
@@ -1491,12 +1612,18 @@ def run_benchmark(
         or prep_covariates
         or prep_conditioning is not None
     )
-    _prep_active = (eff_normalize != "none") or _needs_stats
-    if prep_normalize or prep_covariates or prep_conditioning:
+    _prep_active = (
+        (eff_normalize != "none") or _needs_stats
+        or bool(prep_holdout) or bool(prep_eval_train)
+    )
+    if (prep_normalize or prep_covariates or prep_conditioning
+            or prep_holdout or prep_eval_train):
         logger.info(
             "prep options: normalize=%s, batch_covariates=%s, "
-            "conditioning_field=%s",
+            "conditioning_field=%s, holdout_train_files=%s, "
+            "eval_train_files=%s",
             eff_normalize, prep_covariates, prep_conditioning,
+            sorted(prep_holdout) or None, sorted(prep_eval_train) or None,
         )
 
     # Three sources for the run TS, in order of precedence:
@@ -1708,6 +1835,44 @@ def run_benchmark(
                 f"this silver dir?"
             )
 
+        # ---- leave-one-slice-out (LOSO) partition --------------------------
+        # prep.holdout_train_files moves named *_train slices OUT of training
+        # and INTO evaluation (tag "holdout" = unseen, generalization); the
+        # model NEVER trains on them and feature stats exclude them, so no
+        # leakage. prep.eval_train_files keeps named *_train slices IN
+        # training but ALSO evaluates them (tag "train" = in-distribution).
+        # The two together give the train→holdout generalization GAP, with
+        # the official test slices (tag "test") as the final check — all in
+        # one run, with no touching of the test set for model selection.
+        loso_split_map: Dict[str, str] = {}
+        if prep_holdout or prep_eval_train:
+            train_files, eval_extra, unmatched = _partition_loso_files(
+                train_files, test_files, prep_holdout, prep_eval_train,
+            )
+            if unmatched:
+                logger.warning(
+                    "prep.holdout/eval_train_files entries matched no "
+                    f"*_train.h5ad in {data_path}: {unmatched}. Check names."
+                )
+            for p in test_files:
+                loso_split_map[_section_label_for_file(p)] = "test"
+            for p, sp in eval_extra:
+                loso_split_map[_section_label_for_file(p)] = sp
+            test_files = list(test_files) + [p for p, _ in eval_extra]
+            n_hold = sum(1 for _, s in eval_extra if s == "holdout")
+            n_indist = sum(1 for _, s in eval_extra if s == "train")
+            logger.info(
+                f"LOSO: train={len(train_files)} slices "
+                f"(held out {n_hold}); eval set has {n_hold} holdout + "
+                f"{n_indist} in-distribution-train + "
+                f"{len(test_files) - len(eval_extra)} test slices."
+            )
+            try:
+                with open(out / "eval_split_map.json", "w") as _fh:
+                    json.dump(loso_split_map, _fh, indent=2, sort_keys=True)
+            except Exception as _e:  # non-fatal: the gap is still computable
+                logger.warning(f"could not write eval_split_map.json: {_e}")
+
         train_csv_path = work / "train.csv"
         test_csv_path = work / "test.csv"
         # Cache hit only when no exclusions AND no prep options are active —
@@ -1903,7 +2068,10 @@ def run_benchmark(
         tracker.start("evaluation")
         sections = _read_luna_predictions(test_save_dir)
         plots_dir = (out / "plots") if make_plots else None
-        per_slice = _evaluate_predictions(sections, plots_dir=plots_dir)
+        per_slice = _evaluate_predictions(
+            sections, plots_dir=plots_dir,
+            split_map=(loso_split_map or None),
+        )
         tracker.end("evaluation", flush_to=runtime_csv)
     else:
         logger.info(
@@ -1912,10 +2080,26 @@ def run_benchmark(
             "against the saved checkpoint to score on the test split."
         )
 
+    # Headline = mean-of-medians over the OFFICIAL test slices, so it stays
+    # comparable to non-LOSO runs / the LUNA paper even when a LOSO run also
+    # evaluates held-out-train (split="holdout") and in-distribution-train
+    # (split="train") slices. Falls back to holdout, then to all rows.
+    def _medians_for(want_split: Optional[str]) -> list:
+        out_m = []
+        for r in per_slice:
+            v = r.get("spearman_per_cell_median")
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                continue
+            if want_split is None or r.get("split", "test") == want_split:
+                out_m.append(float(v))
+        return out_m
+
     headline = float("nan")
     if per_slice:
-        medians = [r["spearman_per_cell_median"] for r in per_slice
-                   if not np.isnan(r["spearman_per_cell_median"])]
+        if loso_split_map:
+            medians = _medians_for("test") or _medians_for("holdout")
+        else:
+            medians = _medians_for(None)
         if medians:
             headline = float(np.mean(medians))
 
@@ -1939,6 +2123,32 @@ def run_benchmark(
             w.writeheader()
             for r in per_slice:
                 w.writerow(r)
+
+    # LOSO generalization gap: per-split mean metrics + train→{holdout,test}
+    # gaps. Written + logged only when this was a LOSO run (split tags
+    # present). A positive gap = in-distribution beats unseen = overfitting.
+    if per_slice and loso_split_map:
+        gap_summary, gaps = _generalization_gap(per_slice)
+        gap_cols = sorted({k for d in gap_summary.values() for k in d.keys()})
+        with open(out / "generalization_gap.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["split"] + gap_cols)
+            w.writeheader()
+            for split in sorted(gap_summary):
+                w.writerow({"split": split, **gap_summary[split]})
+        with open(out / "generalization_gap.json", "w") as f:
+            json.dump({"per_split": gap_summary, "gaps": gaps}, f, indent=2)
+        logger.info("=" * 72)
+        logger.info("LOSO generalization gap (in-distribution vs unseen)")
+        logger.info("=" * 72)
+        for split in sorted(gap_summary):
+            d = gap_summary[split]
+            spr = d.get("spearman_per_cell_median_mean", float("nan"))
+            logger.info(
+                f"  {split:8s} n={int(d.get('n_slices', 0)):>3d}  "
+                f"spearman_median_mean={spr:.4f}"
+            )
+        for gk, gv in sorted(gaps.items()):
+            logger.info(f"  {gk} = {gv:+.4f}  (positive = overfitting)")
 
     # Aggregate metrics across slices: mean / median / std / min /
     # max for every numeric per-slice column, plus the headline

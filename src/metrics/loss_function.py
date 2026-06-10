@@ -538,6 +538,26 @@ class LossFunction(nn.Module):
                 "model.loss.sparse_local_distance.landmark_mode must be "
                 f"'fps' or 'random'; got {self._sld_landmark_mode!r}."
             )
+        # Intrinsic-geometry target for the LANDMARK term. "euclidean"
+        # (default, byte-identical) supervises straight-line distance to
+        # each landmark; "geodesic" supervises shortest-path distance along
+        # the cells' kNN manifold graph (Isomap-style). Geodesic is the
+        # gauge-invariant intrinsic metric — it follows the tissue sheet
+        # rather than cutting across concavities/gaps, so it transfers
+        # across slices with different morphology. Computed on the TRUE
+        # positions (no grad) and cached per slice. ``geo_k`` is the kNN
+        # graph connectivity used to build the manifold.
+        self._sld_landmark_metric = str(_cfg_get(
+            cfg, "model", "loss", "sparse_local_distance",
+            "landmark_metric", default="euclidean")).lower()
+        if self._sld_landmark_metric not in ("euclidean", "geodesic"):
+            raise ValueError(
+                "model.loss.sparse_local_distance.landmark_metric must be "
+                f"'euclidean' or 'geodesic'; got {self._sld_landmark_metric!r}."
+            )
+        self._sld_geo_k = int(_cfg_get(
+            cfg, "model", "loss", "sparse_local_distance",
+            "geo_k", default=15))
         # {fingerprint -> (landmark_idx_cpu, d_true_landmark_cpu)}. True
         # positions are fixed, so the landmark set + their true distances
         # are constant across epochs — built once per slice, cached.
@@ -2112,6 +2132,9 @@ class LossFunction(nn.Module):
         with torch.no_grad():
             cache_key = (
                 n, int(Meff), self._sld_landmark_mode,
+                # include the target metric + graph connectivity so the
+                # euclidean and geodesic targets never collide in the cache.
+                self._sld_landmark_metric, int(self._sld_geo_k),
                 float(true_pos_v[0, 0].item()),
                 float(true_pos_v[-1, -1].item()),
                 float(true_pos_v.sum().item()),
@@ -2141,9 +2164,23 @@ class LossFunction(nn.Module):
                     land_idx[i] = nxt
                     new_d = ((true_pos_v - true_pos_v[nxt]) ** 2).sum(-1)
                     min_d = torch.minimum(min_d, new_d)
-            d_true = torch.cdist(
-                true_pos_v, true_pos_v.index_select(0, land_idx),
-            )                                                      # (n, Meff)
+            if self._sld_landmark_metric == "geodesic":
+                # Intrinsic shortest-path distance along the cell kNN
+                # manifold (Isomap target). numpy/scipy, no grad; the (n,M)
+                # result is cached per slice exactly like the Euclidean one.
+                from utils.data.geodesic import geodesic_landmark_distances
+                pos_np = true_pos_v.detach().to(torch.float64).cpu().numpy()
+                land_np = land_idx.detach().cpu().numpy()
+                d_geo = geodesic_landmark_distances(
+                    pos_np, land_np, k=int(self._sld_geo_k),
+                )                                                  # (n, Meff)
+                d_true = torch.as_tensor(
+                    d_geo, dtype=true_pos_v.dtype, device=true_pos_v.device,
+                )
+            else:
+                d_true = torch.cdist(
+                    true_pos_v, true_pos_v.index_select(0, land_idx),
+                )                                                  # (n, Meff)
         self._sld_landmark_cache[cache_key] = (
             land_idx.detach().cpu(), d_true.detach().cpu(),
         )

@@ -765,6 +765,19 @@ loss:
         n_landmarks: 0        # number of global landmark cells (0 = off)
         landmark_weight: 0.1  # weight of the landmark (global frame) term
         landmark_mode: fps    # fps (farthest-point, spread) | random (shared subset)
+        # Intrinsic-geometry target for the landmark term.
+        #   euclidean (default): straight-line distance to each landmark
+        #             (byte-identical to prior runs).
+        #   geodesic : shortest-path distance along the cells' kNN manifold
+        #             graph (Isomap target). The gauge-invariant intrinsic
+        #             metric — follows the tissue sheet instead of cutting
+        #             across concavities/gaps, so the global structure
+        #             transfers across slices with different morphology.
+        #             Computed on the TRUE positions (no grad), cached per
+        #             slice. Expected to help most on non-convex slices
+        #             (folds, ventricles, C-shapes); ~no-op on convex slabs.
+        landmark_metric: euclidean
+        geo_k: 15             # kNN graph connectivity for the geodesic graph
         # Local-vs-global balancing.
         #   none  : local + global at the manual weights above (default).
         #   equal : auto-rescale the global group each step so local and
