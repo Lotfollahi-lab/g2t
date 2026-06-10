@@ -637,6 +637,256 @@ def _plot_pred_vs_truth(
 
 
 # ---------------------------------------------------------------------------
+# Expression normalization + computable batch covariates + obsm conditioning
+# ---------------------------------------------------------------------------
+#
+# These power three data-prep levers, ALL routed through the existing
+# ``--override`` channel via a ``prep.*`` namespace (parsed + stripped in
+# run_benchmark, never forwarded to Hydra). Because run_scgg_pipeline.py
+# already forwards ``--override`` to BOTH the train and the inference
+# invocation, every lever applies identically at train and test time with
+# zero shell/pipeline plumbing:
+#
+#   prep.normalize=<mode>         gene-expression transform (see _NORM_MODES)
+#   prep.batch_covariates=true    append computable per-cell + per-slice
+#                                 technical covariates (library size, #genes
+#                                 detected, per-slice descriptors) — all
+#                                 computable on UNSEEN test slices, so they
+#                                 generalize (unlike a learned slice-ID
+#                                 embedding, which is undefined at test).
+#   prep.conditioning_field=<k>   CONCATENATE adata.obsm[<k>] (e.g. an scVI
+#                                 latent) as extra conditioning columns —
+#                                 distinct from --embedding_field, which
+#                                 REPLACES genes. scVI is precomputed for
+#                                 train AND test slices, so it's available at
+#                                 inference.
+#
+# All appended/standardized columns use TRAIN statistics (mean/std computed
+# over the training slices only), applied to both train and test, so the
+# representation a test slice receives is calibrated to what the model saw
+# in training. Stats are deterministic functions of the train files, so the
+# inference run (which re-discovers the same train files) recomputes
+# byte-identical stats — no sidecar dependency for correctness (one is still
+# written for inspection).
+
+_NORM_MODES = {"none", "log2", "log1p", "lognorm", "zscore", "lognorm_zscore"}
+
+# Per-cell + per-slice technical covariates. Order is fixed (stats alignment
+# depends on it). All are computable from a slice's counts alone — no labels,
+# no train-set membership — which is exactly why they transfer to new slices.
+_COVAR_COLS = [
+    "covar_log_total_counts",    # per-cell sequencing depth
+    "covar_log_n_genes",         # per-cell #detected genes (complexity)
+    "covar_slice_median_log_total",  # per-slice depth descriptor (broadcast)
+    "covar_slice_log_n_cells",   # per-slice size descriptor (broadcast)
+]
+
+_LOGNORM_TARGET = 1.0e4  # scanpy-convention per-cell target sum for lognorm
+
+
+def _gene_base_transform(X: np.ndarray, normalize: str) -> np.ndarray:
+    """Per-cell gene transform that needs NO cross-file state.
+
+    ``zscore`` / ``lognorm_zscore`` return the un-standardized base here
+    (raw / lognorm respectively); the per-gene z-score is applied later in
+    ``_apply_feature_stats`` using TRAIN statistics. Pure numpy — unit
+    testable without anndata/torch.
+    """
+    if normalize in (None, "none", "zscore"):
+        return X
+    if normalize == "log2":
+        return np.log2(X + 1.0)
+    if normalize == "log1p":
+        return np.log1p(X)
+    if normalize in ("lognorm", "lognorm_zscore"):
+        total = X.sum(axis=1, keepdims=True)
+        total = np.where(total == 0.0, 1.0, total)
+        return np.log1p(X / total * _LOGNORM_TARGET)
+    raise ValueError(
+        f"unknown normalize mode {normalize!r}; expected one of {sorted(_NORM_MODES)}"
+    )
+
+
+def _covariates_from_counts(counts: np.ndarray) -> np.ndarray:
+    """(n_cells, n_genes) raw-ish counts -> (n_cells, len(_COVAR_COLS)).
+
+    Per-cell: log1p(total counts), log1p(#detected genes).
+    Per-slice (broadcast to every cell): median per-cell log-depth, and
+    log1p(n_cells). The per-slice columns are constant within a slice but
+    vary ACROSS slices — a slice descriptor the model can read at test time.
+    Pure numpy.
+    """
+    n = counts.shape[0]
+    total = counts.sum(axis=1)
+    n_det = (counts > 0).sum(axis=1)
+    log_total = np.log1p(total)
+    log_ndet = np.log1p(n_det.astype(np.float64))
+    slice_med = np.full(n, float(np.median(log_total)) if n else 0.0)
+    slice_logn = np.full(n, float(np.log1p(n)))
+    return np.column_stack([log_total, log_ndet, slice_med, slice_logn])
+
+
+def _finalize_stats(sum_: np.ndarray, sumsq: np.ndarray, n: int) -> tuple:
+    """(per-column sum, sumsq, count) -> (mean, std) with a std floor.
+
+    Std floored at 1.0 where ~0 so a (near-)constant column z-scores to ~0
+    rather than exploding. Pure numpy.
+    """
+    mean = sum_ / max(n, 1)
+    var = np.clip(sumsq / max(n, 1) - mean * mean, 0.0, None)
+    std = np.sqrt(var)
+    std = np.where(std > 1e-8, std, 1.0)
+    return mean, std
+
+
+def _apply_feature_stats(
+    M: np.ndarray, col_names: List[str], stats: Optional[Dict[str, list]],
+) -> np.ndarray:
+    """Z-score the columns present in ``stats`` (keyed by name). Pure numpy."""
+    if not stats:
+        return M
+    out = M.copy()
+    for j, c in enumerate(col_names):
+        if c in stats:
+            mu, sd = stats[c]
+            out[:, j] = (out[:, j] - mu) / sd
+    return out
+
+
+def _assemble_features(
+    adata,
+    *,
+    embedding_field: Optional[str],
+    normalize: str,
+    add_covariates: bool,
+    conditioning_field: Optional[str],
+) -> tuple:
+    """Build a slice's feature matrix BEFORE z-score standardization.
+
+    Returns ``(matrix (n,F) float64, col_names list[str], std_mask
+    list[bool])`` where ``std_mask[j]`` marks columns to z-score with TRAIN
+    stats. Block order is fixed: [genes-or-embedding | covariates |
+    conditioning], so the layout matches across files (panel-consistency
+    check + stats alignment).
+
+    Touches anndata (adata.X / adata.obsm / adata.layers); the numeric core
+    lives in the pure-numpy helpers above for unit testing.
+    """
+    import scipy.sparse as sp
+
+    mats: List[np.ndarray] = []
+    cols: List[str] = []
+    std: List[bool] = []
+
+    # --- block 1: genes (transformed) OR a replacement embedding ----------
+    if embedding_field is not None:
+        if embedding_field not in adata.obsm:
+            raise KeyError(
+                f"--embedding_field={embedding_field!r} requested but this "
+                f"slice has no adata.obsm[{embedding_field!r}]."
+            )
+        G = np.asarray(adata.obsm[embedding_field], dtype=np.float64)
+        gcols = [f"{embedding_field}_{i}" for i in range(G.shape[1])]
+        gstd = [False] * G.shape[1]  # embeddings kept byte-identical to prior runs
+    else:
+        X = adata.X
+        if sp.issparse(X):
+            X = X.toarray()
+        X = np.asarray(X, dtype=np.float64)
+        G = _gene_base_transform(X, normalize)
+        gcols = list(adata.var_names)
+        is_z = normalize in ("zscore", "lognorm_zscore")
+        gstd = [is_z] * G.shape[1]
+    mats.append(G)
+    cols.extend(gcols)
+    std.extend(gstd)
+
+    # --- block 2: computable technical covariates -------------------------
+    if add_covariates:
+        # Prefer a raw counts layer for depth covariates; fall back to X
+        # (MMC's X is already per-cell-normalised, so total counts there are
+        # near-constant and the depth covariate is weak — but #genes and the
+        # per-slice descriptors still carry signal; a 'counts' layer, if
+        # present, restores true depth).
+        if getattr(adata, "layers", None) is not None and "counts" in adata.layers:
+            C = adata.layers["counts"]
+        else:
+            C = adata.X
+        if sp.issparse(C):
+            C = C.toarray()
+        Cov = _covariates_from_counts(np.asarray(C, dtype=np.float64))
+        mats.append(Cov)
+        cols.extend(_COVAR_COLS)
+        std.extend([True] * Cov.shape[1])
+
+    # --- block 3: obsm conditioning (concat, NOT replace) -----------------
+    if conditioning_field is not None:
+        if conditioning_field not in adata.obsm:
+            raise KeyError(
+                f"prep.conditioning_field={conditioning_field!r} requested "
+                f"but this slice has no adata.obsm[{conditioning_field!r}]. "
+                f"Run precompute_embeddings.py (e.g. --encoder scvi) first."
+            )
+        Cnd = np.asarray(adata.obsm[conditioning_field], dtype=np.float64)
+        ccols = [f"cond_{conditioning_field}_{i}" for i in range(Cnd.shape[1])]
+        mats.append(Cnd)
+        cols.extend(ccols)
+        std.extend([True] * Cnd.shape[1])
+
+    M = np.concatenate(mats, axis=1) if len(mats) > 1 else mats[0]
+    return M, cols, std
+
+
+def _compute_feature_stats(
+    files: List[Path],
+    *,
+    embedding_field: Optional[str],
+    normalize: str,
+    add_covariates: bool,
+    conditioning_field: Optional[str],
+) -> Dict[str, list]:
+    """Per-column (mean, std) over the TRAIN files, for std-flagged columns
+    only. Single streaming pass (sum / sumsq / count) so memory stays O(F).
+    """
+    import anndata as ad
+
+    sum_ = sumsq = None
+    n_total = 0
+    col_names: Optional[List[str]] = None
+    std_mask: Optional[List[bool]] = None
+    for path in files:
+        adata = ad.read_h5ad(path)
+        M, cols, std = _assemble_features(
+            adata,
+            embedding_field=embedding_field,
+            normalize=normalize,
+            add_covariates=add_covariates,
+            conditioning_field=conditioning_field,
+        )
+        if col_names is None:
+            col_names, std_mask = cols, std
+            sum_ = M.sum(axis=0)
+            sumsq = (M * M).sum(axis=0)
+        else:
+            if cols != col_names:
+                raise ValueError(
+                    f"feature-column layout mismatch in {path.name} during "
+                    f"stats pass (expected {len(col_names)} cols, got "
+                    f"{len(cols)})."
+                )
+            sum_ = sum_ + M.sum(axis=0)
+            sumsq = sumsq + (M * M).sum(axis=0)
+        n_total += M.shape[0]
+
+    mean, std_vec = _finalize_stats(sum_, sumsq, n_total)
+    return {
+        c: [float(mean[j]), float(std_vec[j])]
+        for j, c in enumerate(col_names)
+        if std_mask[j]
+    }
+
+
+# ---------------------------------------------------------------------------
 # Build LUNA-format CSVs from per-slice h5ads
 # ---------------------------------------------------------------------------
 
@@ -646,6 +896,10 @@ def _build_luna_csv(
     out_csv: Path,
     log2_normalize: bool = False,
     embedding_field: Optional[str] = None,
+    normalize: Optional[str] = None,
+    add_covariates: bool = False,
+    conditioning_field: Optional[str] = None,
+    feature_stats: Optional[Dict[str, list]] = None,
 ) -> Dict[str, object]:
     """Concatenate per-section h5ads into one CSV in LUNA's input format.
 
@@ -682,9 +936,21 @@ def _build_luna_csv(
     looking at real gene names.
     """
     import anndata as ad
-    import scipy.sparse as sp
 
     gene_names: Optional[List[str]] = None
+
+    # Resolve the effective gene transform. ``normalize`` (from
+    # ``prep.normalize=``) takes precedence; fall back to the legacy
+    # ``log2_normalize`` flag, else "none" (byte-identical default).
+    if normalize is None or normalize == "none":
+        eff_normalize = "log2" if log2_normalize else "none"
+    else:
+        eff_normalize = normalize
+    if eff_normalize not in _NORM_MODES:
+        raise ValueError(
+            f"prep.normalize={eff_normalize!r} not recognised; "
+            f"expected one of {sorted(_NORM_MODES)}"
+        )
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     if out_csv.exists():
@@ -701,40 +967,28 @@ def _build_luna_csv(
     for path in files:
         adata = ad.read_h5ad(path)
 
-        # Choose the matrix that fills the "gene" columns of LUNA's
-        # CSV. Default is adata.X (raw gene counts). When the user
-        # asks for a pretrained encoder via ``embedding_field``, we
-        # instead read from adata.obsm[field] — same shape contract
-        # downstream, just (n_cells, embedding_dim) instead of
-        # (n_cells, n_genes).
-        if embedding_field is not None:
-            if embedding_field not in adata.obsm:
-                raise KeyError(
-                    f"--embedding_field={embedding_field!r} requested but "
-                    f"{path.name} has no adata.obsm[{embedding_field!r}]. "
-                    f"Run scripts/precompute_embeddings.py first to populate."
-                )
-            X = np.asarray(adata.obsm[embedding_field], dtype=np.float64)
-            local_gene_names = [
-                f"{embedding_field}_{i}" for i in range(X.shape[1])
-            ]
-        else:
-            X = adata.X
-            if sp.issparse(X):
-                X = X.toarray()
-            # Preserve the h5ad's native precision (float64 after the
-            # build_h5ad_from_luna_csv float64 fix). Casting to float32
-            # here would introduce LSB rounding on top of LUNA's `.float()`.
-            X = np.asarray(X, dtype=np.float64)
-            if log2_normalize:
-                X = np.log2(X + 1.0)
-            local_gene_names = list(adata.var_names)
+        # Assemble the feature columns that fill the "gene" slot of LUNA's
+        # CSV: [genes(-transformed) OR --embedding_field replacement |
+        # computable batch covariates | --conditioning_field obsm concat].
+        # The default path (embedding_field=None, normalize in {none,log2},
+        # no covariates, no conditioning) reproduces the historic matrix
+        # byte-for-byte. ``feature_stats`` (TRAIN mean/std) z-scores the
+        # std-flagged columns; np.asarray(float64) preserves the h5ad's
+        # native precision (no float32 LSB rounding before LUNA's .float()).
+        feat_M, local_gene_names, _std_mask = _assemble_features(
+            adata,
+            embedding_field=embedding_field,
+            normalize=eff_normalize,
+            add_covariates=add_covariates,
+            conditioning_field=conditioning_field,
+        )
+        X = _apply_feature_stats(feat_M, local_gene_names, feature_stats)
 
         if gene_names is None:
             gene_names = local_gene_names
         elif local_gene_names != gene_names:
             raise ValueError(
-                f"{'Embedding-dim' if embedding_field else 'Gene-panel'} "
+                f"{'Embedding-dim' if embedding_field else 'Feature-column'} "
                 f"mismatch in {path.name}: expected "
                 f"{len(gene_names)} columns, got {len(local_gene_names)}"
             )
@@ -1189,6 +1443,62 @@ def run_benchmark(
     if (train_csv is None) != (test_csv is None):
         raise ValueError("--train_csv and --test_csv must be passed together.")
 
+    # ---- prep.* data-prep options (ride the --override channel) -----------
+    # These configure CSV ASSEMBLY (gene normalization / computable batch
+    # covariates / obsm conditioning), NOT Hydra/LUNA. Parse + STRIP them so
+    # they never reach LUNA's config parser. Because run_scgg_pipeline.py
+    # forwards --override to BOTH the train and the inference invocation,
+    # these apply identically at train and test time with no extra plumbing.
+    prep_normalize: Optional[str] = None
+    prep_covariates = False
+    prep_conditioning: Optional[str] = None
+    if extra_overrides:
+        _kept: List[str] = []
+        for _tok in extra_overrides:
+            if not str(_tok).startswith("prep."):
+                _kept.append(_tok)
+                continue
+            _key, _eq, _val = str(_tok).partition("=")
+            if not _eq:
+                raise ValueError(f"prep override {_tok!r} must be key=value.")
+            _key = _key[len("prep."):]
+            _val = _val.strip().strip("'\"")
+            if _key == "normalize":
+                prep_normalize = _val
+            elif _key == "batch_covariates":
+                prep_covariates = _val.lower() in ("1", "true", "yes", "on")
+            elif _key == "conditioning_field":
+                prep_conditioning = _val or None
+            else:
+                raise ValueError(
+                    f"unknown prep override key 'prep.{_key}'. Valid keys: "
+                    "prep.normalize, prep.batch_covariates, "
+                    "prep.conditioning_field."
+                )
+        extra_overrides = _kept
+    # prep.normalize takes precedence over the legacy --log2_normalize flag.
+    eff_normalize = prep_normalize or ("log2" if log2_normalize else "none")
+    if eff_normalize not in _NORM_MODES:
+        raise ValueError(
+            f"prep.normalize={eff_normalize!r} not recognised; expected one "
+            f"of {sorted(_NORM_MODES)}"
+        )
+    # Standardized columns (z-scored genes, covariates, conditioning) need
+    # TRAIN mean/std. Any non-raw assembly also busts the on-disk CSV cache
+    # so a prior raw build can't be silently reused.
+    _needs_stats = (
+        eff_normalize in ("zscore", "lognorm_zscore")
+        or prep_covariates
+        or prep_conditioning is not None
+    )
+    _prep_active = (eff_normalize != "none") or _needs_stats
+    if prep_normalize or prep_covariates or prep_conditioning:
+        logger.info(
+            "prep options: normalize=%s, batch_covariates=%s, "
+            "conditioning_field=%s",
+            eff_normalize, prep_covariates, prep_conditioning,
+        )
+
     # Three sources for the run TS, in order of precedence:
     #   1. ``run_timestamp`` arg — explicit override (set by
     #      run_scgg_pipeline.py when it received --run_timestamp).
@@ -1400,13 +1710,14 @@ def run_benchmark(
 
         train_csv_path = work / "train.csv"
         test_csv_path = work / "test.csv"
-        # Cache hit only when no exclusions are requested — otherwise
-        # a stale test.csv from a prior un-excluded run would silently
-        # contain the excluded slices.
+        # Cache hit only when no exclusions AND no prep options are active —
+        # otherwise a stale CSV from a prior un-excluded / raw build would
+        # silently contain the wrong slices or the wrong feature columns.
         cache_valid = (
             train_csv_path.exists()
             and test_csv_path.exists()
             and not exclude_test_files
+            and not _prep_active
         )
         if cache_valid:
             logger.info("LUNA CSVs already exist under work/; reusing")
@@ -1418,25 +1729,55 @@ def run_benchmark(
                     f"Using pretrained embeddings from "
                     f"adata.obsm[{embedding_field!r}] in place of raw genes"
                 )
+            # Standardized columns (z-scored genes / covariates / scVI
+            # conditioning) use TRAIN mean/std, applied to BOTH train and
+            # test so a test slice is calibrated to what the model saw.
+            # Deterministic in the train files -> the inference run (which
+            # re-discovers the same train files) recomputes identical stats.
+            feature_stats: Optional[Dict[str, list]] = None
+            if _needs_stats:
+                logger.info(
+                    "Computing TRAIN feature stats (z-score) over "
+                    f"{len(train_files)} train slices..."
+                )
+                feature_stats = _compute_feature_stats(
+                    train_files,
+                    embedding_field=embedding_field,
+                    normalize=eff_normalize,
+                    add_covariates=prep_covariates,
+                    conditioning_field=prep_conditioning,
+                )
+                stats_path = work / "feature_norm_stats.json"
+                with open(stats_path, "w") as _fh:
+                    json.dump(feature_stats, _fh, indent=2, sort_keys=True)
+                logger.info(
+                    f"  wrote {len(feature_stats)} standardized-column stats "
+                    f"-> {stats_path}"
+                )
+            _prep_kwargs = dict(
+                embedding_field=embedding_field,
+                normalize=eff_normalize,
+                add_covariates=prep_covariates,
+                conditioning_field=prep_conditioning,
+                feature_stats=feature_stats,
+            )
             logger.info(f"Writing train CSV -> {train_csv_path}")
             train_stats = _build_luna_csv(
-                train_files, train_csv_path, log2_normalize=log2_normalize,
-                embedding_field=embedding_field,
+                train_files, train_csv_path, **_prep_kwargs,
             )
             logger.info(
                 f"  train: {train_stats['n_rows']:,} rows, "
                 f"{train_stats['n_genes']} "
-                f"{'embedding-dims' if embedding_field else 'genes'}, "
+                f"{'embedding-dims' if embedding_field else 'feature-cols'}, "
                 f"{train_stats['n_sections']} sections"
             )
             logger.info(f"Writing test CSV  -> {test_csv_path}")
             test_stats = _build_luna_csv(
-                test_files, test_csv_path, log2_normalize=log2_normalize,
-                embedding_field=embedding_field,
+                test_files, test_csv_path, **_prep_kwargs,
             )
             logger.info(
                 f"  test : {test_stats['n_rows']:,} rows, "
-                f"{test_stats['n_genes']} genes, "
+                f"{test_stats['n_genes']} feature-cols, "
                 f"{test_stats['n_sections']} sections"
             )
             n_genes = int(train_stats["n_genes"])
