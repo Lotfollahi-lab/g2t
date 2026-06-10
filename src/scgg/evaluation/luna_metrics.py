@@ -762,6 +762,77 @@ def embedding_to_2d(embedding: np.ndarray, method: str = "pca") -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def compute_global_structure(
+    coords_true: np.ndarray,
+    coords_pred: np.ndarray,
+    n_pairs: int = 100_000,
+    seed: int = 0,
+) -> Dict[str, float]:
+    """Global-structure / anti-collapse metrics.
+
+    The per-cell Spearman metric is LOCAL — it only scores each cell's
+    neighbour ordering, so a prediction that 'unrolls' the 2-D tissue
+    into a 1-D curve (dimensional collapse) keeps local order intact and
+    scores well while being globally degenerate. These two metrics catch
+    that:
+
+    * ``anisotropy_ratio_pred`` = lambda2/lambda1 of the predicted cloud's
+      2x2 covariance (in [0, 1]). A line -> ~0; a 2-D blob -> the true
+      cloud's ratio. ``anisotropy_ratio_error`` = |pred - true| flags a
+      collapse directly (true is typically 0.3-0.9; a collapsed pred ~0,
+      so the error ~= the true ratio). This is the sharpest single
+      detector of the 1-D collapse.
+    * ``global_distance_spearman`` / ``global_distance_pearson`` =
+      correlation of TRUE vs PRED Euclidean distance over a random sample
+      of ``n_pairs`` cell pairs. Unlike per-cell Spearman this is
+      dominated by long-range pairs, so a 1-D snake (which gets far-pair
+      distances badly wrong) scores low. O(n_pairs), so it stays cheap at
+      any N.
+
+    Both use ``coords_pred`` already projected to 2-D by the caller.
+    """
+    out: Dict[str, float] = {}
+
+    def _aniso(x: np.ndarray) -> float:
+        x = np.asarray(x, dtype=np.float64)[:, :2]
+        if x.shape[0] < 2:
+            return float("nan")
+        x = x - x.mean(axis=0, keepdims=True)
+        cov = (x.T @ x) / float(x.shape[0])
+        ev = np.clip(np.linalg.eigvalsh(cov), 0.0, None)   # ascending
+        return float(ev[0] / (ev[-1] + 1e-12))             # lambda2/lambda1
+
+    a_true = _aniso(coords_true)
+    a_pred = _aniso(coords_pred)
+    out["anisotropy_ratio_true"] = a_true
+    out["anisotropy_ratio_pred"] = a_pred
+    out["anisotropy_ratio_error"] = (
+        abs(a_pred - a_true)
+        if np.isfinite(a_pred) and np.isfinite(a_true) else float("nan")
+    )
+
+    n = int(coords_true.shape[0])
+    g_spr = g_pear = float("nan")
+    if n >= 4:
+        rng = np.random.default_rng(seed)
+        m = min(int(n_pairs), n * (n - 1) // 2)
+        i = rng.integers(0, n, size=m)
+        j = rng.integers(0, n, size=m)
+        keep = i != j
+        i, j = i[keep], j[keep]
+        if i.size > 1:
+            dt = np.linalg.norm(
+                coords_true[i, :2] - coords_true[j, :2], axis=1)
+            dp = np.linalg.norm(
+                coords_pred[i, :2] - coords_pred[j, :2], axis=1)
+            if dt.std() > 1e-12 and dp.std() > 1e-12:
+                g_spr = float(spearmanr(dt, dp).correlation)
+                g_pear = float(np.corrcoef(dt, dp)[0, 1])
+    out["global_distance_spearman"] = g_spr
+    out["global_distance_pearson"] = g_pear
+    return out
+
+
 def evaluate_slice(
     coords_true: np.ndarray,
     coords_pred: np.ndarray,
@@ -812,17 +883,26 @@ def evaluate_slice(
     out["recall"] = contact["recall"]
     out["contact_percentile"] = contact["percentile"]
 
+    # 2-D view of the prediction (identity if already 2-D), shared by the
+    # RSSD and the global-structure metrics below.
+    if coords_pred.shape[1] == 2:
+        pred2d = coords_pred
+    else:
+        pred2d = embedding_to_2d(coords_pred, method=rssd_projection)
+
     if compute_rssd:
-        if coords_pred.shape[1] == 2:
-            pred2d = coords_pred
-        else:
-            pred2d = embedding_to_2d(coords_pred, method=rssd_projection)
         rssd = compute_RSSD(coords_true, pred2d, cell_class)
         out["absolute_rssd"] = rssd["absolute_rssd"]
         out["sum_rssd"] = rssd["sum_rssd"]
         out["mean_rssd"] = rssd["mean_rssd"]
         out["n_classes_rssd"] = rssd["n_classes"]
         out["rssd_projection"] = rssd_projection
+
+    # Global-structure / anti-collapse metrics. The local per-cell
+    # Spearman cannot see a 1-D dimensional collapse (a 'snake' that
+    # preserves local neighbour order but destroys the 2-D layout); these
+    # flag it. See compute_global_structure.
+    out.update(compute_global_structure(coords_true, pred2d))
 
     out["n_cells"] = int(coords_true.shape[0])
     return out
@@ -863,7 +943,11 @@ def aggregate_slices(
         out["spearman_median_of_means"] = float(np.median(mean))
 
     for key in ("precision", "f1", "recall",
-                "absolute_rssd", "sum_rssd", "mean_rssd"):
+                "absolute_rssd", "sum_rssd", "mean_rssd",
+                # global-structure / anti-collapse metrics
+                "anisotropy_ratio_pred", "anisotropy_ratio_true",
+                "anisotropy_ratio_error",
+                "global_distance_spearman", "global_distance_pearson"):
         v = _stack(key)
         if v.size:
             out[f"{key}_mean"] = float(v.mean())

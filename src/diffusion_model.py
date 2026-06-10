@@ -1263,4 +1263,52 @@ class FullDenoisingDiffusion(pl.LightningModule):
             amsgrad=True,
             weight_decay=self.cfg.train.weight_decay,
         )
-        return {"optimizer": optimizer}
+        # Optional LR schedule. Default "none" → bare AdamW at constant
+        # LR (byte-identical to the historic behaviour). The other modes
+        # add a linear WARMUP (ramp LR 0→target over warmup_steps), which
+        # is the standard transformer recipe and the safe way to use a
+        # higher LR / larger batch: without it the scaled LR slams in at
+        # step 1 and destabilises the early (NaN-prone) distance-loss
+        # steps. "warmup_cosine" then anneals to ``min_lr_ratio``×LR;
+        # "warmup_constant" holds at the target after warmup.
+        schedule = str(getattr(self.cfg.train, "lr_schedule", "none")).lower()
+        if schedule == "none":
+            return {"optimizer": optimizer}
+        if schedule not in ("warmup_cosine", "warmup_constant"):
+            raise ValueError(
+                f"train.lr_schedule must be 'none', 'warmup_cosine' or "
+                f"'warmup_constant'; got {schedule!r}."
+            )
+        import math
+        warmup_steps = max(0, int(getattr(self.cfg.train, "warmup_steps", 0)))
+        min_lr_ratio = float(getattr(self.cfg.train, "min_lr_ratio", 0.1))
+        # Total optimiser steps over the whole run (epochs × batches/epoch
+        # ÷ accumulation), provided by Lightning once the trainer is set
+        # up. Falls back to a large constant if unavailable so cosine
+        # still decays gently rather than crashing.
+        try:
+            total_steps = int(self.trainer.estimated_stepping_batches)
+        except Exception:
+            total_steps = max(warmup_steps + 1, 100_000)
+
+        def _lr_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+            if schedule == "warmup_constant":
+                return 1.0
+            # warmup_cosine: decay 1 → min_lr_ratio over the remaining steps
+            denom = max(1, total_steps - warmup_steps)
+            progress = min(1.0, max(0.0, (step - warmup_steps) / denom))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (
+                1.0 + math.cos(math.pi * progress)
+            )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }

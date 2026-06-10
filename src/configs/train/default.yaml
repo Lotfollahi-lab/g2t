@@ -58,6 +58,23 @@ gradient_clip_val: 1.0
 precision: "32-true"
 
 # ---------------------------------------------------------------------------
+# Learning-rate schedule (configure_optimizers).
+#   "none"            — constant LR, no warmup (default; byte-identical to
+#                       the historic bare-AdamW behaviour).
+#   "warmup_cosine"   — linear warmup over ``warmup_steps`` then cosine
+#                       decay to ``min_lr_ratio``×lr. The standard
+#                       transformer recipe.
+#   "warmup_constant" — linear warmup then hold at the target lr.
+# Warmup is what makes a higher LR / larger batch safe: without it a
+# scaled-up LR hits at step 1 and destabilises the early (NaN-prone)
+# distance-loss steps (the cause of the diverged big-batch runs). Leave
+# "none" for the working batch-6 config; turn on "warmup_cosine" when
+# raising batch size / LR (e.g. on CNS).
+lr_schedule: "none"
+warmup_steps: 0          # linear-warmup length in OPTIMISER STEPS
+min_lr_ratio: 0.1        # cosine floor as a fraction of lr (warmup_cosine)
+
+# ---------------------------------------------------------------------------
 # Train-time rotation+reflection augmentation.
 #
 # Each training step applies an INDEPENDENT random element of O(2)
