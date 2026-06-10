@@ -56,41 +56,49 @@ def canonicalize_cloud(
     """
     B, N, D = positions.shape
     out = torch.zeros_like(positions)
-    for b in range(B):
-        m = node_mask[b]
-        idx = torch.nonzero(m, as_tuple=False).squeeze(-1)
-        n = int(idx.numel())
-        if n == 0:
-            continue
-        x = positions[b].index_select(0, idx)              # (n, D)
-        x = x - x.mean(dim=0, keepdim=True)                # translation gauge
-        if n < 3:
-            # Too few points to define a stable principal axis; centring
-            # is the most we can canonicalise without ambiguity.
-            out[b].index_copy_(0, idx, x.to(out.dtype))
-            continue
-        # PCA via the (D, D) covariance eigendecomposition. D is tiny
-        # (2), so this is trivially cheap; eigh gives ASCENDING
-        # eigenvalues with orthonormal eigenvectors as columns.
-        cov = (x.t() @ x) / float(n)                       # (D, D)
-        evals, evecs = torch.linalg.eigh(cov)              # (D,), (D, D)
-        # Order axes by DESCENDING variance (principal axis first).
-        order = torch.argsort(evals, descending=True)
-        R = evecs.index_select(1, order)                   # (D, D)
-        x_rot = x @ R                                      # (n, D) rotate
-        # Resolve the remaining sign/reflection gauge deterministically:
-        # flip each axis so its third moment (skewness) is >= 0. Two
-        # mirror-image clouds map to the SAME canonical frame, matching
-        # the reflection-invariance the pipeline already assumes. For a
-        # (near-)symmetric axis skewness ~ 0 and the sign is arbitrary
-        # but DETERMINISTIC for fixed data (same slice -> same frame
-        # every epoch).
-        skew = (x_rot ** 3).sum(dim=0)                     # (D,)
-        signs = torch.where(
-            skew < 0.0,
-            torch.full_like(skew, -1.0),
-            torch.ones_like(skew),
-        )
-        x_rot = x_rot * signs.unsqueeze(0)
-        out[b].index_copy_(0, idx, x_rot.to(out.dtype))
+    # FORCE fp32 + autocast OFF for the whole transform. Under a
+    # bf16-mixed autocast the covariance matmul ``xᵀx`` would be downcast
+    # to bf16 and ``torch.linalg.eigh`` has no bf16 CUDA kernel
+    # ("linalg_eigh_cuda not implemented for 'BFloat16'"). This is a
+    # no-grad target transform, so fp32 is the right precision regardless
+    # (we don't want bf16 coarsening the canonical frame); results are
+    # cast back to the input dtype at write-back.
+    with torch.autocast(device_type=positions.device.type, enabled=False):
+        for b in range(B):
+            m = node_mask[b]
+            idx = torch.nonzero(m, as_tuple=False).squeeze(-1)
+            n = int(idx.numel())
+            if n == 0:
+                continue
+            x = positions[b].index_select(0, idx).float()      # (n, D) fp32
+            x = x - x.mean(dim=0, keepdim=True)                # translation gauge
+            if n < 3:
+                # Too few points to define a stable principal axis; centring
+                # is the most we can canonicalise without ambiguity.
+                out[b].index_copy_(0, idx, x.to(out.dtype))
+                continue
+            # PCA via the (D, D) covariance eigendecomposition. D is tiny
+            # (2), so this is trivially cheap; eigh gives ASCENDING
+            # eigenvalues with orthonormal eigenvectors as columns.
+            cov = (x.t() @ x) / float(n)                       # (D, D) fp32
+            evals, evecs = torch.linalg.eigh(cov)              # (D,), (D, D)
+            # Order axes by DESCENDING variance (principal axis first).
+            order = torch.argsort(evals, descending=True)
+            R = evecs.index_select(1, order)                   # (D, D)
+            x_rot = x @ R                                      # (n, D) rotate
+            # Resolve the remaining sign/reflection gauge deterministically:
+            # flip each axis so its third moment (skewness) is >= 0. Two
+            # mirror-image clouds map to the SAME canonical frame, matching
+            # the reflection-invariance the pipeline already assumes. For a
+            # (near-)symmetric axis skewness ~ 0 and the sign is arbitrary
+            # but DETERMINISTIC for fixed data (same slice -> same frame
+            # every epoch).
+            skew = (x_rot ** 3).sum(dim=0)                     # (D,)
+            signs = torch.where(
+                skew < 0.0,
+                torch.full_like(skew, -1.0),
+                torch.ones_like(skew),
+            )
+            x_rot = x_rot * signs.unsqueeze(0)
+            out[b].index_copy_(0, idx, x_rot.to(out.dtype))
     return out
