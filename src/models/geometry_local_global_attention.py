@@ -122,6 +122,63 @@ def _gather_neighbors(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return out.view(B, H, N, K, D)
 
 
+def knn_kdtree(
+    pos: torch.Tensor,            # (B, N, 2)
+    real_mask: torch.Tensor,      # (B, N) bool, True at REAL cells
+    K: int,
+    chunk_size: int = 1024,       # accepted for signature parity; unused
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Drop-in for ``knn_chunked`` that finds neighbour INDICES with a
+    per-slice KD-tree (scipy ``cKDTree``) — O(N log N) instead of brute
+    O(N²) — then RECOMPUTES the neighbour distances in torch from the
+    gathered positions, so they keep the autograd link to ``pos`` exactly
+    like ``knn_chunked`` (this matters only when ``detach_geometry=False``;
+    by default geometry is detached and the result is identical either
+    way). Same ``(idx, dist, valid)`` contract; self is included at col 0.
+
+    Padding cells are excluded as CANDIDATES (the tree is built on real
+    cells only). Raises ImportError if scipy is missing — the caller
+    catches it and falls back to brute.
+    """
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    B, N, _ = pos.shape
+    Keff = min(int(K), N)
+    idx_out = torch.zeros(B, N, Keff, dtype=torch.long, device=pos.device)
+    valid_out = torch.zeros(B, N, Keff, dtype=torch.bool, device=pos.device)
+    with torch.no_grad():
+        pos_np = pos.detach().cpu().numpy()
+        rm = real_mask.detach().cpu().numpy()
+        for b in range(B):
+            real = np.nonzero(rm[b])[0]                      # (n_real,)
+            n_real = int(real.shape[0])
+            if n_real == 0:
+                continue
+            k_b = min(Keff, n_real)
+            tree = cKDTree(pos_np[b][real])
+            _, loc = tree.query(pos_np[b][real], k=k_b, workers=-1)
+            loc = np.asarray(loc)
+            if loc.ndim == 1:                                # k_b == 1
+                loc = loc[:, None]
+            glob = real[loc]                                 # (n_real, k_b) orig idx
+            rows = torch.from_numpy(real).long().to(pos.device)
+            pad_idx = torch.zeros(
+                n_real, Keff, dtype=torch.long, device=pos.device)
+            pad_idx[:, :k_b] = torch.from_numpy(glob).long().to(pos.device)
+            pad_val = torch.zeros(
+                n_real, Keff, dtype=torch.bool, device=pos.device)
+            pad_val[:, :k_b] = True
+            idx_out[b].index_copy_(0, rows, pad_idx)
+            valid_out[b].index_copy_(0, rows, pad_val)
+
+    # Distances recomputed in torch (grad-aware): ‖pos_i − pos_nbr‖.
+    nbr_pos = _gather_neighbors(pos.unsqueeze(1), idx_out).squeeze(1)  # (B,N,Keff,2)
+    dist_out = (pos.unsqueeze(2) - nbr_pos).norm(dim=-1)              # (B,N,Keff)
+    dist_out = torch.where(valid_out, dist_out, torch.zeros_like(dist_out))
+    return idx_out, dist_out, valid_out
+
+
 # ---------------------------------------------------------------------------
 # Per-head radial bias (shared helper)
 # ---------------------------------------------------------------------------
@@ -435,6 +492,24 @@ class LocalGlobalBackbone(nn.Module):
         self.n_landmarks = int(_g("n_landmarks", 64))
         self.moore_penrose_iters = int(_g("moore_penrose_iters", 6))
         self.knn_chunk = int(_g("knn_chunk", 1024))
+        # Neighbour-search backend for the per-forward local kNN.
+        #   "brute"  (default): GPU chunked cdist+topk, O(N²) compute.
+        #            Fast at small N (it's a single GPU matmul); fine to
+        #            ~CNS scale.
+        #   "kdtree": per-slice scipy cKDTree, O(N log N) — for very large
+        #            N (≫10⁵) where the O(N²) cdist dominates. Indices via
+        #            the tree, distances recomputed in torch (grad-aware).
+        #            Falls back to brute (one-time warning) if scipy is
+        #            missing. NOTE: kdtree runs on CPU + a host transfer
+        #            each forward, so at small N brute is usually faster
+        #            in wall-clock — only switch when N is large.
+        self.knn_backend = str(_g("knn_backend", "brute")).lower()
+        if self.knn_backend not in ("brute", "kdtree"):
+            raise ValueError(
+                "model.geomattn_localglobal.knn_backend must be 'brute' "
+                f"or 'kdtree'; got {self.knn_backend!r}."
+            )
+        self._kdtree_warned = False
         self.combine = str(_g("combine", "gated"))
         self.grad_checkpoint = bool(_g("grad_checkpoint", True))
 
@@ -466,9 +541,23 @@ class LocalGlobalBackbone(nn.Module):
         M = self.n_landmarks
         real_mask = node_mask                                     # (B,N) bool, True at REAL
 
-        nbr_idx, nbr_dist, nbr_valid = knn_chunked(
-            positions, real_mask, self.n_local, self.knn_chunk,
-        )
+        if self.knn_backend == "kdtree":
+            try:
+                nbr_idx, nbr_dist, nbr_valid = knn_kdtree(
+                    positions, real_mask, self.n_local, self.knn_chunk,
+                )
+            except ImportError:
+                if not self._kdtree_warned:
+                    print("[geomattn_lg] knn_backend='kdtree' but scipy is "
+                          "unavailable — falling back to brute knn_chunked.")
+                    self._kdtree_warned = True
+                nbr_idx, nbr_dist, nbr_valid = knn_chunked(
+                    positions, real_mask, self.n_local, self.knn_chunk,
+                )
+        else:
+            nbr_idx, nbr_dist, nbr_valid = knn_chunked(
+                positions, real_mask, self.n_local, self.knn_chunk,
+            )
 
         # Landmark centroids (segment-mean of positions over real cells).
         centroids = _segment_mean_pool(

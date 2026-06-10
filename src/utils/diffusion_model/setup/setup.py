@@ -191,6 +191,11 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
     # — a standard transformer-training value, safe to leave on
     # for any run). Set to 0 to disable.
     grad_clip = float(getattr(cfg.train, "gradient_clip_val", 1.0))
+    # Numerical precision (default "32-true" = full fp32, unchanged). Set
+    # ``train.precision=bf16-mixed`` for ~2-3x faster matmuls + ~half the
+    # activation memory; safe here because the fp64-sensitive MDS eigh is
+    # skipped at train (skip_edm_D_train) and runs fp64 at inference.
+    precision = str(getattr(cfg.train, "precision", "32-true"))
     return Trainer(
         devices=gpus,
         max_epochs=max_epochs,
@@ -202,5 +207,6 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
         enable_progress_bar=cfg.general.enable_progress_bar,
         gradient_clip_val=grad_clip if grad_clip > 0 else None,
         gradient_clip_algorithm="norm",
+        precision=precision,
     )
 

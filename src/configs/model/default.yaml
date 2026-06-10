@@ -1737,6 +1737,16 @@ geomattn_localglobal:
     # Query-chunk size for the once-per-forward kNN (bounds its peak
     # memory to O(chunk·N)). Lower if the kNN step itself OOMs on huge N.
     knn_chunk: 1024
+    # Neighbour-search backend for the per-forward local kNN.
+    #   brute  : GPU chunked cdist+topk, O(N^2) compute (default; fastest
+    #            at small/CNS N — it's a single GPU matmul).
+    #   kdtree : per-slice scipy cKDTree, O(N log N) — for N >> 1e5 where
+    #            the O(N^2) cdist dominates. EXACT same neighbours;
+    #            indices from the tree, distances recomputed in torch
+    #            (grad-aware). Runs on CPU + host transfer each forward,
+    #            so only worth it at large N. Falls back to brute if
+    #            scipy is missing.
+    knn_backend: brute
     # Gradient checkpointing. ON by default (the local gather's
     # (B,H,N,K,D) tensor is the main activation; checkpointing keeps a
     # deep stack within memory at cortex scale).

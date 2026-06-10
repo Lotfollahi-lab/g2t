@@ -42,6 +42,22 @@ detect_anomaly: false
 gradient_clip_val: 1.0
 
 # ---------------------------------------------------------------------------
+# Trainer numerical precision (PyTorch Lightning ``precision``).
+#   "32-true"   — full fp32 (default; byte-identical to existing runs).
+#   "bf16-mixed"— bfloat16 autocast + fp32 master weights. ~2-3x faster
+#                 matmuls on tensor cores AND ~half the activation memory
+#                 (both backbone and loss). Safe for this model: the only
+#                 fp64-sensitive op (the MDS eigh) is skipped at train via
+#                 model.edm.skip_edm_D_train, and at inference it runs in
+#                 eval (autocast off) with its own fp64 promotion. bf16's
+#                 wide exponent avoids the fp16 overflow risk, so no loss
+#                 scaler is needed. Turn on with
+#                 ``--override train.precision=bf16-mixed``.
+#   "16-mixed"  — fp16 autocast (narrower range; needs a grad scaler).
+# Other Lightning-accepted strings ("64-true", "bf16", ...) pass through.
+precision: "32-true"
+
+# ---------------------------------------------------------------------------
 # Train-time rotation+reflection augmentation.
 #
 # Each training step applies an INDEPENDENT random element of O(2)
