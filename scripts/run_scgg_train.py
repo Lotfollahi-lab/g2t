@@ -1024,6 +1024,65 @@ def _per_cell_spearman_median(
     return float(np.median(rhos)), float(np.mean(rhos))
 
 
+def _global_structure_metrics(
+    coords_true: np.ndarray, coords_pred: np.ndarray,
+    n_pairs: int = 100_000, seed: int = 0,
+) -> Dict[str, float]:
+    """Global-structure / anti-collapse metrics. Self-contained (numpy +
+    scipy) — mirrors scgg.evaluation.luna_metrics.compute_global_structure
+    so aggregate_metrics.json carries the same signals as
+    extended_metrics.csv.
+
+    The per-cell Spearman is LOCAL and cannot see a 1-D dimensional
+    collapse (a 'snake' that keeps local order but destroys the 2-D
+    layout). These flag it:
+      * anisotropy_ratio_pred = lambda2/lambda1 of the predicted cloud
+        (~0 for a line); anisotropy_ratio_error = |pred - true| is the
+        sharp collapse signal;
+      * global_distance_{spearman,pearson} = corr of true-vs-pred
+        distance over a random sample of cell pairs (low for a globally
+        warped layout, since it is dominated by long-range pairs).
+    """
+    from scipy.stats import spearmanr
+
+    def _aniso(x: np.ndarray) -> float:
+        x = np.asarray(x, dtype=np.float64)[:, :2]
+        if x.shape[0] < 2:
+            return float("nan")
+        x = x - x.mean(0, keepdims=True)
+        cov = (x.T @ x) / float(x.shape[0])
+        ev = np.clip(np.linalg.eigvalsh(cov), 0.0, None)
+        return float(ev[0] / (ev[-1] + 1e-12))
+
+    a_t, a_p = _aniso(coords_true), _aniso(coords_pred)
+    out: Dict[str, float] = {
+        "anisotropy_ratio_true": a_t,
+        "anisotropy_ratio_pred": a_p,
+        "anisotropy_ratio_error": (
+            abs(a_p - a_t) if np.isfinite(a_p) and np.isfinite(a_t)
+            else float("nan")
+        ),
+    }
+    n = int(coords_true.shape[0])
+    g_spr = g_pear = float("nan")
+    if n >= 4:
+        rng = np.random.default_rng(seed)
+        m = min(int(n_pairs), n * (n - 1) // 2)
+        i = rng.integers(0, n, size=m)
+        j = rng.integers(0, n, size=m)
+        keep = i != j
+        i, j = i[keep], j[keep]
+        if i.size > 1:
+            dt = np.linalg.norm(coords_true[i, :2] - coords_true[j, :2], axis=1)
+            dp = np.linalg.norm(coords_pred[i, :2] - coords_pred[j, :2], axis=1)
+            if dt.std() > 1e-12 and dp.std() > 1e-12:
+                g_spr = float(spearmanr(dt, dp).correlation)
+                g_pear = float(np.corrcoef(dt, dp)[0, 1])
+    out["global_distance_spearman"] = g_spr
+    out["global_distance_pearson"] = g_pear
+    return out
+
+
 def _evaluate_predictions(
     sections: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]],
     plots_dir: Optional[Path] = None,
@@ -1046,12 +1105,16 @@ def _evaluate_predictions(
             logger.info(f"  {label}: only {len(coords_true)} cells; skipping")
             continue
         med, mean = _per_cell_spearman_median(coords_true, coords_pred)
-        rows.append({
+        row = {
             "section_label": label,
             "n_cells": int(coords_true.shape[0]),
             "spearman_per_cell_median": med,
             "spearman_per_cell_mean": mean,
-        })
+        }
+        # Global-structure / anti-collapse metrics — numeric, so they
+        # auto-aggregate into aggregate_metrics.json + per_slice_metrics.csv.
+        row.update(_global_structure_metrics(coords_true, coords_pred))
+        rows.append(row)
         logger.info(
             f"  {label:32s}  n={coords_true.shape[0]:>5d}  "
             f"spr_median={med:.4f}  spr_mean={mean:.4f}"
