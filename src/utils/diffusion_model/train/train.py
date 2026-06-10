@@ -274,7 +274,30 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     else:
         batched_data_for_noise = batched_data
 
-    z_t = self.noise_model.apply_noise(batched_data_for_noise)
+    # MixFlow-style informed prior (gated by prior_head; default off).
+    # Predict each cell's coarse CANONICAL-frame position from its
+    # features and (a) train that head with a geodesic MSE to the true
+    # canonical position, (b) hand the prediction (DETACHED) to
+    # apply_noise so the FM source Gaussian is re-centred there. Detach
+    # = the head trains only via the geodesic term, the FM only sees a
+    # warm-started prior (no FM→prior feedback loop).
+    prior_mean = None
+    prior_geo = None
+    if getattr(self, "prior_head", None) is not None:
+        from utils.data.canonicalize import canonicalize_cloud
+        _feat = batched_data.node_features
+        _m = batched_data.node_mask.unsqueeze(-1).to(_feat.dtype)
+        prior_mean = self.prior_head(_feat) * _m                  # (B,N,2)
+        with torch.no_grad():
+            _x0_canon = canonicalize_cloud(
+                batched_data.positions, batched_data.node_mask)
+        _sq = ((prior_mean - _x0_canon) ** 2) * _m
+        prior_geo = _sq.sum() / (_m.sum() * 2.0 + 1e-8)
+
+    z_t = self.noise_model.apply_noise(
+        batched_data_for_noise,
+        prior_mean=(prior_mean.detach() if prior_mean is not None else None),
+    )
 
     # Stash TRUE positions on the Lightning module so the
     # CoarseToFineWrapper (if active) can use them for teacher
@@ -319,6 +342,15 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
         masked_pred=pred, masked_true=batched_data, log=i % self.log_every_steps == 0
     )
     loss = loss
+
+    # learned_regression informed prior: add the geodesic MSE that trains
+    # the prior head (keeps μ near the true canonical position, so the FM
+    # only makes small corrections — MixFlow's geodesic term).
+    if prior_geo is not None:
+        loss = loss + self._prior_geo_weight * prior_geo
+        if wandb.run and (i % self.log_every_steps == 0):
+            wandb.log({"train_loss/prior_geodesic":
+                       float(prior_geo.detach().item())}, commit=False)
 
     # Auxiliary gene-reconstruction loss. Head input: concat of the
     # backbone's per-cell output node_features and the predicted

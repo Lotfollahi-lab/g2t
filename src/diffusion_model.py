@@ -854,6 +854,15 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 and bool(getattr(_edm_cfg_fm, "diffuse_in_embed_space", False))
             )
             if _edm_hspace:
+                _fmc = getattr(cfg.model, "flow_matching", None)
+                if str(getattr(_fmc, "prior_mode", "gaussian")).lower() == \
+                        "learned_regression":
+                    raise NotImplementedError(
+                        "prior_mode='learned_regression' is implemented for "
+                        "coordinate-space FM only, not h-space "
+                        "(edm.diffuse_in_embed_space=true). Use "
+                        "diffuse_in_embed_space=false."
+                    )
                 from utils.diffusion_model.diffusion.edm_fm_model import (
                     EDMFlowMatchingModel,
                 )
@@ -866,6 +875,43 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     FlowMatchingModel,
                 )
                 self.noise_model = FlowMatchingModel(cfg)
+                # MixFlow-style informed prior: a learnable head predicts
+                # each cell's coarse CANONICAL-frame position from its
+                # features (genes, or Nicheformer embeddings if those are
+                # the node_features); the FM then starts from that prior
+                # instead of N(0,I). The head trains via a geodesic MSE in
+                # training_step_func; its (detached) output re-centres the
+                # source Gaussian in apply_noise / sample_limit_dist.
+                # Gated by prior_mode='learned_regression', default off.
+                _fm_cfg = getattr(cfg.model, "flow_matching", None)
+                _prior_mode = str(
+                    getattr(_fm_cfg, "prior_mode", "gaussian")
+                ).lower() if _fm_cfg is not None else "gaussian"
+                if _prior_mode == "learned_regression":
+                    if not bool(getattr(_fm_cfg, "canonicalize_target", False)):
+                        raise ValueError(
+                            "flow_matching.prior_mode='learned_regression' "
+                            "requires flow_matching.canonicalize_target=true: "
+                            "a per-cell point prior is only well-defined in a "
+                            "fixed canonical frame (otherwise the predicted "
+                            "position carries an arbitrary SE(2) gauge)."
+                        )
+                    _ph_hidden = int(getattr(_fm_cfg, "prior_hidden", 128))
+                    # Concrete Linear (NOT LazyLinear): configure_optimizers
+                    # runs before the first forward, so a lazy/uninitialised
+                    # param would be missed by the optimizer and never train.
+                    # node_features width = the gene-column count.
+                    _gene_dim = int(cfg.dataset.gene_columns_end) - int(
+                        cfg.dataset.gene_columns_start
+                    )
+                    self.prior_head = torch.nn.Sequential(
+                        torch.nn.Linear(_gene_dim, _ph_hidden),
+                        torch.nn.SiLU(),
+                        torch.nn.Linear(_ph_hidden, 2),
+                    )
+                    self._prior_geo_weight = float(
+                        getattr(_fm_cfg, "prior_geo_weight", 1.0)
+                    )
         elif framework == "regression":
             # Direct supervised regression — no noise, no iterative
             # sampling. See module docstring of regression_predictor.

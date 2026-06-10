@@ -263,14 +263,21 @@ class FlowMatchingModel:
         # behavior (``x_1 ~ N(0, I)``).
         self.prior_mode = "gaussian"
         self.prior_pool: Optional[dict] = None
+        # Std of the informed-prior Gaussian (learned_regression): x_1 is
+        # μ(features) + prior_sigma·ε. 1.0 keeps the same noise spread as
+        # the standard Gaussian prior, just re-centred on the predicted
+        # per-cell location.
+        self.prior_sigma = 1.0
         if fm_cfg is not None:
             mode = str(getattr(fm_cfg, "prior_mode", "gaussian")).lower()
-            if mode not in ("gaussian", "empirical_gmm"):
+            if mode not in ("gaussian", "empirical_gmm", "learned_regression"):
                 raise ValueError(
                     f"Unknown model.flow_matching.prior_mode={mode!r}. "
-                    f"Expected 'gaussian' or 'empirical_gmm'."
+                    f"Expected 'gaussian', 'empirical_gmm' or "
+                    f"'learned_regression'."
                 )
             self.prior_mode = mode
+            self.prior_sigma = float(getattr(fm_cfg, "prior_sigma", 1.0))
             if mode == "empirical_gmm":
                 pool_path = getattr(fm_cfg, "prior_pool_path", None)
                 if not pool_path:
@@ -309,12 +316,17 @@ class FlowMatchingModel:
     # ------------------------------------------------------------------
     # Training-time perturbation
     # ------------------------------------------------------------------
-    def apply_noise(self, data: DataHolder, train_flag: bool = True) -> DataHolder:
-        """Sample one ``t`` per slice, draw Gaussian ``x_1``, return the
+    def apply_noise(self, data: DataHolder, train_flag: bool = True,
+                    prior_mean: "torch.Tensor" = None) -> DataHolder:
+        """Sample one ``t`` per slice, draw the source ``x_1``, return the
         linear-interpolant point ``x_t = (1-t)·x_0 + t·x_1``.
 
         Mirrors ``NoiseModel.apply_noise`` in signature and return
-        type so training_step_func is framework-agnostic.
+        type so training_step_func is framework-agnostic. ``prior_mean``
+        (B, N, 2), when given (prior_mode='learned_regression'), re-centres
+        the source Gaussian on the per-cell predicted position so the FM
+        starts from an informed prior — passed in as a kwarg (NOT stashed
+        on the DataHolder) by training_step_func.
         """
         B = data.node_features.size(0)
         device = data.node_features.device
@@ -341,7 +353,15 @@ class FlowMatchingModel:
         # "empirical_gmm" samples from the per-cell-type GMM pool
         # produced by precompute_prior_pool.py, then rescales to each
         # slice's bounding-box scale (computed from x_0 at training).
-        if self.prior_mode == "empirical_gmm" and self.prior_pool is not None:
+        if prior_mean is not None:
+            # learned_regression: informed prior centred on the per-cell
+            # predicted (canonical-frame) position μ. x_1 = μ + σ·ε.
+            noise_pos = self.prior_sigma * torch.randn(
+                data.positions.shape, device=device)
+            noise_positions_masked = (
+                prior_mean + noise_pos
+            ) * data.node_mask.unsqueeze(-1)
+        elif self.prior_mode == "empirical_gmm" and self.prior_pool is not None:
             # Sample in normalized scale (roughly [-1, 1]² per cell).
             x_1_norm = _sample_x1_from_gmm_pool(
                 cell_class=data.cell_class,
@@ -411,10 +431,14 @@ class FlowMatchingModel:
         node_mask: torch.Tensor,
         cell_ID: torch.Tensor,
         cell_class: torch.Tensor,
+        prior_mean: "torch.Tensor" = None,
     ) -> DataHolder:
         """Initialise the ODE at ``t = 1``: positions ∼ 𝒩(0, I),
         masked + mean-subtracted. Matches NoiseModel.sample_limit_dist
         signature so ``sample.sample_noise`` works framework-agnostically.
+        ``prior_mean`` (B, N, 2), when given (learned_regression), centres
+        the init on the per-cell predicted position — same informed prior
+        as training, supplied as a kwarg by the sampler.
         """
         B, N = node_mask.shape
         device = node_mask.device
@@ -422,7 +446,10 @@ class FlowMatchingModel:
         # Same branching as apply_noise. At inference we don't have x_0
         # so we use the train-median bbox-diag scale (``default_scale``)
         # from the prior pool — a single global rescaling factor.
-        if self.prior_mode == "empirical_gmm" and self.prior_pool is not None:
+        if prior_mean is not None:
+            positions = prior_mean + self.prior_sigma * torch.randn(
+                B, N, 2, device=device)
+        elif self.prior_mode == "empirical_gmm" and self.prior_pool is not None:
             positions = _sample_x1_from_gmm_pool(
                 cell_class=cell_class,
                 node_mask=node_mask,

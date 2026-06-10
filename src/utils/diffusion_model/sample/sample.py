@@ -20,11 +20,21 @@ def sample_noise(self, batch: DataHolder) -> torch.Tensor:
     cell_ID = batch.cell_ID
     node_mask = batch.node_mask
 
+    # learned_regression informed prior (gated): same head as training
+    # re-centres the ODE init on the per-cell predicted position, so
+    # train and inference start from the SAME informed distribution.
+    prior_mean = None
+    if getattr(self, "prior_head", None) is not None:
+        prior_mean = self.prior_head(node_features) * node_mask.unsqueeze(-1).to(
+            node_features.dtype
+        )
+
     z_t = self.noise_model.sample_limit_dist(
         node_features=node_features,
         cell_class=cell_class,
         cell_ID=cell_ID,
         node_mask=node_mask,
+        prior_mean=prior_mean,
     )
 
     return z_t.device_as(node_features)

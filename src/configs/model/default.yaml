@@ -208,6 +208,27 @@ flow_matching:
     prior_pool_path: null
 
     # -----------------------------------------------------------------
+    # learned_regression prior (MixFlow-style informed prior).
+    # -----------------------------------------------------------------
+    # A third prior_mode. A small LEARNED head predicts each cell's
+    # coarse CANONICAL-frame position from its node_features (gene
+    # expression, or Nicheformer embeddings if those ARE the
+    # node_features via the obsm gene-encoder pathway). The FM then
+    # starts from N(μ(features), prior_sigma²) instead of N(0, I), so it
+    # only makes small corrections (cf. MixFlow's condition-dependent
+    # base + geodesic loss). The head is trained by a geodesic MSE
+    # ‖μ − x0_canonical‖² (weight ``prior_geo_weight``); its DETACHED
+    # output re-centres the source Gaussian (no FM→prior feedback).
+    #
+    # REQUIRES ``canonicalize_target=true`` (a per-cell point prior is
+    # only well-defined in a fixed frame — guarded in diffusion_model).
+    # Coordinate-space FM only (not edm.diffuse_in_embed_space=true).
+    # Default off (prior_mode stays "gaussian").
+    prior_sigma: 1.0       # std of the informed Gaussian around μ
+    prior_hidden: 128      # hidden width of the prior-head MLP (LazyLinear in)
+    prior_geo_weight: 1.0  # weight of the geodesic MSE that trains the head
+
+    # -----------------------------------------------------------------
     # Gauge-fixed flow matching (canonical-frame target).
     # -----------------------------------------------------------------
     # A cell cloud's absolute coordinates are defined only up to a rigid
