@@ -25,7 +25,11 @@ def sample_noise(self, batch: DataHolder) -> torch.Tensor:
     # train and inference start from the SAME informed distribution.
     prior_mean = None
     if getattr(self, "prior_head", None) is not None:
-        prior_mean = self.prior_head(node_features) * node_mask.unsqueeze(-1).to(
+        # Match training: optionally feed the prior head only the last-K
+        # feature columns (e.g. the appended scVI latent); 0 -> full.
+        _pk = int(getattr(self, "_prior_input_last_k", 0))
+        _feat_prior = node_features[..., -_pk:] if _pk > 0 else node_features
+        prior_mean = self.prior_head(_feat_prior) * node_mask.unsqueeze(-1).to(
             node_features.dtype
         )
 

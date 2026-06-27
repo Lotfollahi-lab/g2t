@@ -227,6 +227,15 @@ flow_matching:
     prior_sigma: 1.0       # std of the informed Gaussian around μ
     prior_hidden: 128      # hidden width of the prior-head MLP (LazyLinear in)
     prior_geo_weight: 1.0  # weight of the geodesic MSE that trains the head
+    # Restrict the prior head's INPUT to the last-K node-feature columns.
+    # 0 (default) = use the full feature vector (byte-identical). Set to the
+    # scVI conditioning dim (e.g. 10, when prep.conditioning_field=scvi_10
+    # appended a 10-D scVI latent as the LAST block of node_features) so the
+    # coarse positional prior is regressed from the batch-corrected cell-
+    # state embedding alone (MixFlow-style decomposition: scVI -> coarse
+    # prior, raw genes -> fine FM correction). The FM backbone still sees
+    # the full features.
+    prior_input_last_k: 0
 
     # -----------------------------------------------------------------
     # Gauge-fixed flow matching (canonical-frame target).

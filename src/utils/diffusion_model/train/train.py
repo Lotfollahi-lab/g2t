@@ -287,7 +287,11 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
         from utils.data.canonicalize import canonicalize_cloud
         _feat = batched_data.node_features
         _m = batched_data.node_mask.unsqueeze(-1).to(_feat.dtype)
-        prior_mean = self.prior_head(_feat) * _m                  # (B,N,2)
+        # Optionally restrict the prior head to the last-K columns (e.g. the
+        # appended scVI latent); 0 -> full features.
+        _pk = int(getattr(self, "_prior_input_last_k", 0))
+        _feat_prior = _feat[..., -_pk:] if _pk > 0 else _feat
+        prior_mean = self.prior_head(_feat_prior) * _m            # (B,N,2)
         with torch.no_grad():
             _x0_canon = canonicalize_cloud(
                 batched_data.positions, batched_data.node_mask)

@@ -904,8 +904,28 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     _gene_dim = int(cfg.dataset.gene_columns_end) - int(
                         cfg.dataset.gene_columns_start
                     )
+                    # Optionally feed the prior head ONLY the last-K feature
+                    # columns (e.g. an appended scVI latent) so the coarse
+                    # positional prior is regressed from the cell-state
+                    # embedding alone. 0 -> full features (byte-identical).
+                    self._prior_input_last_k = max(
+                        0, int(getattr(_fm_cfg, "prior_input_last_k", 0))
+                    )
+                    _ph_in = (
+                        self._prior_input_last_k
+                        if 0 < self._prior_input_last_k <= _gene_dim
+                        else _gene_dim
+                    )
+                    if self._prior_input_last_k > _gene_dim:
+                        raise ValueError(
+                            f"flow_matching.prior_input_last_k="
+                            f"{self._prior_input_last_k} exceeds the feature "
+                            f"width {_gene_dim} (gene_columns). It must be the "
+                            f"size of the appended conditioning block (e.g. the "
+                            f"scVI dim)."
+                        )
                     self.prior_head = torch.nn.Sequential(
-                        torch.nn.Linear(_gene_dim, _ph_hidden),
+                        torch.nn.Linear(_ph_in, _ph_hidden),
                         torch.nn.SiLU(),
                         torch.nn.Linear(_ph_hidden, 2),
                     )
