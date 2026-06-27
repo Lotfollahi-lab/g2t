@@ -158,13 +158,20 @@ def _sniff_separator(path: Path) -> str:
 
 
 def _read_scp_csv(path: Path) -> pd.DataFrame:
-    """Single-Cell-Portal CSV/TSV: header, optional TYPE row, NAME index."""
+    """Single-Cell-Portal CSV/TSV: header, optional TYPE row, NAME index.
+
+    Tolerant: not every file in this deposit follows the SCP NAME
+    convention (e.g. ``_spot_meta.csv`` is a plain table indexed by an
+    unnamed first column). When there's no NAME column we fall back to a
+    plain read with the first column as the (string) index; the caller is
+    responsible for whether that index is actually joinable to cell ids.
+    """
     sep = _sniff_separator(path)
     raw = pd.read_csv(path, sep=sep, dtype=object)
     if "NAME" not in raw.columns:
-        raise ValueError(
-            f"{path.name}: missing NAME column (got {list(raw.columns)[:8]})."
-        )
+        df = raw.set_index(raw.columns[0])
+        df.index = df.index.astype(str)
+        return df
     if str(raw.iloc[0]["NAME"]).strip().upper() == "TYPE":
         type_row = raw.iloc[0].to_dict()
         df = raw.iloc[1:].copy()
@@ -242,19 +249,41 @@ def _build_region(bronze: Path, region: str, min_cells: int):
             n_bad = int((~np.isfinite(xy).all(axis=1)).sum())
             if n_bad:
                 logger.warning(f"  {region}: {n_bad} cells non-finite coords")
-        except ValueError as e:
-            logger.warning(f"  {region}: coord parse failed ({e}); no spatial")
+            logger.info(f"  {region}: spatial cols={list(spat.columns)[:8]} "
+                        f"-> using ({xc},{yc}{','+str(zc) if zc else ''})")
+        except Exception as e:
+            logger.warning(f"  {region}: coord parse failed ({e}); NO spatial set "
+                           f"(cols={list(spat.columns)[:8]})")
     else:
         logger.warning(f"  {region}: missing {spat_p.name}; no coords")
 
+    # Per-cell labels are BEST-EFFORT and never fatal: only applied if the
+    # meta table's index actually joins to our cell ids. The deposit's
+    # _spot_meta.csv is a spot-level table (not per-cell, not keyed by cell
+    # id), so labels typically come from the global metadata.csv instead
+    # (wired separately). Missing labels -> cell_class='unknown'.
     if meta_p.exists():
-        meta = _read_scp_csv(meta_p).reindex([str(i) for i in adata.obs_names])
-        for col in meta.columns:
-            adata.obs[str(col)] = meta[col].astype(str).to_numpy()
-        for cand in _CELL_CLASS_CANDIDATES:
-            if cand in meta.columns:
-                adata.obs["cell_class"] = meta[cand].astype(str).to_numpy()
-                break
+        try:
+            meta = _read_scp_csv(meta_p)
+            ids = set(str(i) for i in adata.obs_names)
+            overlap = len(set(str(i) for i in meta.index) & ids)
+            if overlap >= 0.5 * adata.n_obs:
+                meta = meta.reindex([str(i) for i in adata.obs_names])
+                for col in meta.columns:
+                    adata.obs[str(col)] = meta[col].astype(str).to_numpy()
+                for cand in _CELL_CLASS_CANDIDATES:
+                    if cand in meta.columns:
+                        adata.obs["cell_class"] = meta[cand].astype(str).to_numpy()
+                        break
+            else:
+                logger.warning(
+                    f"  {region}: {meta_p.name} index does not match cell ids "
+                    f"(overlap {overlap}/{adata.n_obs}); skipping per-cell labels "
+                    f"(cols={list(meta.columns)[:8]})"
+                )
+        except Exception as e:
+            logger.warning(f"  {region}: could not read {meta_p.name} ({e}); "
+                           f"skipping per-cell labels")
     if "cell_class" not in adata.obs.columns:
         adata.obs["cell_class"] = "unknown"
 
