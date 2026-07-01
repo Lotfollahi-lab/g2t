@@ -298,9 +298,22 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
         _sq = ((prior_mean - _x0_canon) ** 2) * _m
         prior_geo = _sq.sum() / (_m.sum() * 2.0 + 1e-8)
 
+    # Only forward the MixFlow informed-prior mean when a prior head
+    # actually produced one (FlowMatchingModel with
+    # prior_mode='learned_regression'). The other noise models
+    # (DDPM NoiseModel, EDMFlowMatchingModel, RegressionPredictor, ...)
+    # don't take a `prior_mean` kwarg, so passing it unconditionally
+    # raised `TypeError: apply_noise() got an unexpected keyword argument
+    # 'prior_mean'` for e.g. the framework='diffusion' ablation. prior_mean
+    # is non-None only when self.prior_head exists (built solely in the
+    # FlowMatchingModel branch), so omitting it here is byte-identical for
+    # every other path and mirrors validation (val.py omits it too).
+    _noise_kwargs = (
+        {"prior_mean": prior_mean.detach()} if prior_mean is not None else {}
+    )
     z_t = self.noise_model.apply_noise(
         batched_data_for_noise,
-        prior_mean=(prior_mean.detach() if prior_mean is not None else None),
+        **_noise_kwargs,
     )
 
     # Stash TRUE positions on the Lightning module so the
