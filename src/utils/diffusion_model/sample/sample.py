@@ -33,12 +33,20 @@ def sample_noise(self, batch: DataHolder) -> torch.Tensor:
             node_features.dtype
         )
 
+    # As in training (train.py), forward the MixFlow informed-prior mean
+    # only when a prior head produced one. The DDPM NoiseModel's
+    # sample_limit_dist doesn't take a `prior_mean` kwarg, so passing it
+    # unconditionally broke the framework='diffusion' ablation at inference.
+    # prior_mean is non-None only when self.prior_head exists (built solely
+    # in the FlowMatchingModel branch), so omitting it here is byte-identical
+    # for every other path.
+    _limit_kwargs = {"prior_mean": prior_mean} if prior_mean is not None else {}
     z_t = self.noise_model.sample_limit_dist(
         node_features=node_features,
         cell_class=cell_class,
         cell_ID=cell_ID,
         node_mask=node_mask,
-        prior_mean=prior_mean,
+        **_limit_kwargs,
     )
 
     return z_t.device_as(node_features)
