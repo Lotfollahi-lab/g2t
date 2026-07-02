@@ -987,6 +987,15 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 f"or 'latent_diffusion'."
             )
 
+        # One-time trainable-parameter count, printed at construction so it
+        # lands in every run's log (no behavioural effect). Read it with
+        # grep on "[params]" in the run log.
+        try:
+            _n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            print(f"[params] trainable={_n_params:,}", flush=True)
+        except Exception:
+            pass
+
     def _install_per_module_grad_finder(self) -> None:
         """Install register_full_backward_hook on every nn.Module so we
         can pinpoint WHICH module's backward first produces a

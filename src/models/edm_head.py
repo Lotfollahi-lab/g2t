@@ -43,6 +43,7 @@ Trade-offs
 from __future__ import annotations
 
 import contextlib
+import os
 from typing import Optional
 
 import torch
@@ -637,6 +638,23 @@ class EDMOutputWrapper(nn.Module):
                 aligned_list.append(x_ref[b])
                 continue
             D_v = D_sq[b].index_select(0, valid_idx).index_select(1, valid_idx)
+            # Diagnostic (env-gated, eval-only): fraction of the predicted
+            # distances' variance captured by the top-2 MDS eigenvalues ---
+            # i.e. how 2-D-embeddable D_v is (reviewer request). Off by
+            # default; set SCGG_LOG_MDS_VAR=1 for a one-off measurement.
+            # Independent of mds_solver (does its own full eigh), so it
+            # works for the lobpcg baseline too. Prints one line per slice.
+            if os.environ.get("SCGG_LOG_MDS_VAR") and not self.training:
+                with torch.no_grad():
+                    _Dd = D_v.to(torch.float64)
+                    _n = _Dd.shape[0]
+                    _J = torch.eye(_n, dtype=_Dd.dtype, device=_Dd.device) - 1.0 / _n
+                    _B = -0.5 * _J @ _Dd @ _J
+                    _ev = torch.linalg.eigvalsh(_B)            # ascending
+                    _pos = _ev[_ev > 0].sum()
+                    _top2 = _ev[-1] + _ev[-2]
+                    _frac = float(_top2 / _pos) if float(_pos) > 0 else float("nan")
+                    print(f"[mds_var] top2_frac={_frac:.4f} n_valid={_n}", flush=True)
             # Dtype: fp64 (default) for backward stability of eigh
             # when mds_align_gradient=True; fp32 for ~2× speed when
             # no backward goes through eigh. The constructor's
