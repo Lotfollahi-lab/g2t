@@ -253,7 +253,13 @@ def assemble(
     overwrite: bool,
     section_filter: Optional[List[str]],
     min_cells_per_section: int,
+    filename_template: str = "abc_zhuang_abca1_{section}",
 ) -> None:
+    if "{section}" not in filename_template:
+        raise ValueError(
+            f"--filename_template must contain '{{section}}'; got "
+            f"{filename_template!r} (else every section would collide)."
+        )
     import anndata as ad
     import scipy.sparse as sp
 
@@ -458,7 +464,7 @@ def assemble(
     written = 0
     skipped_small = 0
     for sec in sections:
-        out_path = silver_dir / f"abc_zhuang_abca1_{sec}.h5ad"
+        out_path = silver_dir / f"{filename_template.format(section=sec)}.h5ad"
         if out_path.exists() and not overwrite:
             logger.info(f"  exists, skipping: {out_path.name}")
             continue
@@ -515,6 +521,14 @@ def main() -> int:
         "--min_cells_per_section", type=int, default=100,
         help="Drop sections with fewer cells.",
     )
+    p.add_argument(
+        "--filename_template", default="abc_zhuang_abca1_{section}",
+        help="Output h5ad basename template (no extension); must contain "
+             "'{section}' (the brain_section_label, e.g. 'Zhuang-ABCA-1.099'). "
+             "Default 'abc_zhuang_abca1_{section}'. To colocate the MERFISH "
+             "source with the STARmap target in cns_luna_raw using the harmony "
+             "cns_luna naming, pass '{section}_train' -> Zhuang-ABCA-1.099_train.h5ad.",
+    )
     args = p.parse_args()
 
     logging.basicConfig(
@@ -533,6 +547,7 @@ def main() -> int:
         overwrite=args.overwrite,
         section_filter=section_filter,
         min_cells_per_section=args.min_cells_per_section,
+        filename_template=args.filename_template,
     )
     return 0
 
