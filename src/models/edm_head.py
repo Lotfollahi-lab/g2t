@@ -628,6 +628,12 @@ class EDMOutputWrapper(nn.Module):
         into a single pre-allocated output tensor).
         """
         B, N, _ = x_ref.shape
+        # Per-forward-pass counter for the SCGG_LOG_MDS_VAR diagnostic
+        # (one increment per reverse-diffusion step); lets the CSV
+        # distinguish steps within a slice's reverse chain. No cost
+        # when the diagnostic is off.
+        if os.environ.get("SCGG_LOG_MDS_VAR") and not self.training:
+            self._mds_var_call = getattr(self, "_mds_var_call", 0) + 1
         aligned_list = []
         for b in range(B):
             m = node_mask[b]
@@ -641,10 +647,22 @@ class EDMOutputWrapper(nn.Module):
             # Diagnostic (env-gated, eval-only): fraction of the predicted
             # distances' variance captured by the top-2 MDS eigenvalues ---
             # i.e. how 2-D-embeddable D_v is (reviewer request). Off by
-            # default; set SCGG_LOG_MDS_VAR=1 for a one-off measurement.
-            # Independent of mds_solver (does its own full eigh), so it
-            # works for the lobpcg baseline too. Prints one line per slice.
-            if os.environ.get("SCGG_LOG_MDS_VAR") and not self.training:
+            # default. Independent of mds_solver (does its own full fp64
+            # eigh), so it works for the lobpcg baseline too.
+            #
+            # ``SCGG_LOG_MDS_VAR`` controls it:
+            #   * unset / empty  -> off (no cost)
+            #   * "1"/"true"/... -> print one line per (step, slice)
+            #   * any other value-> treated as a CSV PATH to append to,
+            #                       with a per-forward-pass ``call`` index.
+            # forward() (hence MDS) runs at EVERY reverse-diffusion step,
+            # and each test slice is sampled independently, so the log
+            # holds n_steps x n_slices rows. Within one slice's reverse
+            # chain ``n_valid`` is constant and ``call`` increases; the
+            # CONVERGED value is the last row of each contiguous
+            # constant-``n_valid`` run (see analyse_mds_var.py).
+            _dst = os.environ.get("SCGG_LOG_MDS_VAR")
+            if _dst and not self.training:
                 with torch.no_grad():
                     _Dd = D_v.to(torch.float64)
                     _n = _Dd.shape[0]
@@ -654,7 +672,15 @@ class EDMOutputWrapper(nn.Module):
                     _pos = _ev[_ev > 0].sum()
                     _top2 = _ev[-1] + _ev[-2]
                     _frac = float(_top2 / _pos) if float(_pos) > 0 else float("nan")
-                    print(f"[mds_var] top2_frac={_frac:.4f} n_valid={_n}", flush=True)
+                _call = getattr(self, "_mds_var_call", 0)
+                print(f"[mds_var] call={_call} slice_b={b} "
+                      f"top2_frac={_frac:.4f} n_valid={_n}", flush=True)
+                if _dst.lower() not in ("1", "true", "yes", "on"):
+                    _new = not os.path.exists(_dst)
+                    with open(_dst, "a") as _fh:
+                        if _new:
+                            _fh.write("call,slice_b,n_valid,top2_frac\n")
+                        _fh.write(f"{_call},{b},{_n},{_frac:.6f}\n")
             # Dtype: fp64 (default) for backward stability of eigh
             # when mds_align_gradient=True; fp32 for ~2× speed when
             # no backward goes through eigh. The constructor's
