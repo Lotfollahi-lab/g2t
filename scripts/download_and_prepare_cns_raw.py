@@ -232,9 +232,14 @@ def _build_region(bronze: Path, region: str, min_cells: int, expression: str):
         logger.warning(f"  {region}: missing {expr_p.name}; skipping")
         return None
 
-    # Read GENES x CELLS. Force float32 on the data columns to halve memory
-    # for the large imputed CSVs (index_col=0 = gene symbols stays object).
-    expr = pd.read_csv(expr_p, index_col=0, dtype=np.float32)
+    # Read GENES x CELLS. Force float32 on the CELL (data) columns to halve
+    # memory for the large imputed CSVs — but NOT on column 0 (gene symbols,
+    # the index): a scalar float dtype tries to cast 'A2M' -> float and
+    # crashes, so build a per-column dtype map from the header.
+    _hdr = pd.read_csv(expr_p, nrows=0)
+    _data_cols = list(_hdr.columns[1:])
+    expr = pd.read_csv(expr_p, index_col=0,
+                       dtype={c: np.float32 for c in _data_cols})
     genes = [str(g) for g in expr.index]
     cells = [str(c) for c in expr.columns]
     X = expr.to_numpy(dtype=np.float32).T                 # CELLS x GENES
