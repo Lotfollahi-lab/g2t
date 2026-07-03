@@ -50,17 +50,37 @@ logger = logging.getLogger("scgg.prepare_abc_silver")
 # ---------------------------------------------------------------------------
 
 
-def _find_path(bronze_dir: Path, glob_pattern: str) -> Optional[Path]:
-    """Return the first match for the glob, or None."""
-    matches = sorted(bronze_dir.glob(glob_pattern))
+def _find_file(bronze_dir: Path, basename: str,
+               subdir_hint: Optional[str] = None) -> Optional[Path]:
+    """Locate a file by BASENAME anywhere under bronze_dir — layout-agnostic.
+
+    Works for the abc_atlas_access cache (files flat at the top level OR
+    under metadata/<dataset>/<ver>/) AND the HTTPS-fallback S3 nesting.
+    Prefers a top-level hit, then (if given) a ``subdir_hint`` in the path,
+    then the lexicographically-newest match.
+    """
+    top = bronze_dir / basename
+    if top.is_file():
+        return top
+    matches = [m for m in bronze_dir.rglob(basename) if m.is_file()]
     if not matches:
         return None
-    if len(matches) > 1:
-        logger.info(
-            f"  multiple matches for {glob_pattern!r}, using newest by lex order: "
-            f"{matches[-1].name}"
-        )
-    return matches[-1]
+    if subdir_hint:
+        pref = [m for m in matches if subdir_hint in m.as_posix()]
+        if pref:
+            matches = pref
+    return sorted(matches)[-1]
+
+
+def _find_expression(bronze_dir: Path) -> Optional[Path]:
+    """Locate the RAW expression h5ad, tolerating naming/layout variants and
+    never selecting a log2-normalised file."""
+    for pat in ("Zhuang-ABCA-1-raw.h5ad", "*-raw.h5ad", "*raw*.h5ad", "*.h5ad"):
+        hits = [p for p in bronze_dir.rglob(pat)
+                if p.is_file() and "log2" not in p.name.lower()]
+        if hits:
+            return sorted(hits)[-1]
+    return None
 
 
 def _discover_bronze_files(
@@ -75,71 +95,25 @@ def _discover_bronze_files(
         taxonomy_membership, expression
     """
     out: Dict[str, Path] = {}
-
     if release_version:
-        ver = release_version
-    else:
-        # Auto-discover version: look for any cell_metadata.csv path.
-        # In the real ABC layout `cell_metadata.csv` lives directly in the
-        # version dir (not under views/), so look there.
-        candidates = list(bronze_dir.rglob("metadata/Zhuang-ABCA-1/*/cell_metadata.csv"))
-        if not candidates:
-            raise FileNotFoundError(
-                f"No metadata/Zhuang-ABCA-1/*/cell_metadata.csv under "
-                f"{bronze_dir}. Did the download finish?"
-            )
-        versions = sorted({p.parent.name for p in candidates})
-        ver = versions[-1]
-        logger.info(f"Auto-discovered Zhuang-ABCA-1 release version: {ver}")
+        logger.info(f"(release_version={release_version!r} ignored; files are "
+                    f"located by basename, layout-agnostic)")
 
-    # Independent release versions per dataset (Allen rolls them out of sync).
-    def _discover(dataset_subpath: str, default: str) -> str:
-        cands = list(bronze_dir.glob(f"{dataset_subpath}/*/"))
-        if not cands:
-            return default
-        return sorted([c.name for c in cands])[-1]
-
-    ccf_ver = _discover("metadata/Zhuang-ABCA-1-CCF", ver)
-    tax_ver = _discover("metadata/WMB-taxonomy", ver)
-    expr_ver = _discover("expression_matrices/Zhuang-ABCA-1", ver)
-    logger.info(
-        f"Per-dataset versions: Zhuang-ABCA-1={ver} CCF={ccf_ver} "
-        f"WMB-taxonomy={tax_ver} expression={expr_ver}"
-    )
-
-    # Prefer the pre-joined `cell_metadata_with_cluster_annotation.csv` view
-    # (cell_metadata + class/subclass/supertype labels merged by Allen) over
-    # the bare cell_metadata.csv. Falls back to the bare file + WMB-taxonomy
-    # join if the pre-joined view isn't on disk.
-    out["cell_metadata_joined"] = _find_path(
-        bronze_dir,
-        f"metadata/Zhuang-ABCA-1/{ver}/views/"
-        f"cell_metadata_with_cluster_annotation.csv",
-    )
-    out["cell_metadata"] = _find_path(
-        bronze_dir, f"metadata/Zhuang-ABCA-1/{ver}/cell_metadata.csv"
-    )
-    out["gene_metadata"] = _find_path(
-        bronze_dir, f"metadata/Zhuang-ABCA-1/{ver}/gene.csv"
-    )
-    out["ccf_coords"] = _find_path(
-        bronze_dir, f"metadata/Zhuang-ABCA-1-CCF/{ccf_ver}/ccf_coordinates.csv"
-    )
-    out["taxonomy_cluster"] = _find_path(
-        bronze_dir, f"metadata/WMB-taxonomy/{tax_ver}/cluster.csv"
-    )
-    out["taxonomy_term"] = _find_path(
-        bronze_dir, f"metadata/WMB-taxonomy/{tax_ver}/cluster_annotation_term.csv"
-    )
-    out["taxonomy_membership"] = _find_path(
-        bronze_dir,
-        f"metadata/WMB-taxonomy/{tax_ver}/"
-        f"cluster_to_cluster_annotation_membership.csv",
-    )
-    out["expression"] = _find_path(
-        bronze_dir,
-        f"expression_matrices/Zhuang-ABCA-1/{expr_ver}/Zhuang-ABCA-1-raw.h5ad",
-    )
+    # Locate each needed file by basename, wherever it landed.
+    out["cell_metadata_joined"] = _find_file(
+        bronze_dir, "cell_metadata_with_cluster_annotation.csv")
+    out["cell_metadata"] = _find_file(
+        bronze_dir, "cell_metadata.csv", subdir_hint="Zhuang-ABCA-1")
+    out["gene_metadata"] = _find_file(bronze_dir, "gene.csv")
+    out["ccf_coords"] = _find_file(bronze_dir, "ccf_coordinates.csv")
+    out["taxonomy_cluster"] = _find_file(bronze_dir, "cluster.csv")
+    out["taxonomy_term"] = _find_file(bronze_dir, "cluster_annotation_term.csv")
+    out["taxonomy_membership"] = _find_file(
+        bronze_dir, "cluster_to_cluster_annotation_membership.csv")
+    out["expression"] = _find_expression(bronze_dir)
+    for k, v in out.items():
+        if v is not None:
+            logger.info(f"  found {k}: {v}")
 
     missing = [k for k, v in out.items() if v is None]
     if missing:
@@ -152,7 +126,7 @@ def _discover_bronze_files(
         for m in missing:
             logger.warning(f"  optional bronze file missing: {m}")
 
-    out["release_version"] = ver  # type: ignore[assignment]
+    out["release_version"] = release_version or "auto"  # type: ignore[assignment]
     return out
 
 
