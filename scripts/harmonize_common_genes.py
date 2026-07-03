@@ -162,8 +162,11 @@ def main() -> int:
                 pos[s] = i
         idx = [pos[g] for g in common]         # canonical order, identical everywhere
         sub = a[:, idx].copy()
-        sub.var_names = common
-        sub.var.index.name = "gene_symbol"
+        # Fresh var: canonical symbol index, NO columns. Avoids the
+        # index-name/column-name collision from the source's own
+        # 'gene_symbol' column (whose original-case values differ from our
+        # uppercased index); downstream needs only the gene order + names.
+        sub.var = pd.DataFrame(index=pd.Index(common, name="gene_symbol"))
         sub.write_h5ad(out_path)
         logger.info(f"  -> {out_path.name} ({sub.n_obs:,} cells x {sub.n_vars} genes)")
         n_written += 1
