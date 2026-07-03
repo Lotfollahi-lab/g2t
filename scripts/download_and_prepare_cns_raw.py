@@ -78,10 +78,15 @@ _CELL_CLASS_CANDIDATES = [
 ]
 
 
-def _region_files(region: str) -> List[str]:
-    # NB: raw file has NO underscore before 'raw'; spatial/meta DO.
+def _expr_filename(region: str, expression: str) -> str:
+    # NB: the expression file has NO underscore before raw/processed
+    # (e.g. 'well03processed_expression_pd.csv'); spatial/meta DO.
+    return f"{region}{expression}_expression_pd.csv"
+
+
+def _region_files(region: str, expression: str) -> List[str]:
     return [
-        f"{region}raw_expression_pd.csv",
+        _expr_filename(region, expression),
         f"{region}_spatial.csv",
         f"{region}_spot_meta.csv",
     ]
@@ -132,7 +137,8 @@ def _download_file(filename: str, bronze: Path, overwrite: bool,
     return False
 
 
-def download_all(bronze: Path, regions: List[str], overwrite: bool) -> List[str]:
+def download_all(bronze: Path, regions: List[str], overwrite: bool,
+                 expression: str) -> List[str]:
     """Download every region's 3 CSVs + the shared files. Returns the list
     of filenames that FAILED (empty == all good)."""
     bronze.mkdir(parents=True, exist_ok=True)
@@ -142,7 +148,7 @@ def download_all(bronze: Path, regions: List[str], overwrite: bool) -> List[str]
             failed.append(fn)
     for region in regions:
         logger.info(f"  downloading region {region} ...")
-        for fn in _region_files(region):
+        for fn in _region_files(region, expression):
             if not _download_file(fn, bronze, overwrite):
                 failed.append(fn)
     return failed
@@ -206,19 +212,29 @@ def _pick_xy(df: pd.DataFrame) -> tuple:
     raise ValueError(f"no usable XY columns (cols={list(df.columns)[:8]})")
 
 
-def _build_region(bronze: Path, region: str, min_cells: int):
-    """Assemble one region's AnnData; None if missing/too small."""
+def _build_region(bronze: Path, region: str, min_cells: int, expression: str):
+    """Assemble one region's AnnData; None if missing/too small.
+
+    ``expression='raw'``       -> STARmap measured counts (1022-gene panel),
+                                  stored as sparse int32 + layers['counts'].
+    ``expression='processed'`` -> IMPUTED transcriptome-wide expression
+                                  (~11844 genes), CONTINUOUS values kept as
+                                  dense float32 (never int-cast, or the
+                                  imputed signal is destroyed).
+    """
     import anndata as ad
     import scipy.sparse as sp
 
-    expr_p = bronze / f"{region}raw_expression_pd.csv"
+    expr_p = bronze / _expr_filename(region, expression)
     spat_p = bronze / f"{region}_spatial.csv"
     meta_p = bronze / f"{region}_spot_meta.csv"
     if not expr_p.exists():
         logger.warning(f"  {region}: missing {expr_p.name}; skipping")
         return None
 
-    expr = pd.read_csv(expr_p, index_col=0)               # GENES x CELLS
+    # Read GENES x CELLS. Force float32 on the data columns to halve memory
+    # for the large imputed CSVs (index_col=0 = gene symbols stays object).
+    expr = pd.read_csv(expr_p, index_col=0, dtype=np.float32)
     genes = [str(g) for g in expr.index]
     cells = [str(c) for c in expr.columns]
     X = expr.to_numpy(dtype=np.float32).T                 # CELLS x GENES
@@ -227,12 +243,19 @@ def _build_region(bronze: Path, region: str, min_cells: int):
         logger.warning(f"  {region}: {X.shape[0]} cells < {min_cells}; skipping")
         return None
 
+    if expression == "raw":
+        # measured counts -> integer, sparse
+        Xstore = sp.csr_matrix(np.rint(X).astype(np.int32))
+    else:
+        # imputed/processed -> continuous, mostly-dense; keep float32 dense
+        Xstore = X
     adata = ad.AnnData(
-        X=sp.csr_matrix(X.astype(np.int32)),
+        X=Xstore,
         obs=pd.DataFrame(index=pd.Index(cells, name="cell_id")),
         var=pd.DataFrame(index=pd.Index(genes, name="gene_symbol")),
     )
-    adata.layers["counts"] = adata.X.copy()
+    if expression == "raw":
+        adata.layers["counts"] = adata.X.copy()
 
     if spat_p.exists():
         spat = _read_scp_csv(spat_p).reindex([str(i) for i in adata.obs_names])
@@ -288,13 +311,15 @@ def _build_region(bronze: Path, region: str, min_cells: int):
         adata.obs["cell_class"] = "unknown"
 
     adata.obs["cell_section"] = region
-    adata.uns["source"] = "Shi_2023_STARmapPLUS_raw"
+    adata.uns["source"] = ("Shi_2023_STARmapPLUS_raw" if expression == "raw"
+                           else "Shi_2023_STARmapPLUS_imputed")
+    adata.uns["expression"] = expression
     adata.uns["region"] = region
     return adata
 
 
 def prepare_all(bronze: Path, silver: Path, regions: List[str],
-                min_cells: int, overwrite: bool) -> int:
+                min_cells: int, overwrite: bool, expression: str) -> int:
     silver.mkdir(parents=True, exist_ok=True)
     n_done = 0
     for region in regions:
@@ -304,7 +329,7 @@ def prepare_all(bronze: Path, silver: Path, regions: List[str],
             n_done += 1
             continue
         logger.info(f"{region}: building h5ad ...")
-        adata = _build_region(bronze, region, min_cells)
+        adata = _build_region(bronze, region, min_cells, expression)
         if adata is None:
             continue
         adata.write_h5ad(out)
@@ -332,6 +357,13 @@ def main() -> int:
     p.add_argument("--overwrite", action="store_true",
                    help="Re-download / rebuild even if outputs exist.")
     p.add_argument("--min_cells", type=int, default=100)
+    p.add_argument("--expression", choices=["raw", "processed"], default="processed",
+                   help="Which per-region expression matrix to use: 'processed' "
+                        "= IMPUTED transcriptome-wide (~11844 genes; the LUNA "
+                        "benchmark input, ~804 common with the MERFISH panel; "
+                        "continuous values, kept as float) [default]; 'raw' = "
+                        "STARmap measured counts (1022-gene panel, ~432 common; "
+                        "integer counts).")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -345,11 +377,14 @@ def main() -> int:
         if args.regions else DEFAULT_REGIONS
     )
     logger.info(f"Regions ({len(regions)}): {regions}")
-    logger.info(f"bronze={bronze}  silver={silver}")
+    logger.info(f"bronze={bronze}  silver={silver}  expression={args.expression}")
+    if args.expression == "processed":
+        logger.info("expression=processed -> IMPUTED ~11844-gene transcriptome "
+                    "(continuous values kept as float; ~804 common w/ MERFISH).")
 
     if not args.skip_download:
         logger.info("== STEP 1: download from Zenodo ==")
-        failed = download_all(bronze, regions, args.overwrite)
+        failed = download_all(bronze, regions, args.overwrite, args.expression)
         if failed:
             logger.error(f"{len(failed)} file(s) failed to download: {failed}")
             logger.error("Re-run (resumes by skipping completed files), or "
@@ -363,7 +398,8 @@ def main() -> int:
         return 0
 
     logger.info("== STEP 2: build h5ads ==")
-    n_done = prepare_all(bronze, silver, regions, args.min_cells, args.overwrite)
+    n_done = prepare_all(bronze, silver, regions, args.min_cells,
+                         args.overwrite, args.expression)
     logger.info(f"Done. {n_done}/{len(regions)} region h5ads in {silver}")
     return 0 if n_done else 1
 
