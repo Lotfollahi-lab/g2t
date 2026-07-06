@@ -39,6 +39,7 @@ class TransformerLayer(nn.Module):
         device=None,
         dtype=None,
         last_layer=False,
+        position_feedback: str = "absolute",
     ) -> None:
         """
         Initialize TransformerLayer.
@@ -63,6 +64,7 @@ class TransformerLayer(nn.Module):
             diffusion_time_dimensions=diffusion_time_dimensions,
             num_heads=num_heads,
             last_layer=last_layer,
+            position_feedback=position_feedback,
         )
 
         self.lin_node_features_1 = Linear(

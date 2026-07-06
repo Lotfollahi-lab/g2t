@@ -24,6 +24,7 @@ class SelfAttention(nn.Module):
         delta_dimensions: torch.Tensor,
         num_heads: int,
         last_layer=False,
+        position_feedback: str = "absolute",
     ):
         """
         Initialize NodeEdgeBlock.
@@ -43,6 +44,19 @@ class SelfAttention(nn.Module):
         self.diffusion_time_dimensions = diffusion_time_dimensions
         self.delta_dimensions = delta_dimensions
         self.num_heads = num_heads
+        # Auxiliary-stream ablation. "absolute" (default) feeds the current
+        # noisy 2D coordinate estimate back into the attention input as a
+        # per-cell "delta" feature (the historic LUNA behaviour, byte-
+        # identical). "off" SEVERS that feedback — the delta slot is filled
+        # with zeros — testing whether the (gauge-variant) intermediate
+        # coordinate is needed at all. The delta MLP is still constructed
+        # either way, so parameter shapes are identical across modes.
+        self.position_feedback = str(position_feedback).lower()
+        if self.position_feedback not in ("absolute", "off"):
+            raise ValueError(
+                "position_feedback must be 'absolute' or 'off'; got "
+                f"{self.position_feedback!r}"
+            )
 
         """
         Note the below transformations are named funny. I.e. the name of the function is not exactly what it does.
@@ -82,6 +96,13 @@ class SelfAttention(nn.Module):
             self.y_y = Linear(diffusion_time_dimensions, diffusion_time_dimensions)
 
     def transform_positions_for_attention(self, positions, node_mask):
+        if self.position_feedback == "off":
+            # Ablation: no intermediate-coordinate feedback into attention.
+            # Emit zeros in the delta slot (shape/param count unchanged; the
+            # delta MLP is simply unused this forward), so the network gets
+            # NO position information through this stream.
+            bs, n, _ = positions.shape
+            return positions.new_zeros(bs, n, self.delta_dimensions)
         positions = positions * node_mask
         norm_positions = torch.norm(positions, dim=-1, keepdim=True)
         normalized_position = positions / (norm_positions + 1e-7)

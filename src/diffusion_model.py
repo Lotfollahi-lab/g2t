@@ -407,6 +407,22 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 ldm_cfg=getattr(cfg.model, "latent_diffusion", None),
             )
         elif backbone == "luna_transformer":
+            # Auxiliary-stream ablation flag (severs intermediate-coordinate
+            # feedback in the backbone; see models/self_attention.py). Only
+            # the DIRECT Model path threads it today — fail loud rather than
+            # silently ignore it if a wrapper is active.
+            _pfb = str(
+                getattr(cfg.model, "position_feedback", "absolute")
+            ).lower()
+            if _pfb != "absolute" and (
+                combined_enabled or hier_enabled or c2f_enabled
+            ):
+                raise NotImplementedError(
+                    "model.position_feedback != 'absolute' is only supported "
+                    "on the direct luna_transformer backbone (no hierarchical "
+                    "/ coarse-to-fine wrapper). Disable the wrapper or set "
+                    "model.position_feedback=absolute."
+                )
             if combined_enabled:
                 # Resolve the optional input-projection knobs ONCE so
                 # the wrappers (hier / c2f / hier+c2f) and the direct
@@ -506,6 +522,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     input_dropout=float(
                         getattr(_ip_cfg, "dropout", 0.0)
                     ) if _ip_cfg is not None else 0.0,
+                    position_feedback=_pfb,
                 )
         elif backbone == "vn_transformer":
             # scGG fundamental method #3: SE(2)-equivariant vector-

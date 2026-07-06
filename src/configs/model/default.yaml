@@ -102,6 +102,20 @@ framework: "flow_matching"
 #   how cheaply attention is computed, not what it attends to.
 backbone: "luna_transformer"
 
+# Auxiliary-stream ablation. LUNA feeds the current noisy 2D coordinate
+# estimate back into every attention layer as a per-cell "delta" feature
+# (the direction-from-centroid unit vector). That feature is GAUGE-VARIANT
+# (rotates/reflects with the slice) even though the target and metric are
+# gauge-invariant — a candidate cause of weak cross-sample generalization.
+#   * "absolute" (default): historic behaviour — byte-identical.
+#   * "off": sever the coordinate feedback (delta slot zeroed; param shapes
+#     unchanged, so checkpoints stay compatible). Tests whether the
+#     intermediate-coordinate self-conditioning is needed at all — expected
+#     to be near-redundant on the EDM/relational path, which reconstructs
+#     geometry from predicted distances rather than the fed-back coordinate.
+# Only the DIRECT luna_transformer backbone honours this (no hier/c2f wrapper).
+position_feedback: "absolute"
+
 n_layers: 8 # Number of transformer/EGNN layers
 diffusion_noise_schedule: cosine # noise schedule for diffusion time
 diffusion_steps: 1000 # number of diffusion steps (DDPM only — FM ignores this; see flow_matching.n_sampling_steps below)

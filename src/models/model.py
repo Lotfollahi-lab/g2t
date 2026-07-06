@@ -39,6 +39,7 @@ class Model(nn.Module):
         input_activation: str = "relu",
         input_layernorm: bool = False,
         input_dropout: float = 0.0,
+        position_feedback: str = "absolute",
     ) -> None:
         """
         Constructor to initialize the Model instance.
@@ -83,6 +84,10 @@ class Model(nn.Module):
         self.input_activation_name = str(input_activation).lower()
         self.input_layernorm = bool(input_layernorm)
         self.input_dropout = float(input_dropout)
+        # Auxiliary-stream ablation flag, forwarded to every TransformerLayer
+        # → SelfAttention. "absolute" = historic behaviour (byte-identical);
+        # "off" severs the intermediate-coordinate feedback. See SelfAttention.
+        self.position_feedback = str(position_feedback).lower()
 
         act_fn_in = nn.ReLU()
         act_fn_out = nn.ReLU()
@@ -139,6 +144,7 @@ class Model(nn.Module):
                     dim_ff_node_features=hidden_dims["dim_ffX"],
                     dim_ff_diffusion_time=hidden_dims["dim_ffy"],
                     last_layer=False,
+                    position_feedback=self.position_feedback,
                 )
                 for _ in range(n_layers)
             ]
