@@ -235,7 +235,18 @@ class KNNGraphOutputWrapper(nn.Module):
 
         pred.knn_logits = logits
 
-        if self.spectral_layout:
+        # The graph loss (knn_graph_loss) reads pred.knn_logits, NOT
+        # pred.positions, so the (expensive, O(N^3) eigh) spectral layout is
+        # only needed to PRODUCE coordinates for metrics / inference — never
+        # for training. Skip it during training unless a position-reading loss
+        # trains THROUGH it (spectral_layout_gradient=True). This is a large
+        # per-step speedup that makes the method trainable at MMC slice sizes
+        # (a full Laplacian eigendecomposition every step is otherwise
+        # prohibitive). Eval/inference (self.training=False) always runs it.
+        run_layout = self.spectral_layout and (
+            (not self.training) or self.spectral_layout_gradient
+        )
+        if run_layout:
             if self.spectral_layout_gradient:
                 # GRADIENT-CARRYING spectral-layout path. Laplacian
                 # eigenmaps' eigh backward has 1/(λ_i − λ_j) terms
