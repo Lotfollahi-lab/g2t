@@ -755,13 +755,19 @@ class EDMOutputWrapper(nn.Module):
                 if self.decoder == "smacof" and self.smacof_iters > 0:
                     from models.geometric_decoder import smacof_refine
                     use_grad = bool(self.training and self.decoder_grad)
-                    delta = D_v.clamp_min(0.0).sqrt().to(x_mds.dtype)
+                    # Run SMACOF in fp32 regardless of the surrounding
+                    # autocast dtype: under bf16 the small-distance regime
+                    # (d^2 + tau^2 with tau ~ 1e-3·scale) underflows past
+                    # bf16's ~3-digit mantissa, destabilising the Guttman
+                    # reciprocal. Casts preserve the graph (D_v may carry
+                    # gradient); the result is cast back to the graph dtype.
+                    delta = D_v.clamp_min(0.0).sqrt().to(torch.float32)
                     x_mds = smacof_refine(
-                        delta, x_mds,
+                        delta, x_mds.to(torch.float32),
                         n_iter=self.smacof_iters,
                         n_grad_iter=(self.smacof_grad_iters if use_grad else 0),
                         grad_safe=use_grad,
-                    )
+                    ).to(x_mds.dtype)
             except Exception:
                 aligned_list.append(x_ref[b])
                 continue

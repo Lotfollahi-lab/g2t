@@ -696,6 +696,13 @@ loss:
     edm_coord_mse:
         enabled: false
         weight: 1.0
+        # Optional ramp: hold this loss at 0 gradient for the first N steps
+        # so the model builds a sensible predicted-distance matrix (via
+        # edm_distance_mse) BEFORE the coord loss backprops through the
+        # SMACOF decode of an initially-garbage D. 0 = off. A few hundred
+        # to a couple-thousand steps is a good stabiliser if the grad path
+        # is jumpy early.
+        warmup_steps: 0
 
     # ----------------------------------------------------------------
     # Spatially-aware EDM loss variants. All read pred.edm_D (the EDM

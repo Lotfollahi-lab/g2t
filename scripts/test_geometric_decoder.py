@@ -22,13 +22,19 @@ def _stress(delta, x):
     return float(((d - delta)[iu] ** 2).sum())
 
 
-def smacof(delta, x_init, n_iter=200, eps=1e-8):
+def smacof(delta, x_init, n_iter=200, eps=1e-8, tau_rel=1e-3):
+    """Numpy mirror of geometric_decoder.smacof_refine. Uses the same
+    scale-adaptive Tikhonov-smoothed Guttman reciprocal d/(d^2+tau^2) that
+    the torch version uses (bounds the 1/d backward that NaN'd v2)."""
     n = x_init.shape[0]
     x = x_init.copy()
     delta = np.clip(delta, 0, None)
+    n_off = n * (n - 1)
+    scale = delta.sum() / n_off if n_off > 0 else 1.0
+    tau = max(scale * tau_rel, eps)
     for _ in range(n_iter):
         d = _cdist(x)
-        inv = np.where(d > eps, 1.0 / d, 0.0)
+        inv = d / (d * d + tau * tau)          # Tikhonov-smoothed reciprocal
         R = delta * inv
         np.fill_diagonal(R, 0.0)
         B = -R
