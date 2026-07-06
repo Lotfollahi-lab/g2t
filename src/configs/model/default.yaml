@@ -698,6 +698,32 @@ loss:
     edm_distance_mse:
         enabled: false
         weight: 1.0
+        # B (robust distance loss): replace the L2 on the Euclidean-distance
+        # residual with a robust kernel — down-weights the grossly-wrong
+        # distances from one-to-many/symmetric structure (a single outlier
+        # provably wrecks least-squares MDS). Default "none" = plain MSE
+        # (byte-identical).
+        #   robust: none | huber | gm (Geman-McClure) | tls (truncated LS)
+        #   robust_c: kernel scale in DISTANCE units (~ the residual scale at
+        #     which to start treating a pair as an outlier). Tune to the data;
+        #     scale-normalising distances first makes this transferable.
+        #   gnc_steps: >0 anneals the scale from 8·robust_c (≈convex) down to
+        #     robust_c over this many steps (graduated non-convexity) — no
+        #     init guess / threshold tuning needed. 0 = fixed scale.
+        robust: "none"
+        robust_c: 1.0
+        gnc_steps: 0
+
+    # C (embeddability regularizer). Penalize triangle-inequality VIOLATIONS
+    # of the predicted distances on sampled triples — a necessary condition
+    # for 2D-Euclidean-embeddability, and exactly the defect that leaves
+    # residual MDS/SMACOF stress (cf. top2_frac; DMCG measured 8.65% such
+    # violations). Cheap + stable (relu on sampled triples; no eigh). Reads
+    # pred.edm_D. Default off (byte-identical).
+    embeddability:
+        enabled: false
+        weight: 1.0
+        n_triples: 4096   # sampled (i,j,k) triples per slice per step
 
     # v2 geometric-decoder training signal. Scale-invariant, Procrustes-
     # aligned MSE on the DECODED 2D coordinates (pred.positions = SMACOF/MDS
@@ -1454,6 +1480,15 @@ edm:
     # Default false = decoder is inference-only (v1).
     decoder_grad: false
     smacof_grad_iters: 5   # last-k Guttman steps that carry gradient (bounds memory)
+    # Backward strategy through the SMACOF decode (decoder_grad=true):
+    #   "unroll" (default): last smacof_grad_iters Guttman steps carry gradient
+    #     (backprop-through-time). Byte-identical to prior behaviour.
+    #   "jfb": Jacobian-Free Backprop — converge the decode under no_grad, then
+    #     ONE grad-carrying step from the detached fixed point. Constant backward
+    #     memory, gradient independent of smacof_iters, and free of the
+    #     unroll-depth divergence the multi-step path can hit. Recommended for
+    #     the end-to-end (decoder_grad) runs.
+    smacof_backward: "unroll"
     # ---- MDS Tikhonov regularization strength ----
     # Per-eigenvalue diagonal perturbation in ``_classical_mds_2d``.
     # The Tikhonov diagonal is ``arange(n) * mds_tikhonov_eps * scale``

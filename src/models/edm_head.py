@@ -271,6 +271,7 @@ class EDMOutputWrapper(nn.Module):
         smacof_iters: int = 30,
         decoder_grad: bool = False,
         smacof_grad_iters: int = 5,
+        smacof_backward: str = "unroll",
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
@@ -300,6 +301,17 @@ class EDMOutputWrapper(nn.Module):
         # (v1), byte-identical training.
         self.decoder_grad = bool(decoder_grad)
         self.smacof_grad_iters = int(smacof_grad_iters)
+        # Backward strategy through the SMACOF decode (see
+        # geometric_decoder.smacof_refine). "unroll" (default) backprops the
+        # last smacof_grad_iters Guttman steps; "jfb" (Jacobian-Free Backprop)
+        # converges detached then takes ONE grad step — constant memory,
+        # iteration-count-independent, and avoids unroll-depth divergence.
+        self.smacof_backward = str(smacof_backward).lower()
+        if self.smacof_backward not in ("unroll", "jfb"):
+            raise ValueError(
+                "model.edm.smacof_backward must be 'unroll' or 'jfb'; got "
+                f"{self.smacof_backward!r}"
+            )
         self.mds_align = bool(mds_align)
         self.anisotropic_gating = bool(anisotropic_gating)
         # Sparse-training fast path. When True, the forward pass does NOT
@@ -773,6 +785,7 @@ class EDMOutputWrapper(nn.Module):
                         n_iter=self.smacof_iters,
                         n_grad_iter=(self.smacof_grad_iters if use_grad else 0),
                         grad_safe=use_grad,
+                        backward=self.smacof_backward,
                     ).to(x_mds.dtype)
             except Exception:
                 aligned_list.append(x_ref[b])

@@ -129,6 +129,43 @@ def _shape_mse(pp, pt):
     return float(((ppa - pt) ** 2).mean())
 
 
+def _one_guttman_step(delta, x, eps=1e-8, tau_rel=1e-3):
+    """A single Guttman step (mirrors the JFB grad step)."""
+    n = x.shape[0]
+    delta = np.clip(delta, 0, None)
+    n_off = n * (n - 1)
+    scale = max(delta.sum() / n_off if n_off > 0 else 1.0, eps)
+    dn = delta / scale
+    xs = x / scale
+    d = _cdist(xs)
+    inv = d / (d * d + tau_rel * tau_rel)
+    R = dn * inv
+    np.fill_diagonal(R, 0.0)
+    B = -R
+    B[np.diag_indices(n)] = R.sum(1)
+    xs = (B @ xs) / n
+    xs -= xs.mean(0, keepdims=True)
+    return xs * scale
+
+
+def test_jfb_one_step_from_fixed_point_is_negligible():
+    """JFB reads out ONE Guttman step from a converged (detached) fixed
+    point. Validate that this single extra step barely moves a converged
+    config (so JFB's forward ≈ the fully-converged SMACOF solution, and its
+    single-step gradient is taken at the fixed point)."""
+    rng = np.random.default_rng(8)
+    X3 = rng.normal(size=(60, 3))              # non-2D -> real refinement
+    delta = _cdist(X3)
+    x_star = smacof(delta, classical_mds_2d(delta), n_iter=400)   # converged
+    x_plus = _one_guttman_step(delta, x_star)
+    rel_move = np.abs(x_plus - x_star).sum() / (np.abs(x_star).sum() + 1e-12)
+    s0, s1 = _stress(delta, x_star), _stress(delta, x_plus)
+    assert rel_move < 1e-2, rel_move
+    assert abs(s1 - s0) <= 1e-3 * s0 + 1e-6, (s0, s1)
+    print(f"    JFB extra step: rel move={rel_move:.2e}, stress {s0:.3f}->{s1:.3f}")
+    _ok("JFB one-step-from-fixed-point is negligible (valid gradient read-out)")
+
+
 def test_reciprocal_backward_is_bounded():
     """The v2 NaN was the Guttman reciprocal's backward. Validate the two
     fixes on the reciprocal's derivative directly (this is the term that
@@ -175,6 +212,7 @@ if __name__ == "__main__":
     print("test_recovers_2d_from_distances"); test_recovers_2d_from_distances()
     print("test_stress_non_increasing"); test_stress_non_increasing()
     print("test_beats_classical_mds_on_non2d"); test_beats_classical_mds_on_non2d()
+    print("test_jfb_one_step_from_fixed_point_is_negligible"); test_jfb_one_step_from_fixed_point_is_negligible()
     print("test_reciprocal_backward_is_bounded"); test_reciprocal_backward_is_bounded()
     print("test_coord_loss_similarity_invariant"); test_coord_loss_similarity_invariant()
     print("\nAll SMACOF geometric-decoder tests passed.")

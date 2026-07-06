@@ -383,6 +383,45 @@ class LossFunction(nn.Module):
         self._edm_weight = float(_cfg_get(cfg, "model", "loss",
                                           "edm_distance_mse", "weight",
                                           default=1.0))
+        # B (robust distance loss): replace the L2 on the Euclidean-distance
+        # residual with a robust kernel (Huber / Geman-McClure / truncated
+        # least-squares), optionally with graduated non-convexity (anneal the
+        # kernel scale from ~convex to the target over gnc_steps). Down-weights
+        # the grossly-wrong distances from one-to-many/symmetric structure —
+        # a single outlier provably wrecks least-squares MDS (Biswas-Ye chose
+        # L1 for exactly this; robust SLAM uses GNC). Default "none" = plain
+        # MSE (byte-identical).
+        self._edm_robust = str(_cfg_get(cfg, "model", "loss",
+                                        "edm_distance_mse", "robust",
+                                        default="none")).lower()
+        if self._edm_robust not in ("none", "huber", "gm", "tls"):
+            raise ValueError(
+                "model.loss.edm_distance_mse.robust must be one of "
+                f"'none','huber','gm','tls'; got {self._edm_robust!r}"
+            )
+        self._edm_robust_c = float(_cfg_get(cfg, "model", "loss",
+                                            "edm_distance_mse", "robust_c",
+                                            default=1.0))
+        self._edm_gnc_steps = int(_cfg_get(cfg, "model", "loss",
+                                           "edm_distance_mse", "gnc_steps",
+                                           default=0))
+        # C (embeddability regularizer): penalize triangle-inequality
+        # VIOLATIONS of the predicted distances on sampled triples — a
+        # necessary condition for 2D-Euclidean-embeddability, and exactly the
+        # defect distance-prediction methods suffer (DMCG measured 8.65%
+        # violations). Cheap, differentiable, STABLE (relu on triples; the
+        # exact PSD/rank projection needs eigh, whose backward is
+        # degenerate-spectrum unstable — so we use this metric-violation
+        # proxy). Reads edm_D. Default off (byte-identical).
+        self._embed_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                            "embeddability", "enabled",
+                                            default=False))
+        self._embed_weight = float(_cfg_get(cfg, "model", "loss",
+                                            "embeddability", "weight",
+                                            default=1.0))
+        self._embed_n_triples = int(_cfg_get(cfg, "model", "loss",
+                                             "embeddability", "n_triples",
+                                             default=4096))
         # v2 geometric-decoder signal: scale-invariant, Procrustes-aligned
         # MSE on the DECODED 2D coordinates (pred.positions = SMACOF/MDS
         # output). Trains the model to emit distances that embed WELL in
@@ -764,6 +803,10 @@ class LossFunction(nn.Module):
             # in a batch (reads pred.node_features). See below.
             ("domain_invariance", self._dinv_enabled, self._dinv_weight,
              self._compute_domain_invariance),
+            # C: embeddability — triangle-inequality-violation penalty on the
+            # predicted distances (reads edm_D). See below.
+            ("embeddability", self._embed_enabled, self._embed_weight,
+             self._compute_embeddability),
             # Spatially-aware EDM variants (all read edm_D): local-emphasis,
             # log-scale, rank surrogate, neighbourhood preservation.
             ("locality_weighted_distance", self._locw_enabled, self._locw_weight,
@@ -2012,11 +2055,51 @@ class LossFunction(nn.Module):
                 diagonal=1,
             )
             losses.append(
-                self.mse(d_pred_v[triu_mask], d_true_v[triu_mask])
+                self._robust_reduce(
+                    d_pred_v[triu_mask] - d_true_v[triu_mask]
+                )
             )
         if not losses:
             return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))
+
+    def _robust_scale(self) -> float:
+        """GNC-annealed robust kernel scale. ``gnc_steps<=0`` -> constant
+        ``robust_c``. Otherwise LINEARLY anneal from ``8·robust_c`` (near-
+        quadratic / convex regime for GM & Huber) down to ``robust_c`` over
+        ``gnc_steps`` training steps — graduated non-convexity: an easy convex
+        landscape early, the true robust (outlier-rejecting) cost late."""
+        c0 = self._edm_robust_c
+        n = self._edm_gnc_steps
+        if n <= 0:
+            return c0
+        p = min(1.0, float(self._step_count) / float(n))
+        return c0 * (8.0 * (1.0 - p) + p)
+
+    def _robust_reduce(self, resid: torch.Tensor) -> torch.Tensor:
+        """Reduce a residual vector to a scalar loss via the configured robust
+        kernel (B). ``resid`` = (d_pred − d_true) on Euclidean distances.
+        ``none`` -> plain MSE (mean r²), byte-identical to ``self.mse``.
+        huber: quadratic for |r|<=c, linear beyond (C¹, bounded slope);
+        gm (Geman-McClure): c²·r²/(r²+c²) -> r² for r«c, saturates to c²;
+        tls (truncated LS): min(r², c²) — hard outlier cutoff. All are
+        differentiable and BOUNDED-influence (unlike L2, where one outlier
+        dominates). c is GNC-annealed (see _robust_scale)."""
+        mode = self._edm_robust
+        r2 = resid * resid
+        if mode == "none":
+            return r2.mean()
+        c = self._robust_scale()
+        c2 = c * c
+        if mode == "huber":
+            absr = resid.abs()
+            lin = 2.0 * c * absr - c2
+            return torch.where(absr <= c, r2, lin).mean()
+        if mode == "gm":
+            return (c2 * r2 / (r2 + c2)).mean()
+        if mode == "tls":
+            return r2.clamp_max(c2).mean()
+        return r2.mean()
 
     # ------------------------------------------------------------------
     # Spatially-aware EDM losses — operate on the SAME predicted vs true
@@ -2134,6 +2217,52 @@ class LossFunction(nn.Module):
         if not terms:
             return _graph_zero(masked_pred)
         return torch.mean(torch.stack(terms))
+
+    def _compute_embeddability(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """C (embeddability regularizer): penalize TRIANGLE-INEQUALITY
+        VIOLATIONS of the predicted pairwise distances on randomly sampled
+        triples (i, j, k):  relu(d_ij − d_ik − d_kj)². The triangle inequality
+        is a NECESSARY condition for the predicted distance matrix to be
+        Euclidean-embeddable in any dimension; its violations are exactly what
+        make classical MDS / SMACOF leave residual stress (the quantity the
+        ``top2_frac`` diagnostic measures) and what DMCG quantified (8.65% of
+        pairs in a distance-prediction baseline). Softly pushing them to zero
+        makes the downstream decode better-conditioned.
+
+        Cheap — O(#triples) per slice, no N×N materialisation — and STABLE:
+        pure relu on sampled distances, so no eigendecomposition. (The exact
+        EDM projection = double-centre → PSD + rank-≤4 truncate needs an n×n
+        eigh whose backward is unstable at degenerate spectra — the same NaN
+        class we fight elsewhere — so this metric-violation proxy is the
+        tractable, safe form.) Reads ``masked_pred.edm_D``; graph-zero if the
+        EDM head isn't wired in.
+        """
+        D_pred = getattr(masked_pred, "edm_D", None)
+        if D_pred is None:
+            return _graph_zero(masked_pred)
+        eps = 1e-8
+        n_tri = max(1, int(self._embed_n_triples))
+        losses = []
+        for b in range(D_pred.shape[0]):
+            mask = masked_true.node_mask[b]
+            valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            n = int(valid_idx.numel())
+            if n < 3:
+                continue
+            D_v = D_pred[b].index_select(0, valid_idx).index_select(1, valid_idx)
+            d = (D_v.clamp_min(0.0) + eps).sqrt()                 # (n,n) Euclidean
+            m = min(n_tri, n * n)
+            ii = torch.randint(0, n, (m,), device=d.device)
+            jj = torch.randint(0, n, (m,), device=d.device)
+            kk = torch.randint(0, n, (m,), device=d.device)
+            # d_ij must be <= d_ik + d_kj; penalize the positive excess.
+            viol = torch.relu(d[ii, jj] - d[ii, kk] - d[kk, jj])
+            losses.append((viol * viol).mean())
+        if not losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(losses))
 
     def _compute_locality_weighted_distance(
         self, masked_pred: DataHolder, masked_true: DataHolder,

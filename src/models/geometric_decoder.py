@@ -101,6 +101,7 @@ def smacof_refine(
     grad_safe: bool = False,
     tau_rel: float = 1e-3,
     detach_weights: bool = True,
+    backward: str = "unroll",
 ) -> torch.Tensor:
     """Single-slice SMACOF (unit weights) stress minimisation.
 
@@ -125,6 +126,17 @@ def smacof_refine(
             (freeze the Guttman reciprocal weights ``delta/d`` at their
             current value — see _guttman_step). Removes the -1/d^2
             reciprocal derivative from the backward entirely. Default True.
+        backward: gradient strategy when grad iterations are active.
+            "unroll" (default) — the last ``n_grad_iter`` Guttman steps carry
+            gradient (backprop-through-time, memory ~ n_grad_iter steps).
+            "jfb" — JACOBIAN-FREE BACKPROP (Fung/Heaton 2022): converge to the
+            fixed point with NO grad tape (ALL n_iter steps detached), then
+            take exactly ONE grad-carrying step from the detached fixed point.
+            The single-step gradient is the JFB approximation of the implicit
+            gradient (inverse-Jacobian ≈ I): constant backward memory,
+            gradient independent of n_iter, and free of the unroll-depth
+            divergence the multi-step path can hit. Requires a near-converged
+            forward (the MDS warm-start + ~30 Guttman iters give this).
 
     Returns (n, 2), at the ORIGINAL distance scale. The true target config
     is a (near-)fixed point (unit test), and stress is non-increasing
@@ -148,8 +160,20 @@ def smacof_refine(
     x = x_init / scale
     tau = float(tau_rel)               # in unit-mean-distance units
     n_grad = max(0, min(int(n_iter), int(n_grad_iter)))
-    n_detach = int(n_iter) - n_grad
 
+    if backward == "jfb" and n_grad > 0:
+        # Jacobian-Free Backprop: fully converge under no_grad, then ONE
+        # grad-carrying step from the detached fixed point (see docstring).
+        with torch.no_grad():
+            for _ in range(int(n_iter)):
+                x = _guttman_step(delta_n, x, eps, grad_safe=False, tau=tau)
+        x = x.detach()
+        x = _guttman_step(delta_n, x, eps, grad_safe=grad_safe, tau=tau,
+                          detach_weights=detach_weights)
+        return x * scale
+
+    # "unroll": last n_grad steps carry gradient (BPTT).
+    n_detach = int(n_iter) - n_grad
     if n_detach > 0:
         with torch.no_grad():
             for _ in range(n_detach):

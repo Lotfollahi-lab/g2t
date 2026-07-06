@@ -777,6 +777,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 # Pair with model.loss.edm_coord_mse + mds_align_train=true.
                 decoder_grad=bool(getattr(edm_cfg, "decoder_grad", False)),
                 smacof_grad_iters=int(getattr(edm_cfg, "smacof_grad_iters", 5)),
+                # Backward through the decode: "unroll" (BPTT, default) or
+                # "jfb" (Jacobian-Free Backprop — constant memory, no unroll).
+                smacof_backward=str(getattr(edm_cfg, "smacof_backward", "unroll")),
             )
 
         if knn_graph_enabled:
