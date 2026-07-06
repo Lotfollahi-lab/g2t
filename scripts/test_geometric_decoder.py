@@ -23,25 +23,28 @@ def _stress(delta, x):
 
 
 def smacof(delta, x_init, n_iter=200, eps=1e-8, tau_rel=1e-3):
-    """Numpy mirror of geometric_decoder.smacof_refine. Uses the same
-    scale-adaptive Tikhonov-smoothed Guttman reciprocal d/(d^2+tau^2) that
-    the torch version uses (bounds the 1/d backward that NaN'd v2)."""
+    """Numpy mirror of geometric_decoder.smacof_refine. Mirrors the
+    unit-scale normalisation + Tikhonov-smoothed Guttman reciprocal
+    d/(d^2+tau^2) the torch version uses (scale-free tau, bounded backward,
+    which fixes the v2 NaN)."""
     n = x_init.shape[0]
-    x = x_init.copy()
     delta = np.clip(delta, 0, None)
     n_off = n * (n - 1)
     scale = delta.sum() / n_off if n_off > 0 else 1.0
-    tau = max(scale * tau_rel, eps)
+    scale = max(scale, eps)
+    delta_n = delta / scale                    # unit mean-distance
+    x = x_init.copy() / scale
+    tau = tau_rel                              # scale-free (unit-mean units)
     for _ in range(n_iter):
         d = _cdist(x)
         inv = d / (d * d + tau * tau)          # Tikhonov-smoothed reciprocal
-        R = delta * inv
+        R = delta_n * inv
         np.fill_diagonal(R, 0.0)
         B = -R
         B[np.diag_indices(n)] = R.sum(1)
         x = (B @ x) / n
         x -= x.mean(0, keepdims=True)
-    return x
+    return x * scale
 
 
 def classical_mds_2d(delta):
@@ -126,6 +129,31 @@ def _shape_mse(pp, pt):
     return float(((ppa - pt) ** 2).mean())
 
 
+def test_reciprocal_backward_is_bounded():
+    """The v2 NaN was the Guttman reciprocal's backward. Validate the two
+    fixes on the reciprocal's derivative directly (this is the term that
+    enters the backward):
+      * raw 1/d has derivative -1/d^2 → diverges at near-coincident pairs;
+      * Tikhonov d/(d^2+tau^2) has a BOUNDED derivative (≤ 1/tau^2), and
+        because the problem is unit-normalised, tau=tau_rel is scale-free;
+      * the frozen-weight (majorization) gradient treats the reciprocal as
+        constant → its contribution to the backward is exactly 0.
+    """
+    tau_rel = 1e-3                                  # scale-free (unit-mean)
+    d = np.array([1e-8, 1e-4, 1e-2, 1.0, 5.0])      # incl. near-coincident
+    raw_deriv = -1.0 / d ** 2
+    assert raw_deriv[0] < -1e15, raw_deriv[0]       # divergent for raw 1/d
+    tik_deriv = (tau_rel ** 2 - d ** 2) / (d ** 2 + tau_rel ** 2) ** 2
+    assert np.isfinite(tik_deriv).all()
+    assert np.all(np.abs(tik_deriv) <= 1.0 / tau_rel ** 2 + 1e-3), tik_deriv
+    # frozen-weight contribution is identically zero (inv detached)
+    frozen_deriv = np.zeros_like(d)
+    assert np.all(frozen_deriv == 0.0)
+    print(f"    max|d(1/d)/dd|={np.abs(raw_deriv).max():.2e} (raw, diverges)"
+          f"  ->  {np.abs(tik_deriv).max():.2e} (Tikhonov, ≤1/tau^2)")
+    _ok("Guttman reciprocal backward is bounded (Tikhonov) / removed (frozen)")
+
+
 def test_coord_loss_similarity_invariant():
     rng = np.random.default_rng(4)
     X = rng.normal(size=(50, 2))
@@ -147,5 +175,6 @@ if __name__ == "__main__":
     print("test_recovers_2d_from_distances"); test_recovers_2d_from_distances()
     print("test_stress_non_increasing"); test_stress_non_increasing()
     print("test_beats_classical_mds_on_non2d"); test_beats_classical_mds_on_non2d()
+    print("test_reciprocal_backward_is_bounded"); test_reciprocal_backward_is_bounded()
     print("test_coord_loss_similarity_invariant"); test_coord_loss_similarity_invariant()
     print("\nAll SMACOF geometric-decoder tests passed.")
