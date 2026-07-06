@@ -267,10 +267,39 @@ class EDMOutputWrapper(nn.Module):
         mds_solver: str = "eigh",
         skip_edm_D_train: bool = False,
         fp32_geometry: bool = True,
+        decoder: str = "mds",
+        smacof_iters: int = 30,
+        decoder_grad: bool = False,
+        smacof_grad_iters: int = 5,
     ) -> None:
         super().__init__()
         self.inner_model = inner_model
         self.embed_dim = int(embed_dim)
+        # Geometric decoder for the D_sq -> 2D read-out:
+        #   "mds"    (default): classical MDS only (byte-identical to prior).
+        #   "smacof": classical MDS as a warm-start init, then ``smacof_iters``
+        #             differentiable Guttman iterations that directly minimise
+        #             the raw stress. Beats the top-2 spectral truncation
+        #             whenever the predicted distances aren't cleanly
+        #             2D-embeddable (see SCGG_LOG_MDS_VAR top2_frac), and its
+        #             backward is eigh-free (safe for end-to-end geometry).
+        self.decoder = str(decoder).lower()
+        if self.decoder not in ("mds", "smacof"):
+            raise ValueError(
+                f"model.edm.decoder must be 'mds' or 'smacof'; got {self.decoder!r}"
+            )
+        self.smacof_iters = int(smacof_iters)
+        # v2 — end-to-end training THROUGH the decoder. When True (and
+        # decoder='smacof' and mds_align_train=True), the decode runs at
+        # train WITH gradient: the classical-MDS init is DETACHED (no eigh/
+        # lobpcg backward), and the last ``smacof_grad_iters`` Guttman steps
+        # carry gradient through the predicted distances. A coordinate-space
+        # loss (model.loss.edm_coord_mse) then trains the model to emit
+        # distances that embed WELL in flat 2D — the signal neither LUNA nor
+        # the fixed-MDS scgg has. Default False = decoder is inference-only
+        # (v1), byte-identical training.
+        self.decoder_grad = bool(decoder_grad)
+        self.smacof_grad_iters = int(smacof_grad_iters)
         self.mds_align = bool(mds_align)
         self.anisotropic_gating = bool(anisotropic_gating)
         # Sparse-training fast path. When True, the forward pass does NOT
@@ -548,8 +577,17 @@ class EDMOutputWrapper(nn.Module):
         # inference (eval mode) MDS always runs so pred.positions
         # is the canonical layout for downstream metrics + plots.
         skip_mds_for_training = self.training and not self.mds_align_train
+        # v2 SMACOF-grad path: run the decode WITH gradient at train (the
+        # classical-MDS init is detached inside _mds_align_positions, so no
+        # eigh/lobpcg backward is exercised — only the eigh-free SMACOF
+        # Guttman steps carry gradient). Distinct from mds_align_gradient,
+        # which would backprop through eigh.
+        smacof_grad = (
+            self.training and self.decoder == "smacof" and self.decoder_grad
+        )
+        want_grad = self.mds_align_gradient or smacof_grad
         if self.mds_align and not skip_mds_for_training:
-            if self.mds_align_gradient:
+            if want_grad:
                 # GRADIENT-CARRYING MDS path. The MDS-aligned positions
                 # have a live autograd connection back to ``D_sq``, so
                 # any loss computed on ``pred.positions`` (sinkhorn,
@@ -687,10 +725,15 @@ class EDMOutputWrapper(nn.Module):
             # fail-loud guards prevent fp32 + mds_align_gradient=True
             # (which would NaN). See the __init__ comment for the
             # full mathematics.
+            # For decoder='smacof' the classical-MDS step is only a
+            # warm-start, so feed it DETACHED distances: no eigh/lobpcg
+            # backward is ever exercised (the trainable geometry signal
+            # flows through SMACOF's use of the grad-carrying D_v below).
+            D_v_init = D_v.detach() if self.decoder == "smacof" else D_v
             if self.mds_dtype == "fp64":
-                D_v_proc = D_v.to(torch.float64)
+                D_v_proc = D_v_init.to(torch.float64)
             else:  # fp32
-                D_v_proc = D_v if D_v.dtype == torch.float32 else D_v.to(torch.float32)
+                D_v_proc = D_v_init if D_v_init.dtype == torch.float32 else D_v_init.to(torch.float32)
             # Solver: eigh (default, full N×N decomposition) or
             # lobpcg (top-2 only, much faster at large N).
             mds_fn = (
@@ -703,6 +746,22 @@ class EDMOutputWrapper(nn.Module):
                 )
                 # Cast back to the surrounding graph's dtype.
                 x_mds = x_mds_proc.to(D_v.dtype)
+                # SMACOF refinement of the MDS warm-start: Guttman steps
+                # that directly minimise raw stress toward the predicted
+                # distances (delta = sqrt(D_v)). eigh-free. At train with
+                # decoder_grad the last ``smacof_grad_iters`` steps carry
+                # gradient (grad-safe distances) through D_v -> the model;
+                # otherwise fully detached (inference / v1). No-op for 'mds'.
+                if self.decoder == "smacof" and self.smacof_iters > 0:
+                    from models.geometric_decoder import smacof_refine
+                    use_grad = bool(self.training and self.decoder_grad)
+                    delta = D_v.clamp_min(0.0).sqrt().to(x_mds.dtype)
+                    x_mds = smacof_refine(
+                        delta, x_mds,
+                        n_iter=self.smacof_iters,
+                        n_grad_iter=(self.smacof_grad_iters if use_grad else 0),
+                        grad_safe=use_grad,
+                    )
             except Exception:
                 aligned_list.append(x_ref[b])
                 continue

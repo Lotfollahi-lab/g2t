@@ -750,6 +750,16 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 fp32_geometry=bool(
                     getattr(edm_cfg, "fp32_geometry", True)
                 ),
+                # Geometric decoder: 'mds' (classical, default) or 'smacof'
+                # (MDS warm-start + differentiable stress-minimising Guttman
+                # refinement). Default preserves the classical read-out.
+                decoder=str(getattr(edm_cfg, "decoder", "mds")),
+                smacof_iters=int(getattr(edm_cfg, "smacof_iters", 30)),
+                # v2: train end-to-end through the SMACOF decoder (detached
+                # MDS init + grad through the last smacof_grad_iters steps).
+                # Pair with model.loss.edm_coord_mse + mds_align_train=true.
+                decoder_grad=bool(getattr(edm_cfg, "decoder_grad", False)),
+                smacof_grad_iters=int(getattr(edm_cfg, "smacof_grad_iters", 5)),
             )
 
         if knn_graph_enabled:

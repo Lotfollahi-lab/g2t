@@ -383,6 +383,20 @@ class LossFunction(nn.Module):
         self._edm_weight = float(_cfg_get(cfg, "model", "loss",
                                           "edm_distance_mse", "weight",
                                           default=1.0))
+        # v2 geometric-decoder signal: scale-invariant, Procrustes-aligned
+        # MSE on the DECODED 2D coordinates (pred.positions = SMACOF/MDS
+        # output). Trains the model to emit distances that embed WELL in
+        # flat 2D (targets the aligned-RSSD metric), not just locally-
+        # accurate distances. Needs a grad-carrying decode
+        # (model.edm.decoder=smacof + decoder_grad + mds_align_train);
+        # otherwise pred.positions has no gradient and this is a no-op.
+        # Default off (byte-identical).
+        self._coord_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                            "edm_coord_mse", "enabled",
+                                            default=False))
+        self._coord_weight = float(_cfg_get(cfg, "model", "loss",
+                                            "edm_coord_mse", "weight",
+                                            default=1.0))
 
         # --- Spatially-aware EDM loss variants (operate on edm_D) ---
         # 1. Locality-weighted distance MSE (Sammon-stress local emphasis).
@@ -720,6 +734,11 @@ class LossFunction(nn.Module):
             # predicted pairwise-squared-distance matrix.
             ("edm_distance_mse", self._edm_enabled, self._edm_weight,
              self._compute_edm_distance_mse),
+            # v2: scale-invariant Procrustes coord MSE on the DECODED
+            # positions (trains the geometry end-to-end through the SMACOF
+            # decoder). Reads pred.positions.
+            ("edm_coord_mse", self._coord_enabled, self._coord_weight,
+             self._compute_edm_coord_mse),
             # Spatially-aware EDM variants (all read edm_D): local-emphasis,
             # log-scale, rank surrogate, neighbourhood preservation.
             ("locality_weighted_distance", self._locw_enabled, self._locw_weight,
@@ -2004,6 +2023,48 @@ class LossFunction(nn.Module):
         D_pred_v = D_pred[b].index_select(0, valid_idx).index_select(1, valid_idx)
         d_pred_v = (D_pred_v + eps).sqrt()                            # (n,n)
         return d_pred_v, d_true_v, valid_idx, n
+
+    def _compute_edm_coord_mse(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """v2 geometric-decoder loss: scale-invariant, Procrustes-aligned
+        MSE between the DECODED 2D coordinates (``masked_pred.positions`` —
+        the SMACOF/MDS read-out) and the true positions.
+
+        Per slice: centre + RMS-normalise both clouds (so the loss is
+        rotation + reflection + translation + SCALE invariant — pure shape,
+        matching the aligned-RSSD metric), orthogonally Procrustes-align the
+        prediction to truth (R detached), then MSE. Gradient flows through
+        ``pred.positions`` (the SMACOF decode) → the predicted distances →
+        the model, teaching it to emit distances that embed WELL in flat 2D.
+
+        No-op (gradient-free) unless the EDM decode ran WITH gradient
+        (decoder='smacof' + decoder_grad + mds_align_train); otherwise
+        ``pred.positions`` is detached and this contributes zero gradient.
+        """
+        pos_pred = getattr(masked_pred, "positions", None)
+        if pos_pred is None:
+            return _graph_zero(masked_pred)
+        eps = 1e-8
+        losses = []
+        for b in range(pos_pred.shape[0]):
+            mask = masked_true.node_mask[b]
+            valid = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            n = int(valid.numel())
+            if n < 3:
+                continue
+            pp = pos_pred[b].index_select(0, valid)                   # (n, 2)
+            pt = masked_true.positions[b].index_select(0, valid)      # (n, 2)
+            pp = pp - pp.mean(dim=0, keepdim=True)
+            pt = pt - pt.mean(dim=0, keepdim=True)
+            # RMS radius normalisation -> unit scale (scale-invariant shape).
+            pp = pp / (pp.pow(2).sum(-1).mean().clamp_min(eps).sqrt())
+            pt = pt / (pt.pow(2).sum(-1).mean().clamp_min(eps).sqrt())
+            pp_aligned = _procrustes_align_2d(pp, pt)                 # R detached
+            losses.append(self.mse(pp_aligned, pt))
+        if not losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(losses))
 
     def _compute_locality_weighted_distance(
         self, masked_pred: DataHolder, masked_true: DataHolder,

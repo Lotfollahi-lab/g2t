@@ -685,6 +685,18 @@ loss:
         enabled: false
         weight: 1.0
 
+    # v2 geometric-decoder training signal. Scale-invariant, Procrustes-
+    # aligned MSE on the DECODED 2D coordinates (pred.positions = SMACOF/MDS
+    # read-out) vs true positions — trains the model to emit distances that
+    # embed WELL in flat 2D (targets the aligned-RSSD metric), the signal
+    # neither LUNA nor fixed-MDS scgg has. Requires a grad-carrying decode:
+    # model.edm.decoder=smacof + model.edm.decoder_grad=true +
+    # model.edm.mds_align_train=true (else pred.positions has no gradient
+    # and this is a no-op). Default off (byte-identical).
+    edm_coord_mse:
+        enabled: false
+        weight: 1.0
+
     # ----------------------------------------------------------------
     # Spatially-aware EDM loss variants. All read pred.edm_D (the EDM
     # head's predicted pairwise distances) and the true positions, like
@@ -1386,6 +1398,29 @@ edm:
     # so existing runs are unaffected. Set false to let the head follow
     # the ambient precision (i.e. full bf16) — only for A/B diagnosis.
     fp32_geometry: true
+    # ---- Geometric decoder (D_sq -> 2D read-out) ----
+    # "mds"    (default): classical MDS only — top-2 eigenvectors of the
+    #          double-centred distance matrix (byte-identical to prior runs).
+    # "smacof": use classical MDS as a warm-start, then run ``smacof_iters``
+    #          differentiable Guttman iterations that directly minimise the
+    #          raw MDS stress. Beats the spectral top-2 truncation whenever
+    #          the predicted distances aren't cleanly 2D-embeddable (see the
+    #          SCGG_LOG_MDS_VAR top2_frac diagnostic); eigh-free backward, so
+    #          it's safe to differentiate through for end-to-end geometry.
+    #          Can be A/B'd on an existing checkpoint at INFERENCE (with the
+    #          fastmds/detached path it only changes the read-out), or trained
+    #          with mds_align_gradient=true for an end-to-end coord signal.
+    decoder: "mds"
+    smacof_iters: 30       # Guttman iterations when decoder='smacof'
+    # v2 — train END-TO-END through the SMACOF decoder. When true (with
+    # decoder='smacof' AND mds_align_train=true), the decode runs at train
+    # with gradient: classical-MDS init is detached (no eigh backward), and
+    # the last ``smacof_grad_iters`` Guttman steps carry gradient through the
+    # predicted distances. Pair with model.loss.edm_coord_mse to give the
+    # model a coordinate-space signal (learn 2D-embeddable distances).
+    # Default false = decoder is inference-only (v1).
+    decoder_grad: false
+    smacof_grad_iters: 5   # last-k Guttman steps that carry gradient (bounds memory)
     # ---- MDS Tikhonov regularization strength ----
     # Per-eigenvalue diagonal perturbation in ``_classical_mds_2d``.
     # The Tikhonov diagonal is ``arange(n) * mds_tikhonov_eps * scale``
