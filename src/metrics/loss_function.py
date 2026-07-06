@@ -398,6 +398,27 @@ class LossFunction(nn.Module):
                                             "edm_coord_mse", "weight",
                                             default=1.0))
 
+        # #3 (generalization lever): domain-invariance regulariser. Aligns
+        # the per-slice covariance of the backbone's per-cell representation
+        # ACROSS the slices in a batch (Deep CORAL / multi-kernel MMD over
+        # training "domains"), so the learned features encode biology rather
+        # than slice-specific nuisance -> better transfer to UNSEEN slices at
+        # inference. Reads pred.node_features. Default off (byte-identical).
+        self._dinv_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                           "domain_invariance", "enabled",
+                                           default=False))
+        self._dinv_weight = float(_cfg_get(cfg, "model", "loss",
+                                           "domain_invariance", "weight",
+                                           default=1.0))
+        self._dinv_mode = str(_cfg_get(cfg, "model", "loss",
+                                       "domain_invariance", "mode",
+                                       default="coral")).lower()
+        if self._dinv_mode not in ("coral", "mmd"):
+            raise ValueError(
+                "model.loss.domain_invariance.mode must be 'coral' or "
+                f"'mmd'; got {self._dinv_mode!r}"
+            )
+
         # --- Spatially-aware EDM loss variants (operate on edm_D) ---
         # 1. Locality-weighted distance MSE (Sammon-stress local emphasis).
         self._locw_enabled = bool(_cfg_get(cfg, "model", "loss",
@@ -739,6 +760,10 @@ class LossFunction(nn.Module):
             # decoder). Reads pred.positions.
             ("edm_coord_mse", self._coord_enabled, self._coord_weight,
              self._compute_edm_coord_mse),
+            # #3 generalization: CORAL/MMD domain-invariance over the slices
+            # in a batch (reads pred.node_features). See below.
+            ("domain_invariance", self._dinv_enabled, self._dinv_weight,
+             self._compute_domain_invariance),
             # Spatially-aware EDM variants (all read edm_D): local-emphasis,
             # log-scale, rank surrogate, neighbourhood preservation.
             ("locality_weighted_distance", self._locw_enabled, self._locw_weight,
@@ -2065,6 +2090,50 @@ class LossFunction(nn.Module):
         if not losses:
             return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))
+
+    def _compute_domain_invariance(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """#3 (generalization): align the per-slice feature distributions
+        ACROSS the slices in a batch via Deep CORAL (or multi-kernel MMD),
+        on the backbone's learned per-cell representation
+        (``masked_pred.node_features``). Each slice in the batch is a
+        training "domain"; pushing their feature covariances together
+        encourages a slice-invariant representation that encodes biology
+        rather than slice-specific nuisance -> better transfer to UNSEEN
+        slices at inference (a domain-generalization objective, since the
+        test tissue is never in the batch). Pairwise over slices (batch is
+        small); needs >= 2 slices with >= 2 valid cells each, else a
+        graph-attached zero.
+
+        Caveat (the known CORAL/DANN failure mode): global alignment can
+        erase genuine cross-slice biology (region-specific composition). Use
+        a MODEST weight and watch the geometry losses don't regress; the
+        class-conditional variant (models.domain_adaptation.
+        class_conditional_coral) is the principled escalation if it
+        over-aligns.
+        """
+        feats = getattr(masked_pred, "node_features", None)
+        if feats is None or feats.dim() != 3 or feats.shape[0] < 2:
+            return _graph_zero(masked_pred)
+        from models.domain_adaptation import coral_loss, mmd_loss
+        align_fn = coral_loss if self._dinv_mode == "coral" else mmd_loss
+        # Per-slice masked feature sets.
+        sets: List[torch.Tensor] = []
+        for b in range(feats.shape[0]):
+            m = masked_true.node_mask[b].bool()
+            zb = feats[b].index_select(0, torch.nonzero(m, as_tuple=False).squeeze(-1))
+            if zb.shape[0] >= 2:
+                sets.append(zb)
+        if len(sets) < 2:
+            return _graph_zero(masked_pred)
+        terms = []
+        for i in range(len(sets)):
+            for j in range(i + 1, len(sets)):
+                terms.append(align_fn(sets[i], sets[j]))
+        if not terms:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(terms))
 
     def _compute_locality_weighted_distance(
         self, masked_pred: DataHolder, masked_true: DataHolder,

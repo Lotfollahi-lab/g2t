@@ -761,7 +761,13 @@ class EDMOutputWrapper(nn.Module):
                     # bf16's ~3-digit mantissa, destabilising the Guttman
                     # reciprocal. Casts preserve the graph (D_v may carry
                     # gradient); the result is cast back to the graph dtype.
-                    delta = D_v.clamp_min(0.0).sqrt().to(torch.float32)
+                    # Euclidean target distances for SMACOF. Floor the sqrt
+                    # argument with +eps (mirrors loss_function's
+                    # ``(D_pred+eps).sqrt()`` at lines ~1983/2024): a bare
+                    # ``clamp_min(0).sqrt()`` has backward 0.5/sqrt(D) → ∞ as
+                    # D→0⁺, which the coord loss amplifies through the SMACOF
+                    # unroll (the real v2 NaN). +eps bounds it at 0.5/sqrt(eps).
+                    delta = (D_v.clamp_min(0.0) + 1e-8).sqrt().to(torch.float32)
                     x_mds = smacof_refine(
                         delta, x_mds.to(torch.float32),
                         n_iter=self.smacof_iters,

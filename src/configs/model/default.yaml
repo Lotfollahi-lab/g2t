@@ -707,6 +707,18 @@ loss:
     # model.edm.decoder=smacof + model.edm.decoder_grad=true +
     # model.edm.mds_align_train=true (else pred.positions has no gradient
     # and this is a no-op). Default off (byte-identical).
+    # #3 generalization lever. Deep CORAL / multi-kernel MMD aligning the
+    # per-slice covariance of the backbone's per-cell representation ACROSS
+    # the slices in a batch (each slice = a training domain). Pushes the
+    # learned features to be slice-invariant so they transfer to UNSEEN
+    # slices at inference — a domain-generalization objective (the test
+    # tissue is never in the batch). Reads pred.node_features. Use a modest
+    # weight; global alignment can over-erase cross-slice biology.
+    domain_invariance:
+        enabled: false
+        weight: 1.0
+        mode: "coral"   # one of: coral | mmd
+
     edm_coord_mse:
         enabled: false
         weight: 1.0

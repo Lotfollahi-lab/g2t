@@ -85,6 +85,38 @@ def test_mmd_zero_when_matched() -> None:
     _ok("MMD ~0 for matched, large for shifted (mean-sensitive, unlike CORAL)")
 
 
+def _domain_invariance(slices, mode="coral"):
+    """Mirror of LossFunction._compute_domain_invariance: mean pairwise
+    CORAL/MMD over the per-slice feature sets in a batch."""
+    sets = [s for s in slices if s.shape[0] >= 2]
+    if len(sets) < 2:
+        return 0.0
+    fn = coral if mode == "coral" else mmd
+    terms = [fn(sets[i], sets[j])
+             for i in range(len(sets)) for j in range(i + 1, len(sets))]
+    return float(np.mean(terms)) if terms else 0.0
+
+
+def test_domain_invariance_across_slices() -> None:
+    rng = np.random.default_rng(7)
+    D = 8
+    # 4 slices from the SAME distribution -> mean pairwise CORAL ~0.
+    same = [rng.normal(0, 1, size=(2000, D)) for _ in range(4)]
+    inv_same = _domain_invariance(same, "coral")
+    # 4 slices each with a DIFFERENT per-dim covariance scale -> large.
+    scales = [np.array([1.0] * D), np.array([5.0] + [1.0] * (D - 1)),
+              np.array([1.0, 6.0] + [1.0] * (D - 2)), np.array([3.0] * D)]
+    diff = [rng.normal(0, 1, size=(2000, D)) * s for s in scales]
+    inv_diff = _domain_invariance(diff, "coral")
+    assert inv_same < 0.05, inv_same
+    assert inv_diff > 10 * inv_same + 0.1, (inv_same, inv_diff)
+    # < 2 usable slices -> exactly 0 (graph-zero path).
+    assert _domain_invariance([same[0]], "coral") == 0.0
+    assert _domain_invariance([same[0], same[1][:1]], "coral") == 0.0
+    _ok("domain-invariance: mean pairwise CORAL ~0 for matched slices, "
+        "large for slice-shifted covariances, 0 when <2 usable slices")
+
+
 def test_grl_lambda_schedule() -> None:
     assert grl_lambda(0, 300) == 0.0
     assert grl_lambda(-5, 300) == 0.0
@@ -104,5 +136,6 @@ if __name__ == "__main__":
     print("test_coral_zero_when_matched"); test_coral_zero_when_matched()
     print("test_coral_is_mean_invariant"); test_coral_is_mean_invariant()
     print("test_mmd_zero_when_matched"); test_mmd_zero_when_matched()
+    print("test_domain_invariance_across_slices"); test_domain_invariance_across_slices()
     print("test_grl_lambda_schedule"); test_grl_lambda_schedule()
     print("\nAll domain-adaptation math tests passed.")
