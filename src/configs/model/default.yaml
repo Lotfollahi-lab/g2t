@@ -820,6 +820,14 @@ loss:
     sparse_local_distance:
         enabled: false
         weight: 1.0
+        # B (robust loss) on the LOCAL-pair residuals — same kernels as
+        # edm_distance_mse.robust, but on this O(N·k) path so the robust
+        # ablation runs on the efficient (skip_edm_D_train) base. "none" =
+        # plain L2 (byte-identical). See edm_distance_mse.robust for the
+        # kernel/GNC semantics; robust_c is in DISTANCE units.
+        robust: "none"        # none | huber | gm | tls
+        robust_c: 1.0
+        gnc_steps: 0
         local_k: 32           # true-kNN neighbours supervised per cell
         n_random: 8           # random far pairs per cell (0 = pure local)
         global_weight: 0.1    # weight of the random-pair (global) term

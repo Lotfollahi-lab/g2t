@@ -589,6 +589,25 @@ class LossFunction(nn.Module):
         self._sld_n_sample = int(_cfg_get(cfg, "model", "loss",
                                           "sparse_local_distance",
                                           "n_sample", default=0))
+        # B (robust loss) on the O(N·k) sparse-local path — same kernels as
+        # edm_distance_mse.robust, applied to the LOCAL-pair residuals (where
+        # one-to-many / symmetric mismatches bite). Lets the robust ablation
+        # run on the efficient (skip_edm_D_train) base. Default "none" =
+        # byte-identical plain MSE.
+        self._sld_robust = str(_cfg_get(cfg, "model", "loss",
+                                        "sparse_local_distance", "robust",
+                                        default="none")).lower()
+        if self._sld_robust not in ("none", "huber", "gm", "tls"):
+            raise ValueError(
+                "model.loss.sparse_local_distance.robust must be one of "
+                f"'none','huber','gm','tls'; got {self._sld_robust!r}"
+            )
+        self._sld_robust_c = float(_cfg_get(cfg, "model", "loss",
+                                            "sparse_local_distance",
+                                            "robust_c", default=1.0))
+        self._sld_gnc_steps = int(_cfg_get(cfg, "model", "loss",
+                                           "sparse_local_distance",
+                                           "gnc_steps", default=0))
         # Structured global anchor (landmarks). Same idea as
         # geomattn_localglobal's M landmarks, but selected as
         # spatially-SPREAD cells via farthest-point sampling (FPS) rather
@@ -2063,43 +2082,51 @@ class LossFunction(nn.Module):
             return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))
 
-    def _robust_scale(self) -> float:
+    def _robust_scale(self, c0: float, gnc_steps: int) -> float:
         """GNC-annealed robust kernel scale. ``gnc_steps<=0`` -> constant
-        ``robust_c``. Otherwise LINEARLY anneal from ``8·robust_c`` (near-
-        quadratic / convex regime for GM & Huber) down to ``robust_c`` over
-        ``gnc_steps`` training steps — graduated non-convexity: an easy convex
-        landscape early, the true robust (outlier-rejecting) cost late."""
-        c0 = self._edm_robust_c
-        n = self._edm_gnc_steps
-        if n <= 0:
+        ``c0``. Otherwise LINEARLY anneal from ``8·c0`` (near-quadratic /
+        convex regime for GM & Huber) down to ``c0`` over ``gnc_steps``
+        training steps — graduated non-convexity: an easy convex landscape
+        early, the true robust (outlier-rejecting) cost late. Shared by the
+        ``edm_distance_mse`` and ``sparse_local_distance`` robust paths."""
+        if gnc_steps <= 0:
             return c0
-        p = min(1.0, float(self._step_count) / float(n))
+        p = min(1.0, float(self._step_count) / float(gnc_steps))
         return c0 * (8.0 * (1.0 - p) + p)
 
-    def _robust_reduce(self, resid: torch.Tensor) -> torch.Tensor:
-        """Reduce a residual vector to a scalar loss via the configured robust
-        kernel (B). ``resid`` = (d_pred − d_true) on Euclidean distances.
-        ``none`` -> plain MSE (mean r²), byte-identical to ``self.mse``.
-        huber: quadratic for |r|<=c, linear beyond (C¹, bounded slope);
-        gm (Geman-McClure): c²·r²/(r²+c²) -> r² for r«c, saturates to c²;
-        tls (truncated LS): min(r², c²) — hard outlier cutoff. All are
-        differentiable and BOUNDED-influence (unlike L2, where one outlier
-        dominates). c is GNC-annealed (see _robust_scale)."""
-        mode = self._edm_robust
-        r2 = resid * resid
+    @staticmethod
+    def _robust_apply_sq(sq_err: torch.Tensor, resid_abs: torch.Tensor,
+                         mode: str, c: float) -> torch.Tensor:
+        """PER-ELEMENT robust cost from a squared residual ``sq_err`` (= r²)
+        and ``|r|``. ``none`` returns sq_err unchanged (plain L2). huber:
+        quadratic for |r|<=c, linear beyond (C¹, bounded slope); gm
+        (Geman-McClure): c²·r²/(r²+c²) → r² for r«c, saturates to c²; tls
+        (truncated LS): min(r², c²). All bounded-influence (one outlier can't
+        dominate). Returns per-element so callers can apply their own
+        weighting/reduction (edm: plain mean; sparse-local: weighted mean)."""
         if mode == "none":
-            return r2.mean()
-        c = self._robust_scale()
+            return sq_err
         c2 = c * c
         if mode == "huber":
-            absr = resid.abs()
-            lin = 2.0 * c * absr - c2
-            return torch.where(absr <= c, r2, lin).mean()
+            return torch.where(resid_abs <= c, sq_err, 2.0 * c * resid_abs - c2)
         if mode == "gm":
-            return (c2 * r2 / (r2 + c2)).mean()
+            return c2 * sq_err / (sq_err + c2)
         if mode == "tls":
-            return r2.clamp_max(c2).mean()
-        return r2.mean()
+            return sq_err.clamp_max(c2)
+        return sq_err
+
+    def _robust_reduce(self, resid: torch.Tensor) -> torch.Tensor:
+        """Scalar robust loss on the ``edm_distance_mse`` residual (B).
+        ``resid`` = (d_pred − d_true) on Euclidean distances. ``none`` ->
+        plain MSE (mean r²), byte-identical to ``self.mse``. c is
+        GNC-annealed (see _robust_scale / _robust_apply_sq)."""
+        r2 = resid * resid
+        if self._edm_robust == "none":
+            return r2.mean()
+        c = self._robust_scale(self._edm_robust_c, self._edm_gnc_steps)
+        return self._robust_apply_sq(
+            r2, resid.abs(), self._edm_robust, c,
+        ).mean()
 
     # ------------------------------------------------------------------
     # Spatially-aware EDM losses — operate on the SAME predicted vs true
@@ -2231,34 +2258,48 @@ class LossFunction(nn.Module):
         pairs in a distance-prediction baseline). Softly pushing them to zero
         makes the downstream decode better-conditioned.
 
-        Cheap — O(#triples) per slice, no N×N materialisation — and STABLE:
-        pure relu on sampled distances, so no eigendecomposition. (The exact
-        EDM projection = double-centre → PSD + rank-≤4 truncate needs an n×n
-        eigh whose backward is unstable at degenerate spectra — the same NaN
-        class we fight elsewhere — so this metric-violation proxy is the
-        tractable, safe form.) Reads ``masked_pred.edm_D``; graph-zero if the
-        EDM head isn't wired in.
+        Cheap and O(N·k)-COMPATIBLE: it computes the triple distances from the
+        per-cell embedding ``masked_pred.edm_h`` (the same h whose pairwise
+        squared distances ARE edm_D) on ``n_triples`` SAMPLED triples — so it
+        never materialises an N×N matrix and works under
+        ``skip_edm_D_train=true`` (where edm_D is None). Falls back to edm_D
+        only if edm_h is unavailable. STABLE: pure relu on sampled distances,
+        no eigendecomposition. (The exact EDM projection = double-centre →
+        PSD + rank-≤4 truncate needs an n×n eigh whose backward is unstable at
+        degenerate spectra — so this metric-violation proxy is the tractable,
+        safe, AND scalable form.) Graph-zero if neither edm_h nor edm_D is set.
         """
+        h = getattr(masked_pred, "edm_h", None)
         D_pred = getattr(masked_pred, "edm_D", None)
-        if D_pred is None:
+        if h is None and D_pred is None:
             return _graph_zero(masked_pred)
         eps = 1e-8
         n_tri = max(1, int(self._embed_n_triples))
         losses = []
-        for b in range(D_pred.shape[0]):
+        B = h.shape[0] if h is not None else D_pred.shape[0]
+        for b in range(B):
             mask = masked_true.node_mask[b]
             valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
             n = int(valid_idx.numel())
             if n < 3:
                 continue
-            D_v = D_pred[b].index_select(0, valid_idx).index_select(1, valid_idx)
-            d = (D_v.clamp_min(0.0) + eps).sqrt()                 # (n,n) Euclidean
             m = min(n_tri, n * n)
-            ii = torch.randint(0, n, (m,), device=d.device)
-            jj = torch.randint(0, n, (m,), device=d.device)
-            kk = torch.randint(0, n, (m,), device=d.device)
+            ii = torch.randint(0, n, (m,), device=mask.device)
+            jj = torch.randint(0, n, (m,), device=mask.device)
+            kk = torch.randint(0, n, (m,), device=mask.device)
+            if h is not None:
+                # O(#triples·k): distances straight from the embedding, no N×N.
+                h_v = h[b].index_select(0, valid_idx)             # (n, kd)
+                hi, hj, hk = h_v[ii], h_v[jj], h_v[kk]
+                d_ij = (hi - hj).pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
+                d_ik = (hi - hk).pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
+                d_kj = (hk - hj).pow(2).sum(-1).clamp_min(0.0).add(eps).sqrt()
+            else:
+                D_v = D_pred[b].index_select(0, valid_idx).index_select(1, valid_idx)
+                d = (D_v.clamp_min(0.0) + eps).sqrt()
+                d_ij, d_ik, d_kj = d[ii, jj], d[ii, kk], d[kk, jj]
             # d_ij must be <= d_ik + d_kj; penalize the positive excess.
-            viol = torch.relu(d[ii, jj] - d[ii, kk] - d[kk, jj])
+            viol = torch.relu(d_ij - d_ik - d_kj)
             losses.append((viol * viol).mean())
         if not losses:
             return _graph_zero(masked_pred)
@@ -2529,7 +2570,16 @@ class LossFunction(nn.Module):
             h_nbr = h_v[nbr_idx]                             # (S, Kloc, kd)
             diff = h_anc.unsqueeze(1) - h_nbr
             d_pred_loc = (diff * diff).sum(-1).clamp_min(0.0).add(eps).sqrt()
-            sq_err = (d_pred_loc - d_true_loc) ** 2          # (S, Kloc)
+            resid_loc = d_pred_loc - d_true_loc
+            sq_err = resid_loc ** 2                          # (S, Kloc)
+            # B (robust): down-weight grossly-wrong local pairs (one-to-many /
+            # symmetric mismatches). Per-element robust cost; the weighted
+            # mean below is unchanged. "none" = plain L2 (byte-identical).
+            if self._sld_robust != "none":
+                c = self._robust_scale(self._sld_robust_c, self._sld_gnc_steps)
+                sq_err = self._robust_apply_sq(
+                    sq_err, resid_loc.abs(), self._sld_robust, c,
+                )
             if self._sld_fn == "exp":
                 w = torch.exp(-d_true_loc / self._sld_sigma)
             elif self._sld_fn == "inverse":
