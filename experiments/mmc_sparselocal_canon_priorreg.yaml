@@ -17,6 +17,9 @@ queue: training-parallel
 group: s10396
 wandb_run_name: scgg_mmc_sparselocal_canon_priorreg_repro_e1000_seed0
 override:
+  # --- data loading: 0 workers is FASTER on MMC (tiny, ~1 batch/epoch): avoids
+  #     respawning 32 workers every epoch, whose overhead otherwise ~2x's runtime ---
+  dataset.num_workers: 0
   # --- EDM head: skip the O(N^2) matrix + expensive decode (the speed) ---
   model.edm.enabled: true
   model.edm.embed_dim: 8

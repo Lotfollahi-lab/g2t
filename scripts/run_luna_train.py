@@ -1356,30 +1356,44 @@ def run_benchmark(
         data_path = Path(data_dir)
         train_files = _discover_split_files(data_path, "train")
         test_files = _discover_split_files(data_path, "test")
-        # Optional per-name exclusion (typical case: drop a few
-        # too-large CNS slices that GPU-OOM during inference). Match
-        # by basename — user passes e.g.
-        # ``exclude_test_files=["sagittal1_test.h5ad", "spinalcord_test.h5ad"]``.
-        # Train files are NEVER filtered by this flag (excluding from
-        # training would change what the checkpoint learned).
-        if exclude_test_files:
-            excluded_set = set(exclude_test_files)
-            kept = [p for p in test_files if p.name not in excluded_set]
-            dropped = [p.name for p in test_files if p.name in excluded_set]
+        # Per-name exclusion of TEST sections (typical case: drop a few
+        # too-large CNS slices that GPU-OOM during inference). Match by
+        # basename. Train files are NEVER filtered (excluding from training
+        # would change what the checkpoint learned). Kept in sync with
+        # run_scgg_train.py.
+        #
+        # Effective exclusion = the ``--exclude_test_files`` CLI arg UNIONED
+        # with an optional per-dataset manifest ``<data_dir>/
+        # exclude_test_files.txt`` (one basename per line; blank lines and
+        # ``#`` comments ignored) — the manifest makes an exclusion the
+        # DEFAULT for a dataset, so every run holds those sections out with
+        # no flag to remember.
+        exclude_names = set(exclude_test_files or [])
+        _manifest = data_path / "exclude_test_files.txt"
+        if _manifest.is_file():
+            _m = [ln.strip() for ln in _manifest.read_text().splitlines()]
+            _m = [ln for ln in _m if ln and not ln.startswith("#")]
+            if _m:
+                logger.info(
+                    f"[exclude_test_files] manifest {_manifest} adds "
+                    f"{len(_m)} default test-exclusion(s): {sorted(_m)}"
+                )
+                exclude_names |= set(_m)
+        if exclude_names:
+            kept = [p for p in test_files if p.name not in exclude_names]
+            dropped = [p.name for p in test_files if p.name in exclude_names]
             if dropped:
                 logger.info(
-                    f"--exclude_test_files dropped {len(dropped)} file(s) "
+                    f"[exclude_test_files] dropped {len(dropped)} file(s) "
                     f"from the test set: {sorted(dropped)}"
                 )
-                # Warn if any requested exclusion didn't match — typo
-                # protection rather than silent no-op.
-                unmatched = excluded_set - set(dropped)
-                if unmatched:
-                    logger.warning(
-                        f"--exclude_test_files entries did NOT match any "
-                        f"*_test.h5ad in {data_path}: {sorted(unmatched)}. "
-                        f"Check the filenames you passed."
-                    )
+            unmatched = exclude_names - set(dropped)
+            if unmatched:
+                logger.warning(
+                    f"[exclude_test_files] entries did NOT match any "
+                    f"*_test.h5ad in {data_path}: {sorted(unmatched)}. "
+                    f"Check the filenames (CLI or manifest {_manifest})."
+                )
             test_files = kept
         logger.info(
             f"Silver dir: {data_path} "

@@ -1,21 +1,22 @@
 description: >
-  The exact fast+good MMC recipe (see mmc_sparselocal_canon_priorreg) PLUS
-  position_feedback=off — the only change vs the recovered original
-  (20260610_163425). Tests whether severing the intermediate-coordinate
-  feedback helps on top of the sparse-local + canon + learned-regression-prior
-  recipe. One-line diff from the baseline recipe.
+  CNS counterpart of mmc_sparselocal_canon_priorreg_noposfb — identical model /
+  loss / optimizer knobs (recovered fast+good MMC recipe + noposfb), with only
+  the dataset-scale knobs changed for CNS: batch_size=1 (CNS/STARmap slices are
+  much larger than MMC) and dataset.num_workers=4 (large data — 32 risks a
+  memory SIGKILL, 0 serialises big-slice loading; the codebase recommends 2-4).
+  Epochs kept at 1000 for a first comparison; the CNS fastmds baseline used
+  3500, so extend if the loss is still dropping.
 method: scgg
-data_dir: /nfs/team361/sb75/DATASETS/silver/mmc_luna
+data_dir: /nfs/team361/sb75/DATASETS/silver/cns_luna
 seed: 0
 epochs: 1000
 gpu_model: H200
 queue: training-parallel
 group: s10396
-wandb_run_name: scgg_mmc_sparselocal_canon_priorreg_noposfb_e1000_seed0
+wandb_run_name: scgg_cns_sparselocal_canon_priorreg_noposfb_e1000_seed0
 override:
-  # --- data loading: 0 workers is FASTER on MMC (tiny, ~1 batch/epoch): avoids
-  #     respawning 32 workers every epoch, whose overhead otherwise ~2x's runtime ---
-  dataset.num_workers: 0
+  # --- data loading: CNS is large; 2-4 workers (not 0, not 32 -> SIGKILL risk) ---
+  dataset.num_workers: 4
   # --- EDM head: skip the O(N^2) matrix + expensive decode (the speed) ---
   model.edm.enabled: true
   model.edm.embed_dim: 8
@@ -42,7 +43,7 @@ override:
   model.flow_matching.prediction: x0
   # --- backbone / optimizer ---
   model.hidden_dims.num_heads: 32
-  train.batch_size: 6
+  train.batch_size: 1
   train.lr: "5e-4"
   train.lr_schedule: warmup_cosine
   train.warmup_steps: 250
@@ -51,5 +52,5 @@ override:
   train.augment_rotation: false
   train.augment_reflection: false
   train.ema_decay: 0.95
-  # --- the ONE change vs the recovered original ---
+  # --- noposfb ---
   model.position_feedback: "off"
