@@ -1,0 +1,24 @@
+description: >
+  Sparse-local geometry loss + no position-feedback on MMC, on the PROVEN
+  optimizer recipe (bs16 + warmup-cosine + lr8e-4 + clip0.5 + bf16, e2000).
+  Keeps the global edm_distance_mse signal on (no skip_edm_D_train), so it is
+  the accurate-but-heavier variant. Confirmed good metrics on MMC.
+method: scgg
+data_dir: /nfs/team361/sb75/DATASETS/silver/mmc_luna
+seed: 0
+epochs: 2000
+gpu_model: H200
+queue: training-parallel
+group: s10396
+wandb_run_name: scgg_mmc_sparselocal_noposfb_e2000_seed0
+override:
+  model.loss.sparse_local_distance.enabled: true
+  model.loss.sparse_local_distance.n_sample: 4000
+  model.loss.sparse_local_distance.knn_backend: kdtree
+  model.position_feedback: "off"
+  train.batch_size: 16
+  train.lr: "8e-4"
+  train.lr_schedule: warmup_cosine
+  train.warmup_steps: 1000
+  train.gradient_clip_val: 0.5
+  train.precision: bf16-mixed

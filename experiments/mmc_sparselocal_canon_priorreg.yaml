@@ -1,0 +1,54 @@
+description: >
+  EXACT reproduction of the fast+good run
+  scgg_mmc_sparselocal_nsample4000_bf16island_canon_priorreg_warmupcos_e1000_seed0
+  (config recovered from wandb; original run dir 20260610_163425). Fast because
+  edm_distance_mse is OFF (loss_weight=0) and the N×N matrix is skipped
+  (skip_edm_D_train=true) with a cheap lobpcg/fp32 decode; TRAINS because
+  sparse_local uses large local_k=512 / n_random=512 (strong local+global
+  signal) so it needs neither edm_distance_mse nor landmarks. Canonical-frame
+  FM (x0) + learned_regression prior, augmentation off. This is the baseline;
+  see mmc_sparselocal_canon_priorreg_noposfb for the +noposfb A/B.
+method: scgg
+data_dir: /nfs/team361/sb75/DATASETS/silver/mmc_luna
+seed: 0
+epochs: 1000
+gpu_model: H200
+queue: training-parallel
+group: s10396
+wandb_run_name: scgg_mmc_sparselocal_canon_priorreg_repro_e1000_seed0
+override:
+  # --- EDM head: skip the O(N^2) matrix + expensive decode (the speed) ---
+  model.edm.enabled: true
+  model.edm.embed_dim: 8
+  model.edm.loss_weight: 0
+  model.edm.skip_edm_D_train: true
+  model.edm.mds_align_train: false
+  model.edm.mds_solver: lobpcg
+  model.edm.mds_dtype: fp32
+  model.loss.edm_distance_mse.enabled: true
+  model.loss.edm_distance_mse.weight: 0
+  # --- sparse-local geometry loss: LARGE local_k/n_random = the training signal ---
+  model.loss.sparse_local_distance.enabled: true
+  model.loss.sparse_local_distance.weight: 1
+  model.loss.sparse_local_distance.local_k: 512
+  model.loss.sparse_local_distance.n_random: 512
+  model.loss.sparse_local_distance.n_sample: 4000
+  model.loss.sparse_local_distance.global_weight: 0.1
+  model.loss.sparse_local_distance.knn_backend: kdtree
+  # --- canonical-frame flow matching + learned-regression prior ---
+  model.flow_matching.canonicalize_target: true
+  model.flow_matching.prior_mode: learned_regression
+  model.flow_matching.prior_geo_weight: 1
+  model.flow_matching.prior_sigma: 1
+  model.flow_matching.prediction: x0
+  # --- backbone / optimizer ---
+  model.hidden_dims.num_heads: 32
+  train.batch_size: 6
+  train.lr: "5e-4"
+  train.lr_schedule: warmup_cosine
+  train.warmup_steps: 250
+  train.gradient_clip_val: 1
+  train.precision: bf16-mixed
+  train.augment_rotation: false
+  train.augment_reflection: false
+  train.ema_decay: 0.95
