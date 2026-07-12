@@ -1,0 +1,9 @@
+description: >
+  Landmark-count sweep point: confirmed CNS default with n_landmarks raised
+  128 -> 256 (denser global frame, still O(N*M) cheap) at the default
+  landmark_weight=0.5. Tests whether more spatially-spread anchors sharpen the
+  global brain shape. Everything else identical.
+extends: cns_sparselocal_canon_priorreg_noposfb
+wandb_run_name: scgg_cns_landmark_n256_e1000_seed0
+override:
+  model.loss.sparse_local_distance.n_landmarks: 256

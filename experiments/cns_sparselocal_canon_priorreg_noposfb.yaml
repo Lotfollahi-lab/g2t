@@ -6,6 +6,10 @@ description: >
   memory SIGKILL, 0 serialises big-slice loading; the codebase recommends 2-4).
   Epochs kept at 1000 for a first comparison; the CNS fastmds baseline used
   3500, so extend if the loss is still dropping.
+  CONFIRMED CNS DEFAULT: the sparse-local LANDMARK term (n_landmarks=128,
+  landmark_weight=0.5, global_weight=0.3) is what recovered the global brain
+  shape on CNS — do not drop it. (Sagittal sections are held out of inference
+  automatically via <data_dir>/exclude_test_files.txt, not this recipe.)
 method: scgg
 data_dir: /nfs/team361/sb75/DATASETS/silver/cns_luna
 seed: 0
@@ -27,13 +31,19 @@ override:
   model.edm.mds_dtype: fp32
   model.loss.edm_distance_mse.enabled: true
   model.loss.edm_distance_mse.weight: 0
-  # --- sparse-local geometry loss: LARGE local_k/n_random = the training signal ---
+  # --- sparse-local geometry loss ---
+  # local_k/n_random (512/512) = local signal; the LANDMARK term
+  # (n_landmarks=128, farthest-point-spread anchors) + boosted global_weight
+  # are what recover the GLOBAL brain shape on CNS — without them the layout
+  # collapses to a blob (confirmed on well06). O(N*(k+r+M)), still sub-quadratic.
   model.loss.sparse_local_distance.enabled: true
   model.loss.sparse_local_distance.weight: 1
   model.loss.sparse_local_distance.local_k: 512
   model.loss.sparse_local_distance.n_random: 512
   model.loss.sparse_local_distance.n_sample: 4000
-  model.loss.sparse_local_distance.global_weight: 0.1
+  model.loss.sparse_local_distance.global_weight: 0.3
+  model.loss.sparse_local_distance.n_landmarks: 128
+  model.loss.sparse_local_distance.landmark_weight: 0.5
   model.loss.sparse_local_distance.knn_backend: kdtree
   # --- canonical-frame flow matching + learned-regression prior ---
   model.flow_matching.canonicalize_target: true

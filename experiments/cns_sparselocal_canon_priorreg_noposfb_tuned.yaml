@@ -1,0 +1,13 @@
+description: >
+  Runtime-tuned candidate for the confirmed CNS default: local_k/n_random
+  halved (512 -> 256) to ~halve the sparse-local loss cost, plus 10-sample
+  inference ensembling for a cheap metric bump. Everything else identical to
+  cns_sparselocal_canon_priorreg_noposfb (incl. the landmark global terms).
+  Validate that the brain shape + metric hold at 256; if so, promote to the
+  default (it's a one-line change to local_k/n_random in the base recipe).
+extends: cns_sparselocal_canon_priorreg_noposfb
+wandb_run_name: scgg_cns_sparselocal_canon_priorreg_noposfb_tuned256_e1000_seed0
+override:
+  model.loss.sparse_local_distance.local_k: 256
+  model.loss.sparse_local_distance.n_random: 256
+  test.n_inference_samples: 10

@@ -56,7 +56,17 @@ def _list_recipes():
     return sorted(p.stem for p in _EXP_DIR.glob("*.yaml"))
 
 
-def _load(name: str) -> dict:
+def _load(name: str, _seen: set = None) -> dict:
+    """Load a recipe, resolving an optional ``extends: <base>`` field.
+
+    A recipe with ``extends`` inherits the base recipe's fields; its own
+    top-level fields win, and its ``override:`` dict is DEEP-MERGED on top of
+    the base's (so a sweep recipe need only list the knob it changes). Cycles
+    are rejected."""
+    _seen = _seen or set()
+    if name in _seen:
+        sys.exit(f"[launch] recipe inheritance cycle involving '{name}'")
+    _seen.add(name)
     path = _EXP_DIR / f"{name}.yaml"
     if not path.exists():
         sys.exit(
@@ -67,6 +77,15 @@ def _load(name: str) -> dict:
         rec = yaml.safe_load(fh) or {}
     if not isinstance(rec, dict):
         sys.exit(f"[launch] recipe '{name}' is not a YAML mapping")
+    base_name = rec.pop("extends", None)
+    if base_name:
+        base = _load(str(base_name), _seen)
+        merged_override = dict(base.get("override") or {})
+        merged_override.update(rec.get("override") or {})
+        merged = dict(base)
+        merged.update(rec)                 # this recipe's top-level fields win
+        merged["override"] = merged_override  # ...but override is deep-merged
+        rec = merged
     return rec
 
 

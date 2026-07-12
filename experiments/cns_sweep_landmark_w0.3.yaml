@@ -1,0 +1,8 @@
+description: >
+  Landmark-weight sweep point: confirmed CNS default with landmark_weight
+  lowered 0.5 -> 0.3 (weaker global frame). A/B against the default (0.5) and
+  w0.8 to find the best global/local balance. Everything else identical.
+extends: cns_sparselocal_canon_priorreg_noposfb
+wandb_run_name: scgg_cns_landmark_w0.3_e1000_seed0
+override:
+  model.loss.sparse_local_distance.landmark_weight: 0.3
