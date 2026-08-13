@@ -437,6 +437,30 @@ class LossFunction(nn.Module):
                                             "edm_coord_mse", "weight",
                                             default=1.0))
 
+        # PLAIN coordinate-space x0 MSE — the non-invariant control. See the
+        # config block for why none of the existing position losses can serve
+        # this role. Fails loudly under EDM, where pred.positions is a detached
+        # MDS read-out and this would silently train on nothing.
+        self._coord_raw_enabled = bool(_cfg_get(cfg, "model", "loss",
+                                                "coord_mse_raw", "enabled",
+                                                default=False))
+        self._coord_raw_weight = float(_cfg_get(cfg, "model", "loss",
+                                                "coord_mse_raw", "weight",
+                                                default=1.0))
+        if self._coord_raw_enabled:
+            _edm_on = bool(_cfg_get(cfg, "model", "edm", "enabled",
+                                    default=False))
+            if _edm_on:
+                raise ValueError(
+                    "model.loss.coord_mse_raw.enabled=true requires "
+                    "model.edm.enabled=false. With the EDM head on, "
+                    "pred.positions is produced by a detached MDS read-out, so "
+                    "this loss would contribute no gradient and the run would "
+                    "silently train on nothing. For the raw-coordinate "
+                    "baseline set: model.edm.enabled=false "
+                    "model.loss.pairwise_distance_mse.enabled=false "
+                    "model.loss.coord_mse_raw.enabled=true")
+
         # #3 (generalization lever): domain-invariance regulariser. Aligns
         # the per-slice covariance of the backbone's per-cell representation
         # ACROSS the slices in a batch (Deep CORAL / multi-kernel MMD over
@@ -818,6 +842,10 @@ class LossFunction(nn.Module):
             # decoder). Reads pred.positions.
             ("edm_coord_mse", self._coord_enabled, self._coord_weight,
              self._compute_edm_coord_mse),
+            # Reviewer-requested control: plain, NON-invariant coordinate-space
+            # x0 MSE on pred.positions (EDM head off). See _compute_coord_mse_raw.
+            ("coord_mse_raw", self._coord_raw_enabled, self._coord_raw_weight,
+             self._compute_coord_mse_raw),
             # #3 generalization: CORAL/MMD domain-invariance over the slices
             # in a batch (reads pred.node_features). See below.
             ("domain_invariance", self._dinv_enabled, self._dinv_weight,
@@ -2197,6 +2225,50 @@ class LossFunction(nn.Module):
             pt = pt / (pt.pow(2).sum(-1).mean().clamp_min(eps).sqrt())
             pp_aligned = _procrustes_align_2d(pp, pt)                 # R detached
             losses.append(self.mse(pp_aligned, pt))
+        if not losses:
+            return _graph_zero(masked_pred)
+        return torch.mean(torch.stack(losses))
+
+    def _compute_coord_mse_raw(
+        self, masked_pred: DataHolder, masked_true: DataHolder,
+    ) -> torch.Tensor:
+        """Plain coordinate-space x0 MSE — the NON-invariant control.
+
+            L = mean over valid cells of || y_hat_0,i - y_i ||^2
+
+        Deliberately minimal: no centring, no Procrustes alignment, no scale
+        normalisation. That is the entire point. This is the conventional
+        flow-matching coordinate objective, so it charges the model for the
+        arbitrary global frame of each slice — the cost §2.3 of the paper argues
+        the pairwise-distance surrogate avoids. Contrast with
+        ``_compute_edm_coord_mse``, which centres, RMS-normalises and
+        Procrustes-aligns before its MSE and is therefore frame-invariant.
+
+        Reads ``masked_pred.positions``, which is the backbone's direct 2-D
+        output when the EDM head is off (the constructor enforces that), so the
+        gradient path is live. ``masked_true`` is the CLEAN batch (train.py passes
+        ``masked_true=batched_data``, not the noised ``z_t``), so the target here
+        is y, the same target ``edm_distance_mse`` builds ``D*`` from.
+
+        Masking / reduction: only valid (non-padded) cells contribute. Each slice
+        is reduced to its own mean squared error and the slices are then averaged,
+        so SLICES are weighted equally regardless of cell count — the same
+        reduction ``_compute_edm_coord_mse`` and the other per-slice losses use.
+        (A per-cell weighting would favour large slices; we match the house
+        convention so this row stays comparable with the other ablations.)
+        """
+        pos_pred = getattr(masked_pred, "positions", None)
+        if pos_pred is None:
+            return _graph_zero(masked_pred)
+        losses = []
+        for b in range(pos_pred.shape[0]):
+            valid = torch.nonzero(masked_true.node_mask[b],
+                                  as_tuple=False).squeeze(-1)
+            if int(valid.numel()) == 0:
+                continue
+            pp = pos_pred[b].index_select(0, valid)                  # (n, 2)
+            pt = masked_true.positions[b].index_select(0, valid)     # (n, 2)
+            losses.append(self.mse(pp, pt))
         if not losses:
             return _graph_zero(masked_pred)
         return torch.mean(torch.stack(losses))

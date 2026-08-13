@@ -745,6 +745,33 @@ loss:
         weight: 1.0
         mode: "coral"   # one of: coral | mmd
 
+    # PLAIN coordinate-space x0 objective — deliberately NOT invariant.
+    #
+    # Every other position-space loss here is invariant by construction
+    # (edm_coord_mse is Procrustes-aligned AND scale-normalised; sinkhorn /
+    # chamfer are set-based; shape_matching is shape-only). That makes them
+    # unusable as the "conventional coordinate regression" control, because the
+    # whole question is what happens WITHOUT frame invariance.
+    #
+    # This component is the textbook flow-matching x0 loss on coordinates,
+    #     L = mean_i || y_hat_0,i - y_i ||^2 ,
+    # with no centring, no alignment, no rescaling — so it charges the model for
+    # the arbitrary global frame, which is exactly the thing §2.3 of the paper
+    # argues against. Intended use is the reviewer-requested raw-coordinate
+    # flow-matching baseline:
+    #
+    #   model.edm.enabled=false                        (predict 2-D directly)
+    #   model.loss.pairwise_distance_mse.enabled=false (drop LUNA's invariant loss)
+    #   model.loss.coord_mse_raw.enabled=true          (this loss instead)
+    #
+    # Requires a grad-carrying pred.positions, i.e. the EDM head OFF (then
+    # pred.positions is the backbone's direct output). With EDM on, positions
+    # come from a detached MDS read-out and this would be a silent no-op, so we
+    # fail loudly in that configuration rather than train on nothing.
+    coord_mse_raw:
+        enabled: false
+        weight: 1.0
+
     edm_coord_mse:
         enabled: false
         weight: 1.0
