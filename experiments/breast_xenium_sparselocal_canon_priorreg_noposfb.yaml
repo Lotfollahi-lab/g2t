@@ -1,0 +1,21 @@
+description: >
+  10x breast cancer adjacent-section benchmark (Janesick 2023) on the CONFIRMED
+  CNS efficient recipe (sparse-local + canonical-frame + learned-regression
+  prior + noposfb + landmark global term). Inherits every model/loss/optimizer
+  knob from cns_sparselocal_canon_priorreg_noposfb via `extends`; only the
+  dataset changes.
+  Trains on Xenium Rep1 and evaluates BOTH held-out test files in the silver dir:
+    * xenium_rep2_test  = the ADJACENT serial Xenium section, REAL coords ->
+      the per-cell Spearman / RSSD metric is meaningful (Tier A).
+    * scffpe_test       = real dissociated scFFPE-seq, PLACEHOLDER coords ->
+      the built-in metric is MEANINGLESS; score Tier B externally from the
+      predicted coords (metadata_pred.csv) via cell-type -> spatial-domain
+      concordance against the Xenium reference.
+  313-gene Xenium panel (identical across all files). Sections are large
+  (Rep1 ~168k, Rep2 ~119k cells) so the O(N^2)-free config matters, exactly
+  like CNS. To run Tier A alone, add
+  --exclude_test_files scffpe_test.h5ad ; for Tier B alone, exclude
+  xenium_rep2_test.h5ad.
+extends: cns_sparselocal_canon_priorreg_noposfb
+data_dir: /nfs/team361/sb75/DATASETS/silver/breast_janesick
+wandb_run_name: scgg_breast_xenium_sparselocal_canon_priorreg_noposfb_e1000_seed0
