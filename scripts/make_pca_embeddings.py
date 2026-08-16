@@ -93,11 +93,19 @@ def main() -> int:
     p.add_argument("--n_pcs", type=int, default=50)
     p.add_argument("--field", default="",
                    help="obsm key to write (default: X_pca{n_pcs})")
+    p.add_argument("--as_x", action="store_true",
+                   help="ALSO replace .X with the PCs as n_pcs pseudo-genes "
+                        "(PC1..PCn). Only the scgg pipeline understands "
+                        "--embedding_field; LUNA and CeLEry read .X, so this "
+                        "is how they get the same input. Equivalent for scgg "
+                        "too: run_scgg_train.py substitutes obsm for the gene "
+                        "block and renames the columns, nothing more.")
     p.add_argument("--dry_run", action="store_true",
                    help="fit and report, write nothing")
     args = p.parse_args()
 
     import anndata as ad
+    import pandas as pd
 
     in_dir, out_dir = Path(args.in_dir), Path(args.out_dir)
     field = args.field or f"X_pca{args.n_pcs}"
@@ -167,6 +175,20 @@ def main() -> int:
               f"train-basis captures {100*frac:5.1f}% of its variance")
         if not args.dry_run:
             a.obsm[field] = Z
+            if args.as_x:
+                # Rebuild rather than assign: .X's second axis changes length.
+                # obs / obsm / uns are carried over verbatim -- obsm['spatial']
+                # above all, which is the ground truth every scorer reads.
+                a = ad.AnnData(
+                    X=Z.copy(),
+                    obs=a.obs.copy(),
+                    var=pd.DataFrame(index=[f"PC{i+1}" for i in range(Z.shape[1])]),
+                    obsm={k: v.copy() for k, v in a.obsm.items()},
+                    uns=dict(a.uns),
+                )
+                if "spatial" not in a.obsm:
+                    raise SystemExit(f"{f.name}: obsm['spatial'] lost — refusing "
+                                     "to write a file with no ground truth")
             a.write_h5ad(out_dir / f.name)
         del a, Xc, Z
 
