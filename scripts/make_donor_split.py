@@ -87,6 +87,11 @@ def main() -> int:
     p.add_argument("--allow_seen_donor", action="store_true",
                    help="permit a test donor that also appears in train "
                         "(deliberate for a seen-donor/unseen-section arm)")
+    p.add_argument("--allow_train_test_overlap", action="store_true",
+                   help="permit the SAME section in both splits. This is a "
+                        "deliberately leaky memorisation control (train==test) "
+                        "for measuring capacity, never a generalisation "
+                        "result. Implies --allow_seen_donor.")
     p.add_argument("--copy", action="store_true",
                    help="copy files instead of symlinking")
     p.add_argument("--dry_run", action="store_true")
@@ -124,9 +129,17 @@ def main() -> int:
         want_train = [s for s in sorted(by_section)
                       if s not in want_test
                       and s.startswith(args.train_prefix)]
-    overlap = set(want_train) & set(want_test)
+    overlap = sorted(set(want_train) & set(want_test))
+    if overlap and not args.allow_train_test_overlap:
+        raise SystemExit(f"section(s) in both splits: {overlap}\n"
+                         "Pass --allow_train_test_overlap if this is a "
+                         "memorisation control.")
     if overlap:
-        raise SystemExit(f"section(s) in both splits: {sorted(overlap)}")
+        args.allow_seen_donor = True     # implied: same section, same donor
+        print(f"\n*** TRAIN == TEST for {len(overlap)} section(s): {overlap}")
+        print("*** Memorisation control. Any score here measures capacity to "
+              "fit seen data,\n*** NOT generalisation. Do not report it as a "
+              "benchmark result.")
     if not want_train:
         raise SystemExit("no train sections selected")
 
@@ -196,6 +209,7 @@ def main() -> int:
         "src_dir": str(src), "donor_col": donor_col,
         "mode": "copy" if args.copy else "symlink",
         "train_prefix": args.train_prefix or None,
+        "train_test_overlap": overlap,
         "n_train_sections": len(want_train), "n_test_sections": len(want_test),
         "n_train_cells": n_cells["train"], "n_test_cells": n_cells["test"],
         "train_donors": sorted(train_donors),
