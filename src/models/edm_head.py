@@ -169,6 +169,30 @@ def _classical_mds_2d_lobpcg(
     return evecs * torch.sqrt(e2).unsqueeze(0)                    # (n, 2)
 
 
+def _classical_mds_2d_svd(H: torch.Tensor) -> torch.Tensor:
+    """Classical MDS read-out computed directly from the embeddings.
+
+    For an embedding-induced squared-distance matrix
+    ``D_ij = ||h_i - h_j||^2`` the double-centred Gram matrix is
+    ``B = -1/2 J D J = (J H)(J H)^T``, so the top-2 eigenpairs of ``B``
+    are given by the SVD of the centred embeddings: the MDS coordinates
+    are the top-2 principal-component scores of ``H``. This needs
+    O(N K^2) time and O(N K) memory and never forms an N x N matrix.
+
+    Args:
+        H: (n, k) embeddings whose pairwise squared distances define D.
+
+    Returns:
+        (n, 2) MDS coordinates, defined up to rotation/reflection (the
+        caller Procrustes-aligns them). Equal, up to an orthogonal
+        transform, to ``_classical_mds_2d`` on the induced D without
+        the Tikhonov term.
+    """
+    Hc = H - H.mean(dim=0, keepdim=True)
+    U, S, _ = torch.linalg.svd(Hc, full_matrices=False)   # U: (n, k), S: (k,)
+    return U[:, :2] * S[:2].unsqueeze(0)                     # (n, 2)
+
+
 def _procrustes_align(x_src: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
     """Orthogonal Procrustes: find the rotation+reflection R that minimises
     ‖x_src @ R − x_ref‖_F. Returns x_src @ R with R DETACHED.
@@ -264,7 +288,7 @@ class EDMOutputWrapper(nn.Module):
         mds_tikhonov_eps: float = 1e-6,
         mds_align_train: bool = True,
         mds_dtype: str = "fp64",
-        mds_solver: str = "eigh",
+        mds_solver: str = "svd",
         skip_edm_D_train: bool = False,
         fp32_geometry: bool = True,
         decoder: str = "mds",
@@ -352,7 +376,10 @@ class EDMOutputWrapper(nn.Module):
         #     no backward goes through eigh (i.e. mds_align_gradient
         #     False AND/OR mds_align_train False).
         # ``mds_solver``:
-        #   "eigh" (default) — torch.linalg.eigh, computes ALL N
+        #   "svd" (default) — top-2 principal components of the centred
+        #     embeddings (B = (JH)(JH)^T), O(N·K²), no N×N eigensolve.
+        #     Mathematically identical to classical MDS of the induced D.
+        #   "eigh" — torch.linalg.eigh on B, computes ALL N
         #     eigenpairs (O(N³)). Has autograd backward.
         #   "lobpcg" — torch.lobpcg, top-2 eigenpairs only
         #     (O(N²·iter)). 10-20× faster at large N. NO stable
@@ -364,9 +391,9 @@ class EDMOutputWrapper(nn.Module):
                 f"mds_dtype must be 'fp32' or 'fp64'; got "
                 f"{self.mds_dtype!r}"
             )
-        if self.mds_solver not in ("eigh", "lobpcg"):
+        if self.mds_solver not in ("svd", "eigh", "lobpcg"):
             raise ValueError(
-                f"mds_solver must be 'eigh' or 'lobpcg'; got "
+                f"mds_solver must be 'svd', 'eigh' or 'lobpcg'; got "
                 f"{self.mds_solver!r}"
             )
         # Fail-loud if mds_align_gradient is True AND user requested
@@ -631,7 +658,7 @@ class EDMOutputWrapper(nn.Module):
                 # fp32 ISLAND — MDS double-centering bmm + eigh on fp32.
                 with self._fp32_ctx(D_sq):
                     new_pos = self._mds_align_positions(
-                        D_sq, pred.positions, data.node_mask,
+                        D_sq, pred.positions, data.node_mask, emb=hW,
                     )
                 new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
             else:
@@ -653,6 +680,7 @@ class EDMOutputWrapper(nn.Module):
                 with torch.no_grad(), self._fp32_ctx(D_sq):
                     new_pos = self._mds_align_positions(
                         D_sq.detach(), pred.positions.detach(), data.node_mask,
+                        emb=hW.detach(),
                     )
                 new_pos = new_pos * data.node_mask.unsqueeze(-1).to(new_pos.dtype)
             pred.positions = new_pos
@@ -667,9 +695,12 @@ class EDMOutputWrapper(nn.Module):
         D_sq: torch.Tensor,
         x_ref: torch.Tensor,
         node_mask: torch.Tensor,
+        emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """For each slice, compute classical MDS from D_sq, then
-        Procrustes-align to x_ref's frame. Returns (B, N, 2).
+        """For each slice, compute classical MDS from D_sq (or, with
+        ``mds_solver='svd'``, directly from the embeddings ``emb`` that
+        induce D_sq), then Procrustes-align to x_ref's frame. Returns
+        (B, N, 2).
 
         Per-slice loop because n_valid varies across the batch. B=1
         for our small-slice datasets so the loop overhead is moot.
@@ -741,21 +772,27 @@ class EDMOutputWrapper(nn.Module):
             # warm-start, so feed it DETACHED distances: no eigh/lobpcg
             # backward is ever exercised (the trainable geometry signal
             # flows through SMACOF's use of the grad-carrying D_v below).
-            D_v_init = D_v.detach() if self.decoder == "smacof" else D_v
-            if self.mds_dtype == "fp64":
-                D_v_proc = D_v_init.to(torch.float64)
-            else:  # fp32
-                D_v_proc = D_v_init if D_v_init.dtype == torch.float32 else D_v_init.to(torch.float32)
-            # Solver: eigh (default, full N×N decomposition) or
-            # lobpcg (top-2 only, much faster at large N).
+            proc_dtype = torch.float64 if self.mds_dtype == "fp64" else torch.float32
+            # Solver: svd (default; top-2 principal components of the
+            # centred embeddings, no N×N eigensolve), eigh (full N×N
+            # decomposition) or lobpcg (top-2 eigenpairs only).
+            use_svd = self.mds_solver == "svd" and emb is not None
+            if not use_svd:
+                D_v_init = D_v.detach() if self.decoder == "smacof" else D_v
+                D_v_proc = D_v_init if D_v_init.dtype == proc_dtype else D_v_init.to(proc_dtype)
             mds_fn = (
                 _classical_mds_2d_lobpcg if self.mds_solver == "lobpcg"
                 else _classical_mds_2d
             )
             try:
-                x_mds_proc = mds_fn(                  # (n_valid, 2)
-                    D_v_proc, tikhonov_eps=self.mds_tikhonov_eps,
-                )
+                if use_svd:
+                    H_v = emb[b].index_select(0, valid_idx)
+                    H_init = H_v.detach() if self.decoder == "smacof" else H_v
+                    x_mds_proc = _classical_mds_2d_svd(H_init.to(proc_dtype))   # (n_valid, 2)
+                else:
+                    x_mds_proc = mds_fn(              # (n_valid, 2)
+                        D_v_proc, tikhonov_eps=self.mds_tikhonov_eps,
+                    )
                 # Cast back to the surrounding graph's dtype.
                 x_mds = x_mds_proc.to(D_v.dtype)
                 # SMACOF refinement of the MDS warm-start: Guttman steps

@@ -1457,14 +1457,18 @@ edm:
     # mds_align_gradient=true.
     mds_dtype: "fp64"
     # ---- MDS solver algorithm (efficiency knob B) ----
-    # "eigh" (default) — torch.linalg.eigh, computes ALL N eigenpairs
+    # "svd" (default) — the MDS coordinates are the top-2 principal
+    # components of the centred embeddings, since the double-centred Gram
+    # matrix of the induced distances is B = (JH)(JH)^T. O(N·K²) time,
+    # O(N·K) memory, no N×N eigensolve; identical to classical MDS.
+    # "eigh" — torch.linalg.eigh, computes ALL N eigenpairs
     # (O(N³)). Has a stable autograd backward.
     # "lobpcg" — torch.lobpcg with k=2, computes only the top-2
     # eigenpairs we actually need (O(N²·iter)). 10-20× faster at
     # N≈46k. No stable autograd backward — gated to
     # ``mds_align_gradient=false``. The wrapper fail-loud-raises
     # otherwise.
-    mds_solver: "eigh"
+    mds_solver: "svd"
     # ---- Sparse-training: skip the full (N,N) D_sq at train time ----
     # When true, the EDM head does NOT materialise the (B,N,N) squared
     # distance matrix during TRAINING — it only emits pred.edm_h (the

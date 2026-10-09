@@ -753,9 +753,10 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 ),
                 # MDS solver precision + algorithm — see EDMOutputWrapper
                 # docstring for the safety guards. Defaults preserve
-                # historic behaviour (fp64 + eigh).
+                # historic behaviour (fp64); the read-out defaults to the SVD of
+                # the centred embeddings (identical to classical MDS).
                 mds_dtype=str(getattr(edm_cfg, "mds_dtype", "fp64")),
-                mds_solver=str(getattr(edm_cfg, "mds_solver", "eigh")),
+                mds_solver=str(getattr(edm_cfg, "mds_solver", "svd")),
                 # Sparse-training: skip the (B,N,N) D_sq at train time so
                 # the O(N·k) sparse_local_distance loss is the only
                 # distance term. Default False (historic full-matrix).
